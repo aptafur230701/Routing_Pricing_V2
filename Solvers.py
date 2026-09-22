@@ -191,14 +191,21 @@ def generate_optimal_route_pytorch(agent, start_node, time_matrix, reward_matrix
     # detalles del ciclo, igual que en el original.
     return route, total_reward, time_elapsed
 
-def solve_heuristic(start_node, time_m, reward_m, max_d, num_n):
+def solve_heuristic(start_node, time_m, reward_m, max_d, num_n, k_max=None):
+    """Greedy con horizonte estático (día fijo). Usado standalone (dead
+    externamente) y como semilla de la población inicial de
+    solve_HGA_LNS_metaheuristic.
+
+    k_max : int | None — presupuesto de cardinalidad (ver
+        solve_heuristic_rolling_horizon). None (default) = caso libre.
+    """
     current_node = start_node
     time_elapsed = 0.0
     total_reward = 0.0
     route = [start_node]
     visited = {start_node}
     steps = 0
-    max_arcs = num_n - 1
+    max_arcs = min(num_n - 1, k_max - 1) if k_max is not None else num_n - 1
 
     while steps < max_arcs:
         best_reward = -np.inf  
@@ -726,14 +733,20 @@ def solve_genetic_algorithm(start_node, time_m, reward_m, max_d, num_n, seed=Non
                       best_overall['reward'], best_overall['duration'])
 
 
-def _generate_route_nearest_neighbor(start_node, time_m, reward_m, max_d, num_n):
+def _generate_route_nearest_neighbor(start_node, time_m, reward_m, max_d, num_n, k_max=None):
     """
     Nearest neighbor heuristic with randomization:
     Start from a node and greedily move to closest unvisited node.
     Max 5 steps (6 nodes total including start/end)
+
+    k_max : int | None — presupuesto de cardinalidad (nº de arcos, incluido
+        el retorno). None (default) = caso libre. max_route_len (cap en nº
+        de nodos de `route`, incluidos ambos extremos = arcos+1) se deriva
+        de k_max preservando exactamente la relación actual en el caso libre
+        (max_route_len = max_steps + 1 = num_n).
     """
-    max_steps = num_n - 1
-    max_route_len = num_n
+    max_route_len = (k_max + 1) if k_max is not None else num_n
+    max_steps = max_route_len - 1
     current_node = start_node
     route = [start_node]
     visited = {start_node}
@@ -785,13 +798,16 @@ def _generate_route_nearest_neighbor(start_node, time_m, reward_m, max_d, num_n)
     return None
 
 
-def _generate_random_feasible_route(start_node, time_m, reward_m, max_d, num_n):
+def _generate_random_feasible_route(start_node, time_m, reward_m, max_d, num_n, k_max=None):
     """
     Generate a random feasible route by randomly selecting nodes.
     Max 5 steps (6 nodes total including start/end)
+
+    k_max : int | None — ver _generate_route_nearest_neighbor. None (default)
+        = caso libre.
     """
-    max_steps = num_n - 1
-    max_route_len = num_n
+    max_route_len = (k_max + 1) if k_max is not None else num_n
+    max_steps = max_route_len - 1
     current_node = start_node
     route = [start_node]
     visited = {start_node}
@@ -844,14 +860,17 @@ def _generate_random_feasible_route(start_node, time_m, reward_m, max_d, num_n):
     return None
 
 
-def _crossover_routes(route1, route2, start_node, time_m, reward_m, max_d, num_n):
+def _crossover_routes(route1, route2, start_node, time_m, reward_m, max_d, num_n, k_max=None):
     """
     Order Crossover (OX): Combines two routes by:
     1. Copy segment from parent1
     2. Fill remaining nodes from parent2 in order
-    Respects max num_n nodes constraint
+    Respects max num_n nodes constraint (o k_max+1 si K está restringido).
+
+    k_max : int | None — ver _generate_route_nearest_neighbor. None (default)
+        = caso libre.
     """
-    max_route_len = num_n
+    max_route_len = (k_max + 1) if k_max is not None else num_n
     if len(route1) < 4 or len(route2) < 4:
         return route1 if np.random.rand() < 0.5 else route2
 
@@ -887,12 +906,15 @@ def _crossover_routes(route1, route2, start_node, time_m, reward_m, max_d, num_n
     return None
 
 
-def _apply_2opt_mutation(route, start_node, time_m, reward_m, max_d, num_n):
+def _apply_2opt_mutation(route, start_node, time_m, reward_m, max_d, num_n, k_max=None):
     """
     2-opt mutation: Try reversing a segment to improve the route.
-    Maintains max num_n nodes constraint.
+    Maintains max num_n nodes constraint (o k_max+1 si K está restringido).
+
+    k_max : int | None — ver _generate_route_nearest_neighbor. None (default)
+        = caso libre.
     """
-    max_route_len = num_n
+    max_route_len = (k_max + 1) if k_max is not None else num_n
     best_route = route[:]
     best_reward = sum(reward_m[route[i]][route[i+1]] for i in range(len(route) - 1))
     improved = True
@@ -926,15 +948,20 @@ def _apply_2opt_mutation(route, start_node, time_m, reward_m, max_d, num_n):
     return best_route if len(best_route) <= max_route_len else None
 
 
-def _apply_lns_mutation(route, start_node, time_m, reward_m, max_d, destroy_size, num_n):
+def _apply_lns_mutation(route, start_node, time_m, reward_m, max_d, destroy_size, num_n, k_max=None):
     """
     LNS mutation operator used by HGA-LNS:
     1. Destroy: remove `destroy_size` random intermediate nodes
     2. Repair:  reinsert using best-position greedy strategy
     3. Refine:  polish geometry with 2-opt
     Falls back to the original route if repair produces nothing valid.
+
+    k_max : int | None — ver _generate_route_nearest_neighbor. None (default)
+        = caso libre. _repair_route_lns_best_position no necesita k_max: no
+        tiene noción propia de longitud máxima, el cap se aplica aquí
+        post-hoc sobre su resultado (igual que ya hacía con max_route_len).
     """
-    max_route_len = num_n
+    max_route_len = (k_max + 1) if k_max is not None else num_n
     intermediates = route[1:-1]
     if len(intermediates) < 2:
         return route  # too short to destroy meaningfully
@@ -955,7 +982,7 @@ def _apply_lns_mutation(route, start_node, time_m, reward_m, max_d, destroy_size
     if repaired_route is None or repaired_time > max_d or len(repaired_route) > max_route_len:
         return route  # fallback to original
 
-    refined = _apply_2opt_mutation(repaired_route, start_node, time_m, reward_m, max_d, num_n)
+    refined = _apply_2opt_mutation(repaired_route, start_node, time_m, reward_m, max_d, num_n, k_max=k_max)
     if refined and len(refined) <= max_route_len:
         return refined
     return repaired_route
@@ -965,6 +992,7 @@ def solve_HGA_LNS_metaheuristic(
     start_node, time_m, max_d, num_n,
     rate_stack, loads_stack, distance_arr, diesel_arr, start_day_idx,
     seed=None,
+    k_max=None,
 ):
     """
     Hybrid Genetic Algorithm – Large Neighborhood Search (HGA-LNS):
@@ -977,6 +1005,12 @@ def solve_HGA_LNS_metaheuristic(
     population is evaluated on the same footing as DRL Det.
     Search operators (crossover, LNS repair, 2-opt) still use the static day-0
     reward matrix for fast local decisions.
+
+    k_max : int | None — presupuesto de cardinalidad (nº de arcos, incluido
+        el retorno). None (default) = caso libre. Se propaga a todos los
+        generadores/operadores de la población (mismo max_route_len
+        generalizado que usan). El "sweep" garantizado de rutas de 2-3
+        paradas no necesita condición: siempre es ≤K bajo K_MIN=4.
 
     Returns: status, route, total_reward, total_duration
     """
@@ -997,7 +1031,7 @@ def solve_HGA_LNS_metaheuristic(
     _rng_state = np.random.get_state() if seed is not None else None
     if seed is not None:
         np.random.seed(seed)
-    max_route_len = num_n
+    max_route_len = (k_max + 1) if k_max is not None else num_n
 
     # --- Parameters ---
     population_size = max(10, num_n * num_n)
@@ -1023,21 +1057,21 @@ def solve_HGA_LNS_metaheuristic(
         return r, t
 
     _, route, _, _, is_valid = solve_heuristic(
-        start_node, time_m, reward_m, max_d, num_n
+        start_node, time_m, reward_m, max_d, num_n, k_max=k_max
     )
     if is_valid and len(route) <= max_route_len:
         rew, dur = _eval(route)
         population.append({'route': route, 'reward': rew, 'duration': dur})
 
     for _ in range(max(2, population_size // 4)):
-        route = _generate_route_nearest_neighbor(start_node, time_m, reward_m, max_d, num_n)
+        route = _generate_route_nearest_neighbor(start_node, time_m, reward_m, max_d, num_n, k_max=k_max)
         if route and len(route) <= max_route_len:
             rew, dur = _eval(route)
             if dur <= max_d:
                 population.append({'route': route, 'reward': rew, 'duration': dur})
 
     for _ in range(max(2, population_size // 4)):
-        route = _generate_random_feasible_route(start_node, time_m, reward_m, max_d, num_n)
+        route = _generate_random_feasible_route(start_node, time_m, reward_m, max_d, num_n, k_max=k_max)
         if route and len(route) <= max_route_len:
             rew, dur = _eval(route)
             if dur <= max_d:
@@ -1046,7 +1080,7 @@ def solve_HGA_LNS_metaheuristic(
     _fill_iters = 0
     while len(population) < population_size and _fill_iters < population_size * 10:
         _fill_iters += 1
-        route = _generate_random_feasible_route(start_node, time_m, reward_m, max_d, num_n)
+        route = _generate_random_feasible_route(start_node, time_m, reward_m, max_d, num_n, k_max=k_max)
         if route and len(route) <= max_route_len:
             rew, dur = _eval(route)
             if dur <= max_d:
@@ -1099,7 +1133,7 @@ def solve_HGA_LNS_metaheuristic(
                 p1 = mating_pool[np.random.randint(0, len(mating_pool))]
                 p2 = mating_pool[np.random.randint(0, len(mating_pool))]
                 child_route = _crossover_routes(
-                    p1['route'], p2['route'], start_node, time_m, reward_m, max_d, num_n
+                    p1['route'], p2['route'], start_node, time_m, reward_m, max_d, num_n, k_max=k_max
                 )
             else:
                 # No crossover: clone a tournament winner to mutate
@@ -1111,7 +1145,7 @@ def solve_HGA_LNS_metaheuristic(
             # LNS mutation: destroy → repair → 2-opt (replaces classical mutation)
             if np.random.rand() < lns_mut_rate:
                 child_route = _apply_lns_mutation(
-                    child_route, start_node, time_m, reward_m, max_d, destroy_size, num_n
+                    child_route, start_node, time_m, reward_m, max_d, destroy_size, num_n, k_max=k_max
                 )
 
             if child_route and len(child_route) <= max_route_len:
@@ -1261,12 +1295,25 @@ def _label_setting_core(
     start_node, time_matrix_np, rate_stack, loads_stack,
     distance_arr, diesel_arr, max_d, num_n, start_day_idx,
     time_limit_seconds=None,
+    k_max=None,
 ):
     """Label Setting DP for the Orienteering Problem (deterministic, exact).
 
     State: (current_node, visited_bitmask, time_elapsed, reward).
     Dominance: L1 dominates L2 at same (node, visited) when t(L1)<=t(L2) and
     r(L1)>=r(L2) with at least one strict inequality.
+
+    k_max : int | None — presupuesto de cardinalidad (nº de arcos, incluido
+        el retorno). None = caso libre (comportamiento sin cambios). Se
+        aplica filtrando la generación de labels: el nº de arcos usados para
+        alcanzar un label es popcount(visited_bitmask)-1, y cerrar desde ahí
+        suma 1 arco más, así que popcount(new_mask) es exactamente el total
+        de arcos si se cerrara desde el nuevo label. Filtrar
+        popcount(new_mask) <= k_max en la generación basta para garantizar
+        ≤K por construcción: el conteo de arcos ya está codificado en el
+        propio visited_bitmask (no es una dimensión nueva del DP), y como
+        popcount solo crece con cada expansión, ningún label podado podía
+        llevar a una solución factible bajo K.
 
     Returns (route, reward, duration, timed_out).
     """
@@ -1322,9 +1369,12 @@ def _label_setting_core(
             if new_t + ret_t > max_d:
                 continue
 
+            new_mask = visited_mask | (1 << next_node)
+            if k_max is not None and bin(new_mask).count("1") > k_max:
+                continue   # excedería K arcos incluso cerrando de inmediato
+
             arc_r    = rm_cur[cur_node, next_node]
             new_r    = rew + arc_r
-            new_mask = visited_mask | (1 << next_node)
             new_state = (next_node, new_mask)
 
             # Is new label dominated by any existing label at this state?
@@ -1380,12 +1430,16 @@ def _label_setting_core_stochastic(
     distance_arr, diesel_arr, max_d, num_n, start_day_idx,
     avail_prob_arr,
     time_limit_seconds=None,
+    k_max=None,
 ):
     """Label Setting DP for the Orienteering Problem with Bernoulli lane filtering.
 
     Identical to _label_setting_core but filters arc expansions using
     draw_lane_availability (same Bernoulli draws as beam_search_dynamic and
     simulate_route_reward). The return-to-depot closure is never filtered.
+
+    k_max : ver _label_setting_core — mismo filtro por popcount del bitmask.
+
     Returns (route, reward, duration, timed_out).
     """
     import time as _time
@@ -1446,9 +1500,12 @@ def _label_setting_core_stochastic(
             if new_t + ret_t > max_d:
                 continue
 
+            new_mask = visited_mask | (1 << next_node)
+            if k_max is not None and bin(new_mask).count("1") > k_max:
+                continue   # excedería K arcos incluso cerrando de inmediato
+
             arc_r    = rm_cur[cur_node, next_node]
             new_r    = rew + arc_r
-            new_mask = visited_mask | (1 << next_node)
             new_state = (next_node, new_mask)
 
             front = pareto.get(new_state, [])
@@ -1501,6 +1558,7 @@ def solve_label_setting_oracle(
     distance_arr, diesel_arr, max_d, num_n, start_day_idx,
     avail_prob_arr,
     time_limit_seconds=None,
+    k_max=None,
 ):
     """Cota superior clarividente (posterior bound) para el mundo estocástico.
 
@@ -1512,6 +1570,9 @@ def solve_label_setting_oracle(
     del MDP estocástico. Sirve como techo de referencia para el Bloque 2, en el
     mismo rol que cumplía el antiguo oráculo basado en MIP, ahora vía Label Setting.
 
+    k_max : int | None — presupuesto de cardinalidad (ver _label_setting_core).
+        None (default) = caso libre, comportamiento idéntico al actual.
+
     Returns (status, route, total_reward, total_duration).
     status: "Optimal" | "Time-Limited" | "Infeasible".
     """
@@ -1520,6 +1581,7 @@ def solve_label_setting_oracle(
         distance_arr, diesel_arr, max_d, num_n, start_day_idx,
         avail_prob_arr=avail_prob_arr,
         time_limit_seconds=time_limit_seconds,
+        k_max=k_max,
     )
 
     if route is None:
@@ -1542,10 +1604,15 @@ def solve_label_setting_exact(
     distance_arr, diesel_arr, max_d, num_n, start_day_idx,
     avail_prob_arr=None,        # accepted and ignored (deterministic world only)
     time_limit_seconds=None,
+    k_max=None,
 ):
     """Exact Orienteering solver via Label Setting DP.
 
     Drop-in replacement for the removed solve_mip_exact.
+
+    k_max : int | None — presupuesto de cardinalidad (ver _label_setting_core).
+        None (default) = caso libre, comportamiento idéntico al actual.
+
     Returns (status, route, total_reward, total_duration).
     status: "Optimal" | "Time-Limited" | "Infeasible".
     """
@@ -1553,6 +1620,7 @@ def solve_label_setting_exact(
         start_node, time_matrix_np, rate_stack, loads_stack,
         distance_arr, diesel_arr, max_d, num_n, start_day_idx,
         time_limit_seconds=time_limit_seconds,
+        k_max=k_max,
     )
 
     if route is None:
@@ -1572,6 +1640,7 @@ def solve_label_setting_exact(
 def solve_heuristic_rolling_horizon(
     start_node, time_m, rate_stack, loads_stack,
     distance_arr, diesel_arr, max_d, num_n, start_day_idx,
+    k_max=None,
 ):
     """Greedy miope con día de mercado DINÁMICO (rolling horizon).
 
@@ -1580,6 +1649,11 @@ def solve_heuristic_rolling_horizon(
     razonamiento de horizonte. Recalcula la matriz de reward del día corriente en
     cada paso, replicando _get_current_day_idx() del entorno:
         day_idx = min(start_day_idx + int(time_elapsed // 14), num_days - 1)
+
+    k_max : int | None — presupuesto de cardinalidad (nº de arcos, incluido
+        el retorno). None (default) = caso libre. El cierre de ciclo siempre
+        añade el arco de retorno sin descontar nada, así que se reserva 1
+        arco de margen en max_arcs para que el total cerrado sea ≤K.
 
     Devuelve: status, route, total_reward, total_duration, is_valid
     (mismo formato que solve_heuristic).
@@ -1598,7 +1672,7 @@ def solve_heuristic_rolling_horizon(
     route = [start_node]
     visited = {start_node}
     steps = 0
-    max_arcs = num_n - 1
+    max_arcs = min(num_n - 1, k_max - 1) if k_max is not None else num_n - 1
 
     while steps < max_arcs:
         # Decision uses the current-day matrix (causal, same info as DRL).
@@ -1638,6 +1712,7 @@ def solve_heuristic_rolling_horizon_lookahead(
     start_node, time_m, rate_stack, loads_stack,
     distance_arr, diesel_arr, max_d, num_n, start_day_idx,
     lookahead: int = 3,
+    k_max=None,
 ):
     """Rolling Horizon Greedy with Deterministic Lookahead.
 
@@ -1661,12 +1736,18 @@ def solve_heuristic_rolling_horizon_lookahead(
     ----------
     lookahead : int — pasos de simulación hacia adelante por candidato (default 3).
                 lookahead=1 es equivalente a solve_heuristic_rolling_horizon.
+    k_max : int | None — presupuesto de cardinalidad (ver solve_heuristic_rolling_horizon).
+        None (default) = caso libre. Nota: el scoring de _lookahead_score no
+        conoce k_max (puede simular pasos más allá del presupuesto al puntuar
+        candidatos); esto no rompe la garantía ≤K porque la construcción real
+        de la ruta está acotada por max_arcs más abajo, solo puede desafinar
+        ligeramente el ranking de candidatos cerca del límite de K.
 
     Devuelve: status, route, total_reward, total_duration, is_valid
     (mismo formato que solve_heuristic_rolling_horizon).
     """
     num_days  = rate_stack.shape[0]
-    max_arcs  = num_n - 1
+    max_arcs  = min(num_n - 1, k_max - 1) if k_max is not None else num_n - 1
 
     if hasattr(time_m, 'iloc'):
         time_m = np.array(time_m, dtype=float)
@@ -1774,6 +1855,7 @@ def solve_heuristic_rolling_horizon_lookahead_stochastic(
     distance_arr, diesel_arr, max_d, num_n, start_day_idx,
     avail_prob_arr,
     lookahead=3,
+    k_max=None,
 ):
     """Extensión estocástica de solve_heuristic_rolling_horizon_lookahead.
 
@@ -1787,12 +1869,17 @@ def solve_heuristic_rolling_horizon_lookahead_stochastic(
     para garantizar paridad bit-exact con DRL Real y RH-Greedy Real.
 
     Con lookahead=1 la función es idéntica a solve_heuristic_rolling_horizon_stochastic.
+
+    k_max : int | None — presupuesto de cardinalidad (ver
+        solve_heuristic_rolling_horizon). None (default) = caso libre. Mismo
+        matiz que la variante determinista: _lookahead_score no conoce k_max,
+        pero la construcción real de la ruta sí está acotada por max_arcs.
     """
     from problem_data import draw_lane_availability
 
     num_days = rate_stack.shape[0]
     max_day  = num_days - 1
-    max_arcs = num_n - 1
+    max_arcs = min(num_n - 1, k_max - 1) if k_max is not None else num_n - 1
 
     if hasattr(time_m, 'iloc'):
         time_m = np.array(time_m, dtype=float)
@@ -1904,6 +1991,7 @@ def _rh_greedy_stoch_from_state(
     start_node, time_m, rate_stack, loads_stack,
     distance_arr, diesel_arr, max_d, num_n, start_day_idx,
     avail_prob_arr,
+    k_max=None,
 ):
     """Greedy estocástico desde un estado arbitrario (current_node, time_elapsed, visited).
 
@@ -1915,12 +2003,17 @@ def _rh_greedy_stoch_from_state(
     usando el mismo filtrado Bernoulli y la misma lógica de día dinámico que el resto
     del sistema. No recibe seed: draw_lane_availability es determinista dado
     (start_day_idx, node, arrival_day), así que una sola llamada es suficiente.
+
+    k_max : int | None — presupuesto de cardinalidad ABSOLUTO (no restante):
+        `steps = len(visited) - 1` ya cuenta los arcos usados desde el
+        start_node real (visited se hereda del rollout exterior), así que
+        pasar el mismo k_max absoluto del llamador basta sin más ajuste.
     """
     from problem_data import draw_lane_availability
 
     num_days = rate_stack.shape[0]
     max_day = num_days - 1
-    max_arcs = num_n - 1
+    max_arcs = min(num_n - 1, k_max - 1) if k_max is not None else num_n - 1
 
     if hasattr(time_m, 'iloc'):
         time_m = np.array(time_m, dtype=float)
@@ -1982,6 +2075,7 @@ def solve_mc_rollout_stochastic(
     avail_prob_arr,
     n_simulations=1,
     lookahead_base_policy='rh_greedy',
+    k_max=None,
 ):
     """Monte Carlo Rollout estocástico (VFA/policy rollout).
 
@@ -2003,6 +2097,8 @@ def solve_mc_rollout_stochastic(
                     entre sí bajo draw_lane_availability determinista (nota histórica:
                     el parámetro seed que se pasaba nunca tuvo efecto sobre el resultado).
     lookahead_base_policy : str — política base usada ('rh_greedy').
+    k_max : int | None — presupuesto de cardinalidad (ver
+        solve_heuristic_rolling_horizon). None (default) = caso libre.
 
     Returns
     -------
@@ -2017,7 +2113,7 @@ def solve_mc_rollout_stochastic(
 
     num_days = rate_stack.shape[0]
     max_day = num_days - 1
-    max_arcs = num_n - 1
+    max_arcs = min(num_n - 1, k_max - 1) if k_max is not None else num_n - 1
 
     _get_rm = _make_rm_cache(rate_stack, loads_stack, distance_arr, diesel_arr,
                              start_day_idx, max_day, as_numpy=True)
@@ -2064,6 +2160,7 @@ def solve_mc_rollout_stochastic(
                 start_node, time_m, rate_stack, loads_stack,
                 distance_arr, diesel_arr, max_d, num_n, start_day_idx,
                 avail_prob_arr,
+                k_max=k_max,
             )
 
             q_value = imm_reward + future_r
@@ -2092,12 +2189,16 @@ def solve_mc_rollout_stochastic(
 def solve_heuristic_rolling_horizon_stochastic(
     start_node, time_m, rate_stack, loads_stack,
     distance_arr, diesel_arr, max_d, num_n, start_day_idx, avail_prob_arr,
+    k_max=None,
 ):
     """Variante estocástica de solve_heuristic_rolling_horizon.
 
     Idéntica a la versión determinista salvo que en cada paso descarta los
     nodos cuya lane está bloqueada según draw_lane_availability (mundo Bernoulli).
     La evaluación final usa simulate_route_reward con avail_prob_arr.
+
+    k_max : int | None — presupuesto de cardinalidad (ver
+        solve_heuristic_rolling_horizon). None (default) = caso libre.
     """
     from problem_data import draw_lane_availability
 
@@ -2115,7 +2216,7 @@ def solve_heuristic_rolling_horizon_stochastic(
     route = [start_node]
     visited = {start_node}
     steps = 0
-    max_arcs = num_n - 1
+    max_arcs = min(num_n - 1, k_max - 1) if k_max is not None else num_n - 1
 
     while steps < max_arcs:
         rm = _get_rm(time_elapsed)

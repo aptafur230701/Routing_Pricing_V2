@@ -78,6 +78,15 @@ SELF_CRITICAL_COEF           = 0.5     # peso del término self-critical en el l
 SELF_CRITICAL_WARMUP_UPDATES = 50      # no aplicar self-critical hasta este update
                                         # (deja que el crítico se estabilice primero)
 
+# ── Cardinalidad de ruta (K) ───────────────────────────────────
+K_MIN  = 4    # mínimo K entrenado — pertinencia operativa (4-5 cargas por tour)
+K_MAX  = 8    # máximo K entrenado
+K_NORM = K_MAX  # normalizador GLOBAL de k_remaining_norm (no por episodio): con
+                # K_NORM=8, K=4 arranca en 0.5 y K=8 arranca en 1.0, permitiendo
+                # que la red distinga el nivel de K desde el primer paso.
+K_LEVELS          = [4, 5, 6, 7, 8]      # niveles restringidos de entrenamiento
+K_TRAINING_LEVELS = K_LEVELS + [None]    # + caso libre (None) — 6 niveles en total
+
 # ── Train / eval split ───────────────────────────────────────
 TRAIN_DAYS = 90   # días usados para entrenamiento; el resto (días 90-119) queda para evaluación
 

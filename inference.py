@@ -12,12 +12,12 @@ Uso
 """
 
 import os
-import torch
 import numpy as np
 
 from config import DEVICE, MAX_DURATION, get_beam_width
 from am_agent import AMRoutingAgent
 from problem_data import load_matrices, build_day_matrices
+from transfer_learning import load_checkpoint_compatible
 
 # ── Configuración ─────────────────────────────────────────────────────────────
 
@@ -28,16 +28,22 @@ CHECKPOINT_NAME = f"am_checkpoint_{NUM_NODES}nodes.pt"
 # ── Carga del modelo ──────────────────────────────────────────────────────────
 
 def load_agent(checkpoint_path: str) -> AMRoutingAgent:
-    """Instancia el agente y carga los pesos del checkpoint."""
+    """Instancia el agente y carga los pesos del checkpoint.
+
+    Usa load_checkpoint_compatible (transfer_learning.py) en vez de un
+    load_state_dict estricto: tolera checkpoints guardados antes del
+    condicionamiento en K (expansión en cero de context_net.proj), y es
+    idéntico a un load estricto para checkpoints ya compatibles con la
+    arquitectura actual. Mantiene los mismos hiperparámetros de arquitectura
+    (defaults de AMRoutingAgent) que esta función ya usaba.
+    """
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
             f"No se encontró el checkpoint: {checkpoint_path}\n"
             f"Asegúrate de haber ejecutado main.py antes de correr inference.py."
         )
 
-    agent = AMRoutingAgent(num_nodes=NUM_NODES, device=DEVICE)
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-    agent.load_state_dict(checkpoint["agent"])
+    agent, _critic = load_checkpoint_compatible(checkpoint_path, num_nodes=NUM_NODES)
     agent.eval()
     return agent
 

@@ -19,6 +19,7 @@ from config import (
     REWARD_SCALE_FACTOR,
     N_EVAL_EPISODES, SEED, TRAIN_DAYS,
     get_beam_width_real,
+    K_LEVELS,
 )
 from problem_data import build_day_matrices
 from Solvers import (
@@ -51,11 +52,16 @@ def rollout_drl_env(
     beam_width:     int        = None,
     critic                     = None,
     value_coef:     float      = 1.0,
+    k_max:          int        = None,
 ) -> tuple:
     """Beam search con días de mercado dinámicos.
 
     Delega en agent.beam_search_dynamic(): las decisiones y la recompensa acumulada
     usan la matriz del día corriente según el time_elapsed de cada beam.
+
+    k_max : int | None — presupuesto de cardinalidad (nº de arcos, incluido
+        el retorno). None (default) = caso libre, comportamiento idéntico al
+        de antes de introducir el condicionamiento en K.
     """
     agent.eval()
     try:
@@ -67,12 +73,282 @@ def rollout_drl_env(
             avail_prob_arr=avail_prob_arr,
             beam_width=beam_width,
             critic=critic, value_coef=value_coef,
+            k_max=k_max,
         )
     finally:
         agent.train()
 
 
 # ── Solver comparison ─────────────────────────────────────────
+
+# Claves internas de timing compartidas por _run_comparison_cell / ambas
+# funciones públicas — deben coincidir con las claves de dict que devuelve
+# _run_comparison_cell() y con el mapeo a nombres de columna de `timing`.
+_TIMING_KEYS = (
+    'drl_real', 'drl_det', 'rh_greedy', 'rh_lookahead',
+    'rh_stoch', 'rh_lookahead_stoch', 'mc_rollout', 'hga_lns',
+    'ls_exact', 'ls_oracle',
+)
+
+
+def _run_comparison_cell(
+    agent, s, day_idx, rep,
+    time_matrix, time_matrix_np,
+    rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
+    ltr_stack, trucks_stack, avail_prob_arr, critic,
+    k_max=None, verbose=True,
+) -> tuple:
+    """Ejecuta DRL Real + DRL Det + los 8 solvers baseline para un
+    (start_node=s, day_idx, k_max) y construye las columnas de resultado.
+
+    Extraído del cuerpo de run_solver_comparison() para poder reusarlo tanto
+    en el caso libre (run_solver_comparison, k_max=None) como en el sweep por
+    K (run_solver_comparison_by_k, un k_max por llamada) sin duplicar las ~10
+    llamadas a solvers. No añade las columnas de contexto ('Start Node',
+    'Rep', días) — esas las añade el llamador.
+
+    k_max : int | None — presupuesto de cardinalidad (nº de arcos, incluido
+        el retorno). None (default) = caso libre, comportamiento idéntico al
+        de antes de introducir el condicionamiento en K.
+
+    Retorna (row: dict, times: dict[str, float]) — times usa las claves de
+    _TIMING_KEYS.
+    """
+    row = {}
+    times = {}
+
+    # ── DRL Real — rollout único bajo revelación post-decisión (mundo fijo por seed) ──
+    t0 = time.time()
+    drl_real_route, drl_real_reward, drl_real_duration = rollout_drl_env(
+        agent, s, day_idx,
+        time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
+        ltr_stack=ltr_stack, trucks_stack=trucks_stack,
+        avail_prob_arr=avail_prob_arr,
+        beam_width=get_beam_width_real(num_nodes),
+        critic=critic,
+        k_max=k_max,
+    )
+    times['drl_real'] = time.time() - t0
+    drl_real_valid = drl_real_route is not None
+    row.update({
+        'DRL Real Route':    drl_real_route,
+        'DRL Real Reward':   drl_real_reward   if drl_real_valid else -np.inf,
+        'DRL Real Duration': drl_real_duration if drl_real_valid else np.inf,
+        'DRL Real Valid':    drl_real_valid,
+    })
+    _p_drl_real = f"  DRL Real:       {drl_real_route} | reward {drl_real_reward:.1f}"
+
+    # ── DRL Det — ruta construida y evaluada sin Bernoulli ───────────────
+    # avail_prob_arr=None desactiva el filtrado de lanes en beam_search_dynamic.
+    # El reward se recomputa explícitamente con simulate_route_reward para
+    # garantizar paridad bit-a-bit con el mundo determinista.
+    t0 = time.time()
+    drl_det_route, _, drl_det_duration_raw = rollout_drl_env(
+        agent, s, day_idx,
+        time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
+        ltr_stack=ltr_stack, trucks_stack=trucks_stack,
+        avail_prob_arr=None,   # sin Bernoulli → mundo determinista
+        critic=critic,
+        k_max=k_max,
+    )
+    drl_det_valid = drl_det_route is not None
+    if drl_det_valid:
+        drl_det_reward, drl_det_duration = simulate_route_reward(
+            drl_det_route, s, day_idx,
+            time_matrix_np, rate_stack, loads_stack, distance_arr, diesel_arr,
+            avail_prob_arr=None,
+        )
+    else:
+        drl_det_reward, drl_det_duration = -np.inf, np.inf
+    times['drl_det'] = time.time() - t0
+    row.update({
+        'DRL Det Route':    drl_det_route,
+        'DRL Det Reward':   drl_det_reward   if drl_det_valid else -np.inf,
+        'DRL Det Duration': drl_det_duration if drl_det_valid else np.inf,
+        'DRL Det Valid':    drl_det_valid,
+    })
+    _p_drl_det = f"  DRL Det:        {drl_det_route} | reward {drl_det_reward:.1f}"
+
+    # ── RH-Greedy — greedy miope con día dinámico ────────────────────────
+    t0 = time.time()
+    rh_status, rh_route, rh_reward, rh_duration, rh_valid = \
+        solve_heuristic_rolling_horizon(
+            s, time_matrix, rate_stack, loads_stack,
+            distance_arr, diesel_arr, MAX_DURATION, num_nodes,
+            start_day_idx=day_idx, k_max=k_max,
+        )
+    times['rh_greedy'] = time.time() - t0
+    row.update({
+        'RH-Greedy Route':    rh_route,
+        'RH-Greedy Reward':   rh_reward if rh_valid else -np.inf,
+        'RH-Greedy Duration': rh_duration if rh_route else np.inf,
+        'RH-Greedy Valid':    rh_valid,
+    })
+    _p_rh_greedy = f"  RH-Greedy:      {rh_route} | reward {rh_reward:.1f}"
+
+    # ── RH-Lookahead — rolling horizon con lookahead determinista ─────────
+    t0 = time.time()
+    rhl_status, rhl_route, rhl_reward, rhl_duration, rhl_valid = \
+        solve_heuristic_rolling_horizon_lookahead(
+            s, time_matrix, rate_stack, loads_stack,
+            distance_arr, diesel_arr, MAX_DURATION, num_nodes,
+            start_day_idx=day_idx, lookahead=3, k_max=k_max,
+        )
+    times['rh_lookahead'] = time.time() - t0
+    row.update({
+        'RH-Lookahead Route':    rhl_route,
+        'RH-Lookahead Reward':   rhl_reward if rhl_valid else -np.inf,
+        'RH-Lookahead Duration': rhl_duration if rhl_route else np.inf,
+        'RH-Lookahead Valid':    rhl_valid,
+    })
+    _p_rh_lookahead = f"  RH-Lookahead:   {rhl_route} | reward {rhl_reward:.1f}"
+
+    # ── RH-Greedy Real — greedy miope en mundo estocástico ───────────────
+    t0 = time.time()
+    rh_stoch_status, rh_stoch_route, rh_stoch_reward, rh_stoch_duration, rh_stoch_valid = \
+        solve_heuristic_rolling_horizon_stochastic(
+            s, time_matrix, rate_stack, loads_stack,
+            distance_arr, diesel_arr, MAX_DURATION, num_nodes,
+            start_day_idx=day_idx, avail_prob_arr=avail_prob_arr, k_max=k_max,
+        )
+    times['rh_stoch'] = time.time() - t0
+    row.update({
+        'RH-Greedy Real Route':    rh_stoch_route,
+        'RH-Greedy Real Reward':   rh_stoch_reward if rh_stoch_valid else -np.inf,
+        'RH-Greedy Real Duration': rh_stoch_duration if rh_stoch_route else np.inf,
+        'RH-Greedy Real Valid':    rh_stoch_valid,
+    })
+    _p_rh_greedy_real = f"  RH-Greedy Real: {rh_stoch_route} | reward {rh_stoch_reward:.1f}"
+
+    # ── RH-Lookahead Real — lookahead en mundo estocástico ────────────────
+    t0 = time.time()
+    rhlr_status, rhlr_route, rhlr_reward, rhlr_duration, rhlr_valid = \
+        solve_heuristic_rolling_horizon_lookahead_stochastic(
+            s, time_matrix, rate_stack, loads_stack,
+            distance_arr, diesel_arr, MAX_DURATION, num_nodes,
+            start_day_idx=day_idx, avail_prob_arr=avail_prob_arr, lookahead=3, k_max=k_max,
+        )
+    times['rh_lookahead_stoch'] = time.time() - t0
+    row.update({
+        'RH-Lookahead Real Route':    rhlr_route,
+        'RH-Lookahead Real Reward':   rhlr_reward if rhlr_valid else -np.inf,
+        'RH-Lookahead Real Duration': rhlr_duration if rhlr_route else np.inf,
+        'RH-Lookahead Real Valid':    rhlr_valid,
+    })
+    _p_rh_lookahead_real = f"  RH-Lookahead Real: {rhlr_route} | reward {rhlr_reward:.1f}"
+
+    # ── MC-Rollout estocástico ────────────────────────────────────────────
+    t0 = time.time()
+    mc_status, mc_route, mc_reward, mc_duration, mc_valid = \
+        solve_mc_rollout_stochastic(
+            s, time_matrix, rate_stack, loads_stack,
+            distance_arr, diesel_arr, MAX_DURATION, num_nodes,
+            start_day_idx=day_idx, avail_prob_arr=avail_prob_arr, k_max=k_max,
+        )
+    times['mc_rollout'] = time.time() - t0
+    row.update({
+        'MC-Rollout Route':    mc_route,
+        'MC-Rollout Reward':   mc_reward if mc_valid else -np.inf,
+        'MC-Rollout Duration': mc_duration if mc_route else np.inf,
+        'MC-Rollout Valid':    mc_valid,
+    })
+    _p_mc_rollout = f"  MC-Rollout:     {mc_route} | reward {mc_reward:.1f}"
+
+    # ── HGA-LNS ──────────────────────────────────────────────────────────
+    if verbose:
+        print(f"  [HGA-LNS]...", end=" ", flush=True)
+    t0 = time.time()
+    hga_status, hga_route, hga_reward, hga_duration = solve_HGA_LNS_metaheuristic(
+        s, time_matrix, MAX_DURATION, num_nodes,
+        rate_stack=rate_stack, loads_stack=loads_stack,
+        distance_arr=distance_arr, diesel_arr=diesel_arr,
+        start_day_idx=day_idx,
+        seed=SEED + s * 1000 + rep,
+        k_max=k_max,
+    )
+    times['hga_lns'] = time.time() - t0
+    if verbose:
+        print(f"{times['hga_lns']:.1f}s", flush=True)
+    row.update({
+        'HGA-LNS Status':   hga_status,
+        'HGA-LNS Route':    hga_route,
+        'HGA-LNS Reward':   hga_reward   if hga_status == 'Optimal' else -np.inf,
+        'HGA-LNS Duration': hga_duration if hga_status == 'Optimal' else np.inf,
+        'HGA-LNS Valid':    hga_status == 'Optimal' and hga_route is not None,
+    })
+    _p_hga_lns = f"  HGA-LNS:        {hga_route} | reward {hga_reward:.1f}"
+
+    # ── Label-Setting Exact ───────────────────────────────────────────────
+    if verbose:
+        print(f"  [LS-Exact]...", end=" ", flush=True)
+    t0 = time.time()
+    ls_status, ls_route, ls_reward, ls_duration = solve_label_setting_exact(
+        s, time_matrix_np, rate_stack, loads_stack,
+        distance_arr, diesel_arr, MAX_DURATION, num_nodes,
+        start_day_idx=day_idx,
+        time_limit_seconds=300,
+        k_max=k_max,
+    )
+    times['ls_exact'] = time.time() - t0
+    if verbose:
+        print(f"{times['ls_exact']:.1f}s", flush=True)
+    ls_valid = ls_status in ("Optimal", "Time-Limited") and ls_route is not None
+    row.update({
+        'LS-Exact Status':   ls_status,
+        'LS-Exact Route':    ls_route,
+        'LS-Exact Reward':   ls_reward   if ls_valid else -np.inf,
+        'LS-Exact Duration': ls_duration if ls_valid else np.inf,
+        'LS-Exact Valid':    ls_valid,
+    })
+    _p_ls_exact = f"  LS-Exact:       {ls_route} | reward {ls_reward:.1f} [{ls_status}]"
+
+    # ── Label Setting Oracle (cota clarividente, mundo estocástico) ───────────
+    if verbose:
+        print(f"  [LS-Oracle]...", end=" ", flush=True)
+    t0 = time.time()
+    lso_status, lso_route, lso_reward, lso_duration = solve_label_setting_oracle(
+        s, time_matrix_np, rate_stack, loads_stack,
+        distance_arr, diesel_arr, MAX_DURATION, num_nodes,
+        start_day_idx=day_idx,
+        avail_prob_arr=avail_prob_arr,
+        time_limit_seconds=300,
+        k_max=k_max,
+    )
+    times['ls_oracle'] = time.time() - t0
+    if verbose:
+        print(f"{times['ls_oracle']:.1f}s", flush=True)
+    lso_valid = lso_status in ("Optimal", "Time-Limited") and lso_route is not None
+    row.update({
+        'LS-Oracle Status':   lso_status,
+        'LS-Oracle Route':    lso_route,
+        'LS-Oracle Reward':   lso_reward   if lso_valid else -np.inf,
+        'LS-Oracle Duration': lso_duration if lso_valid else np.inf,
+        'LS-Oracle Valid':    lso_valid,
+    })
+    assert lso_reward >= row.get('DRL Real Reward', -np.inf) - 1e-3, (
+        f"LS-Oracle ({lso_reward:.1f}) no debería ser superado por DRL Real "
+        f"({row.get('DRL Real Reward', float('nan')):.1f}) en start={s} day={day_idx} "
+        f"k_max={k_max} — revisar alineación de semillas Bernoulli."
+    )
+    _p_ls_oracle = f"  LS-Oracle:      {lso_route} | reward {lso_reward:.1f} [{lso_status}]"
+
+    if verbose:
+        print("  -- Determinísticos --")
+        print(_p_drl_det)
+        print(_p_rh_greedy)
+        print(_p_rh_lookahead)
+        print(_p_hga_lns)
+        print(_p_ls_exact)
+        print("  -- Estocásticos --")
+        print(_p_drl_real)
+        print(_p_rh_greedy_real)
+        print(_p_rh_lookahead_real)
+        print(_p_mc_rollout)
+        print(_p_ls_oracle)
+
+    return row, times
+
+
 def run_solver_comparison(agent, time_matrix,
                            rate_stack, loads_stack, distance_arr, diesel_arr,
                            num_nodes,
@@ -84,19 +360,13 @@ def run_solver_comparison(agent, time_matrix,
     (días TRAIN_DAYS … total-1), sin repetición dentro del mismo nodo. Los índices
     se pre-generan con un RNG dedicado antes del loop para que no dependan del
     estado random del agente.
+
+    Caso libre (sin K) — delega en _run_comparison_cell(k_max=None). Para la
+    comparación por nivel de K, ver run_solver_comparison_by_k().
     """
-    results          = []
-    drl_real_times   = []
-    drl_det_times    = []
-    hga_lns_times    = []
-    ls_exact_times   = []
-    ls_oracle_times  = []
-    rh_greedy_times  = []
-    rh_lookahead_times = []
-    rh_stoch_times   = []
-    rh_lookahead_stoch_times = []
-    mc_rollout_times = []
-    num_days         = rate_stack.shape[0]
+    results   = []
+    times_acc = {k: [] for k in _TIMING_KEYS}
+    num_days  = rate_stack.shape[0]
 
     rng = np.random.default_rng(SEED)
     if n_days_per_node > num_days:
@@ -121,238 +391,123 @@ def run_solver_comparison(agent, time_matrix,
             print(f"\nStart node {s}/{num_nodes-1} | rep {rep}/{n_days_per_node-1} | eval day {day_idx} (abs day {abs_day_idx})", flush=True)
             row = {'Start Node': s, 'Rep': rep, 'Eval Day Index': day_idx, 'Abs Day Index': abs_day_idx}
 
-            # ── DRL Real — rollout único bajo revelación post-decisión (mundo fijo por seed) ──
-            t0 = time.time()
-            drl_real_route, drl_real_reward, drl_real_duration = rollout_drl_env(
-                agent, s, day_idx,
-                time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-                ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-                avail_prob_arr=avail_prob_arr,
-                beam_width=get_beam_width_real(num_nodes),
-                critic=critic,
+            cell_row, cell_times = _run_comparison_cell(
+                agent, s, day_idx, rep,
+                time_matrix, time_matrix_np,
+                rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
+                ltr_stack, trucks_stack, avail_prob_arr, critic,
+                k_max=None, verbose=True,
             )
-            drl_real_times.append(time.time() - t0)
-            drl_real_valid = drl_real_route is not None
-            row.update({
-                'DRL Real Route':    drl_real_route,
-                'DRL Real Reward':   drl_real_reward   if drl_real_valid else -np.inf,
-                'DRL Real Duration': drl_real_duration if drl_real_valid else np.inf,
-                'DRL Real Valid':    drl_real_valid,
-            })
-            _p_drl_real = f"  DRL Real:       {drl_real_route} | reward {drl_real_reward:.1f}"
-
-            # ── DRL Det — ruta construida y evaluada sin Bernoulli ───────────────
-            # avail_prob_arr=None desactiva el filtrado de lanes en beam_search_dynamic.
-            # El reward se recomputa explícitamente con simulate_route_reward para
-            # garantizar paridad bit-a-bit con el mundo determinista.
-            t0 = time.time()
-            drl_det_route, _, drl_det_duration_raw = rollout_drl_env(
-                agent, s, day_idx,
-                time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-                ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-                avail_prob_arr=None,   # sin Bernoulli → mundo determinista
-                critic=critic,
-            )
-            drl_det_valid = drl_det_route is not None
-            if drl_det_valid:
-                drl_det_reward, drl_det_duration = simulate_route_reward(
-                    drl_det_route, s, day_idx,
-                    time_matrix_np, rate_stack, loads_stack, distance_arr, diesel_arr,
-                    avail_prob_arr=None,
-                )
-            else:
-                drl_det_reward, drl_det_duration = -np.inf, np.inf
-            drl_det_times.append(time.time() - t0)
-            row.update({
-                'DRL Det Route':    drl_det_route,
-                'DRL Det Reward':   drl_det_reward   if drl_det_valid else -np.inf,
-                'DRL Det Duration': drl_det_duration if drl_det_valid else np.inf,
-                'DRL Det Valid':    drl_det_valid,
-            })
-            _p_drl_det = f"  DRL Det:        {drl_det_route} | reward {drl_det_reward:.1f}"
-
-            # ── RH-Greedy — greedy miope con día dinámico ────────────────────────
-            t0 = time.time()
-            rh_status, rh_route, rh_reward, rh_duration, rh_valid = \
-                solve_heuristic_rolling_horizon(
-                    s, time_matrix, rate_stack, loads_stack,
-                    distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-                    start_day_idx=day_idx,
-                )
-            rh_greedy_times.append(time.time() - t0)
-            row.update({
-                'RH-Greedy Route':    rh_route,
-                'RH-Greedy Reward':   rh_reward if rh_valid else -np.inf,
-                'RH-Greedy Duration': rh_duration if rh_route else np.inf,
-                'RH-Greedy Valid':    rh_valid,
-            })
-            _p_rh_greedy = f"  RH-Greedy:      {rh_route} | reward {rh_reward:.1f}"
-
-            # ── RH-Lookahead — rolling horizon con lookahead determinista ─────────
-            t0 = time.time()
-            rhl_status, rhl_route, rhl_reward, rhl_duration, rhl_valid = \
-                solve_heuristic_rolling_horizon_lookahead(
-                    s, time_matrix, rate_stack, loads_stack,
-                    distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-                    start_day_idx=day_idx, lookahead=3,
-                )
-            rh_lookahead_times.append(time.time() - t0)
-            row.update({
-                'RH-Lookahead Route':    rhl_route,
-                'RH-Lookahead Reward':   rhl_reward if rhl_valid else -np.inf,
-                'RH-Lookahead Duration': rhl_duration if rhl_route else np.inf,
-                'RH-Lookahead Valid':    rhl_valid,
-            })
-            _p_rh_lookahead = f"  RH-Lookahead:   {rhl_route} | reward {rhl_reward:.1f}"
-
-            # ── RH-Greedy Real — greedy miope en mundo estocástico ───────────────
-            t0 = time.time()
-            rh_stoch_status, rh_stoch_route, rh_stoch_reward, rh_stoch_duration, rh_stoch_valid = \
-                solve_heuristic_rolling_horizon_stochastic(
-                    s, time_matrix, rate_stack, loads_stack,
-                    distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-                    start_day_idx=day_idx, avail_prob_arr=avail_prob_arr,
-                )
-            rh_stoch_times.append(time.time() - t0)
-            row.update({
-                'RH-Greedy Real Route':    rh_stoch_route,
-                'RH-Greedy Real Reward':   rh_stoch_reward if rh_stoch_valid else -np.inf,
-                'RH-Greedy Real Duration': rh_stoch_duration if rh_stoch_route else np.inf,
-                'RH-Greedy Real Valid':    rh_stoch_valid,
-            })
-            _p_rh_greedy_real = f"  RH-Greedy Real: {rh_stoch_route} | reward {rh_stoch_reward:.1f}"
-
-            # ── RH-Lookahead Real — lookahead en mundo estocástico ────────────────
-            t0 = time.time()
-            rhlr_status, rhlr_route, rhlr_reward, rhlr_duration, rhlr_valid = \
-                solve_heuristic_rolling_horizon_lookahead_stochastic(
-                    s, time_matrix, rate_stack, loads_stack,
-                    distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-                    start_day_idx=day_idx, avail_prob_arr=avail_prob_arr, lookahead=3,
-                )
-            rh_lookahead_stoch_times.append(time.time() - t0)
-            row.update({
-                'RH-Lookahead Real Route':    rhlr_route,
-                'RH-Lookahead Real Reward':   rhlr_reward if rhlr_valid else -np.inf,
-                'RH-Lookahead Real Duration': rhlr_duration if rhlr_route else np.inf,
-                'RH-Lookahead Real Valid':    rhlr_valid,
-            })
-            _p_rh_lookahead_real = f"  RH-Lookahead Real: {rhlr_route} | reward {rhlr_reward:.1f}"
-
-            # ── MC-Rollout estocástico ────────────────────────────────────────────
-            t0 = time.time()
-            mc_status, mc_route, mc_reward, mc_duration, mc_valid = \
-                solve_mc_rollout_stochastic(
-                    s, time_matrix, rate_stack, loads_stack,
-                    distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-                    start_day_idx=day_idx, avail_prob_arr=avail_prob_arr,
-                )
-            mc_rollout_times.append(time.time() - t0)
-            row.update({
-                'MC-Rollout Route':    mc_route,
-                'MC-Rollout Reward':   mc_reward if mc_valid else -np.inf,
-                'MC-Rollout Duration': mc_duration if mc_route else np.inf,
-                'MC-Rollout Valid':    mc_valid,
-            })
-            _p_mc_rollout = f"  MC-Rollout:     {mc_route} | reward {mc_reward:.1f}"
-
-            # ── HGA-LNS ──────────────────────────────────────────────────────────
-            print(f"  [HGA-LNS]...", end=" ", flush=True)
-            t0 = time.time()
-            hga_status, hga_route, hga_reward, hga_duration = solve_HGA_LNS_metaheuristic(
-                s, time_matrix, MAX_DURATION, num_nodes,
-                rate_stack=rate_stack, loads_stack=loads_stack,
-                distance_arr=distance_arr, diesel_arr=diesel_arr,
-                start_day_idx=day_idx,
-                seed=SEED + s * 1000 + rep,
-            )
-            hga_lns_times.append(time.time() - t0)
-            print(f"{hga_lns_times[-1]:.1f}s", flush=True)
-            row.update({
-                'HGA-LNS Status':   hga_status,
-                'HGA-LNS Route':    hga_route,
-                'HGA-LNS Reward':   hga_reward   if hga_status == 'Optimal' else -np.inf,
-                'HGA-LNS Duration': hga_duration if hga_status == 'Optimal' else np.inf,
-                'HGA-LNS Valid':    hga_status == 'Optimal' and hga_route is not None,
-            })
-            _p_hga_lns = f"  HGA-LNS:        {hga_route} | reward {hga_reward:.1f}"
-
-            # ── Label-Setting Exact ───────────────────────────────────────────────
-            print(f"  [LS-Exact]...", end=" ", flush=True)
-            t0 = time.time()
-            ls_status, ls_route, ls_reward, ls_duration = solve_label_setting_exact(
-                s, time_matrix_np, rate_stack, loads_stack,
-                distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-                start_day_idx=day_idx,
-                time_limit_seconds=300,
-            )
-            ls_exact_times.append(time.time() - t0)
-            print(f"{ls_exact_times[-1]:.1f}s", flush=True)
-            ls_valid = ls_status in ("Optimal", "Time-Limited") and ls_route is not None
-            row.update({
-                'LS-Exact Status':   ls_status,
-                'LS-Exact Route':    ls_route,
-                'LS-Exact Reward':   ls_reward   if ls_valid else -np.inf,
-                'LS-Exact Duration': ls_duration if ls_valid else np.inf,
-                'LS-Exact Valid':    ls_valid,
-            })
-            _p_ls_exact = f"  LS-Exact:       {ls_route} | reward {ls_reward:.1f} [{ls_status}]"
-
-            # ── Label Setting Oracle (cota clarividente, mundo estocástico) ───────────
-            print(f"  [LS-Oracle]...", end=" ", flush=True)
-            t0 = time.time()
-            lso_status, lso_route, lso_reward, lso_duration = solve_label_setting_oracle(
-                s, time_matrix_np, rate_stack, loads_stack,
-                distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-                start_day_idx=day_idx,
-                avail_prob_arr=avail_prob_arr,
-                time_limit_seconds=300,
-            )
-            ls_oracle_times.append(time.time() - t0)
-            print(f"{ls_oracle_times[-1]:.1f}s", flush=True)
-            lso_valid = lso_status in ("Optimal", "Time-Limited") and lso_route is not None
-            row.update({
-                'LS-Oracle Status':   lso_status,
-                'LS-Oracle Route':    lso_route,
-                'LS-Oracle Reward':   lso_reward   if lso_valid else -np.inf,
-                'LS-Oracle Duration': lso_duration if lso_valid else np.inf,
-                'LS-Oracle Valid':    lso_valid,
-            })
-            assert lso_reward >= row.get('DRL Real Reward', -np.inf) - 1e-3, (
-                f"LS-Oracle ({lso_reward:.1f}) no debería ser superado por DRL Real "
-                f"({row.get('DRL Real Reward', float('nan')):.1f}) en start={s} day={day_idx} "
-                f"— revisar alineación de semillas Bernoulli."
-            )
-            _p_ls_oracle = f"  LS-Oracle:      {lso_route} | reward {lso_reward:.1f} [{lso_status}]"
-
-            print("  -- Determinísticos --")
-            print(_p_drl_det)
-            print(_p_rh_greedy)
-            print(_p_rh_lookahead)
-            print(_p_hga_lns)
-            print(_p_ls_exact)
-            print("  -- Estocásticos --")
-            print(_p_drl_real)
-            print(_p_rh_greedy_real)
-            print(_p_rh_lookahead_real)
-            print(_p_mc_rollout)
-            print(_p_ls_oracle)
+            row.update(cell_row)
+            for key, val in cell_times.items():
+                times_acc[key].append(val)
 
             results.append(row)
 
     df = pd.DataFrame(results)
 
     timing = {
-        'drl_real_times':    drl_real_times,
-        'drl_det_times':     drl_det_times,
-        'hga_lns_times':     hga_lns_times,
-        'ls_exact_times':    ls_exact_times,
-        'rh_greedy_times':            rh_greedy_times,
-        'rh_lookahead_times':         rh_lookahead_times,
-        'rh_stoch_times':             rh_stoch_times,
-        'rh_lookahead_stoch_times':   rh_lookahead_stoch_times,
-        'mc_rollout_times':           mc_rollout_times,
-        'ls_oracle_times':            ls_oracle_times,
+        'drl_real_times':           times_acc['drl_real'],
+        'drl_det_times':            times_acc['drl_det'],
+        'hga_lns_times':            times_acc['hga_lns'],
+        'ls_exact_times':           times_acc['ls_exact'],
+        'rh_greedy_times':          times_acc['rh_greedy'],
+        'rh_lookahead_times':       times_acc['rh_lookahead'],
+        'rh_stoch_times':           times_acc['rh_stoch'],
+        'rh_lookahead_stoch_times': times_acc['rh_lookahead_stoch'],
+        'mc_rollout_times':         times_acc['mc_rollout'],
+        'ls_oracle_times':          times_acc['ls_oracle'],
+    }
+    return df, timing
+
+
+def run_solver_comparison_by_k(agent, time_matrix,
+                                rate_stack, loads_stack, distance_arr, diesel_arr,
+                                num_nodes,
+                                k_levels=None,
+                                ltr_stack=None, trucks_stack=None, avail_prob_arr=None,
+                                n_days_per_node=1, critic=None):
+    """Como run_solver_comparison, pero repite la comparación completa (DRL +
+    los 8 solvers baseline) para cada nivel de K en k_levels, añadiendo una
+    columna 'K' a cada fila resultante — permite comparar el gap DRL-vs-
+    oráculo (y vs. el resto de baselines) bajo presupuesto de cardinalidad
+    restringido, no solo en el caso libre.
+
+    k_levels por defecto es K_LEVELS (config.py: [4, 5, 6, 7, 8]) — el caso
+    libre ya lo cubre run_solver_comparison, así que no se repite aquí.
+
+    n_days_per_node por defecto es 1 (no 3 como en run_solver_comparison):
+    el costo ya se multiplica por len(k_levels) sobre solvers que incluyen
+    HGA-LNS y LS-Exact/LS-Oracle (estos dos con time_limit_seconds=300 cada
+    uno), así que se mantiene bajo por defecto para que el sweep sea tratable.
+
+    Función opt-in: NO se llama automáticamente desde main.py. Se invoca
+    aparte cuando se quiera la comparación por K.
+    """
+    if k_levels is None:
+        k_levels = K_LEVELS
+
+    results   = []
+    times_acc = {k: [] for k in _TIMING_KEYS}
+    num_days  = rate_stack.shape[0]
+
+    rng = np.random.default_rng(SEED)
+    if n_days_per_node > num_days:
+        raise ValueError(
+            f"n_days_per_node={n_days_per_node} excede num_days={num_days} disponibles"
+        )
+    day_indices = np.array([
+        rng.choice(num_days, size=n_days_per_node, replace=False)
+        for _ in range(num_nodes)
+    ])
+
+    time_matrix_np = np.array(time_matrix, dtype=float)
+
+    print("\n--- Solver Comparison by K (eval set) ---")
+    print(f"K levels: {list(k_levels)}")
+    print(f"Eval days: {num_days} | absolute range: [{TRAIN_DAYS}, {TRAIN_DAYS + num_days - 1}]")
+    print(f"Day assignments per node: {day_indices.tolist()}\n")
+
+    for k_max in k_levels:
+        for s in range(num_nodes):
+            for rep in range(n_days_per_node):
+                day_idx     = int(day_indices[s, rep])
+                abs_day_idx = TRAIN_DAYS + day_idx
+                print(
+                    f"\nK={k_max} | Start node {s}/{num_nodes-1} | rep {rep}/{n_days_per_node-1} "
+                    f"| eval day {day_idx} (abs day {abs_day_idx})", flush=True,
+                )
+                row = {
+                    'K': k_max, 'Start Node': s, 'Rep': rep,
+                    'Eval Day Index': day_idx, 'Abs Day Index': abs_day_idx,
+                }
+
+                cell_row, cell_times = _run_comparison_cell(
+                    agent, s, day_idx, rep,
+                    time_matrix, time_matrix_np,
+                    rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
+                    ltr_stack, trucks_stack, avail_prob_arr, critic,
+                    k_max=k_max, verbose=True,
+                )
+                row.update(cell_row)
+                for key, val in cell_times.items():
+                    times_acc[key].append(val)
+
+                results.append(row)
+
+    df = pd.DataFrame(results)
+
+    timing = {
+        'drl_real_times':           times_acc['drl_real'],
+        'drl_det_times':            times_acc['drl_det'],
+        'hga_lns_times':            times_acc['hga_lns'],
+        'ls_exact_times':           times_acc['ls_exact'],
+        'rh_greedy_times':          times_acc['rh_greedy'],
+        'rh_lookahead_times':       times_acc['rh_lookahead'],
+        'rh_stoch_times':           times_acc['rh_stoch'],
+        'rh_lookahead_stoch_times': times_acc['rh_lookahead_stoch'],
+        'mc_rollout_times':         times_acc['mc_rollout'],
+        'ls_oracle_times':          times_acc['ls_oracle'],
     }
     return df, timing
 

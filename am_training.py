@@ -36,6 +36,7 @@ from config import (
     PPO_ENTROPY_COEF, PPO_ENTROPY_COEF_START, PPO_ENTROPY_COEF_END, PPO_GRAD_CLIP,
     PPO_WEIGHT_DECAY,
     USE_SELF_CRITICAL, SELF_CRITICAL_COEF, SELF_CRITICAL_WARMUP_UPDATES,
+    K_TRAINING_LEVELS,
 )
 from routing_env import RoutingEnv, VectorRoutingEnv
 from problem_data import build_day_matrices, build_rm_pen_stack
@@ -43,10 +44,43 @@ from attention_encoder import (
     build_node_features_batch,
     build_temporal_features_batch,
     build_market_features_batch,
+    build_budget_features_batch,
 )
 from am_agent import AMRoutingAgent
 from critic_head import CriticHead
 from debug_utils import check_tensor
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Muestreo balanceado de niveles de K
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _balanced_k_assignment(n: int, rng) -> list:
+    """
+    Reparte K_TRAINING_LEVELS (6 niveles, incluido el caso libre None) de
+    forma balanceada sobre n episodios y permuta. Mismo patrón que el
+    balanceo ya existente de start_nodes_arr, pero independiente (cruce
+    aproximadamente balanceado).
+
+    rng : np.random.Generator | np.random.RandomState — debe exponer
+          .permutation(n) y (si hace falta relleno) .choice/.randint.
+    """
+    n_levels  = len(K_TRAINING_LEVELS)
+    per_level = n // n_levels
+    remainder = n % n_levels
+
+    k_arr = []
+    for lvl in K_TRAINING_LEVELS:
+        k_arr += [lvl] * per_level
+    if remainder:
+        if hasattr(rng, "integers"):
+            extra_idx = rng.integers(0, n_levels, size=remainder)
+        else:
+            extra_idx = rng.randint(0, n_levels, size=remainder)
+        k_arr += [K_TRAINING_LEVELS[i] for i in extra_idx]
+
+    perm = rng.permutation(n)
+    return [k_arr[i] for i in perm]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -65,6 +99,7 @@ class RolloutBuffer:
         self.node_feats    = []   # list of np.ndarray (N, N_NODE_FEATURES)
         self.temporal_feats = []  # list of np.ndarray (3,)
         self.market_feats  = []   # list of np.ndarray (1,)
+        self.budget_feats  = []   # list of np.ndarray (2,)
         self.current_nodes = []   # list of int
         self.masks         = []   # list of np.ndarray (N,) int8
         self.actions       = []   # list of int
@@ -93,11 +128,14 @@ class RolloutBuffer:
         value:         float,
         done:          bool,
         market_feats:  np.ndarray = None,   # (1,)
+        budget_feats:  np.ndarray = None,   # (2,)
     ):
         self.node_feats.append(node_feats)
         self.temporal_feats.append(temporal)
         self.market_feats.append(market_feats if market_feats is not None
                                  else np.zeros(1, dtype=np.float32))
+        self.budget_feats.append(budget_feats if budget_feats is not None
+                                 else np.array([1.0, 0.0], dtype=np.float32))
         self.current_nodes.append(current_node)
         self.masks.append(mask)
         self.actions.append(action)
@@ -204,6 +242,7 @@ def _forward(
     mask_t:         torch.Tensor,    # (B, N) int8
     actions_t:      torch.Tensor = None,   # (B,) int64 — None en recolección
     market_feats_t: torch.Tensor = None,   # (B, 1)
+    budget_feats_t: torch.Tensor = None,   # (B, 2)
 ):
     """
     Ejecuta encoder → context → decoder → critic para un batch.
@@ -231,7 +270,7 @@ def _forward(
     current_emb = embeddings[torch.arange(B), current_nodes, :]   # (B, d_h)
     check_tensor("current_emb", current_emb)
 
-    h_t = agent.context_net(graph_emb, current_emb, temporal_t, market_feats_t)   # (B, d_h)
+    h_t = agent.context_net(graph_emb, current_emb, temporal_t, market_feats_t, budget_feats_t)   # (B, d_h)
     check_tensor("context h_t", h_t)
 
     values = critic(h_t)                                           # (B,)
@@ -275,12 +314,14 @@ def _evaluate_greedy(
     trucks_stack:     np.ndarray,
     avail_prob_arr:   np.ndarray,
     reward_global_p95: float,
+    eval_k_levels:    list = None,   # niveles de K por episodio (None ⇒ todos libres)
 ) -> tuple:
     """
     Recompensa promedio en modo greedy (beam_width=1) sobre un set fijo de
-    episodios (mismos nodos de inicio y días entre llamadas), para monitorear
-    el desempeño en el modo que de verdad se usa en producción — distinto del
-    avg_reward de los rollouts de entrenamiento, que samplean de la política.
+    episodios (mismos nodos de inicio, días y niveles de K entre llamadas),
+    para monitorear el desempeño en el modo que de verdad se usa en
+    producción — distinto del avg_reward de los rollouts de entrenamiento,
+    que samplean de la política.
 
     beam_search_dynamic devuelve route=None, reward=-np.inf cuando ningún beam
     logra cerrar el ciclo de regreso al depot dentro de max_duration. Esos
@@ -296,9 +337,11 @@ def _evaluate_greedy(
     agent.eval()
     rewards = []
     n_valid = 0
+    if eval_k_levels is None:
+        eval_k_levels = [None] * len(eval_start_nodes)
     try:
         with torch.no_grad():
-            for start_node, start_day in zip(eval_start_nodes, eval_start_days):
+            for start_node, start_day, k_max in zip(eval_start_nodes, eval_start_days, eval_k_levels):
                 route, reward, _ = agent.beam_search_dynamic(
                     int(start_node), int(start_day),
                     time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
@@ -306,6 +349,7 @@ def _evaluate_greedy(
                     ltr_stack=ltr_stack, trucks_stack=trucks_stack,
                     avail_prob_arr=avail_prob_arr,
                     reward_global_p95=reward_global_p95,
+                    k_max=k_max,
                 )
                 if route is not None:
                     n_valid += 1
@@ -335,10 +379,11 @@ def _collect_greedy_rollout(
     reward_global_p95: float,
     ltr_stack:       np.ndarray,
     num_nodes:       int,
+    k_max_arr:       list = None,   # MISMOS niveles de K que el rollout muestreado del update
 ) -> np.ndarray:
     """
     Rollout greedy (argmax, beam=1) vectorizado sobre los MISMOS
-    (start_node, start_day_idx) del update actual.
+    (start_node, start_day_idx, k_max) del update actual.
 
     Reutiliza VectorRoutingEnv (el mismo step() que la recolección muestreada)
     en vez de beam_search_dynamic, para que la fórmula de recompensa
@@ -346,7 +391,9 @@ def _collect_greedy_rollout(
     temporal) y la realización estocástica del mundo (draw_lane_availability,
     determinista en start_day_idx/node/arrival_day) sean IDÉNTICAS a las del
     rollout muestreado — condición necesaria para que la ventaja self-critical
-    (R_sample - R_greedy) compare en las mismas unidades.
+    (R_sample - R_greedy) compare en las mismas unidades. k_max_arr DEBE ser
+    el mismo del rollout muestreado: si el baseline se calcula con un K
+    distinto, la ventaja queda contaminada.
 
     Asume que agent/critic ya están en eval() (llamado entre la fase de
     recolección y la fase de update del loop principal). No samplea ni usa
@@ -356,7 +403,7 @@ def _collect_greedy_rollout(
     B = len(start_nodes_arr)
     ep_rewards = np.zeros(B, dtype=np.float32)
 
-    masks  = vec_env.reset(start_nodes_arr, start_day_idxs)
+    masks  = vec_env.reset(start_nodes_arr, start_day_idxs, k_max_arr=k_max_arr)
     active = np.ones(B, dtype=bool)
 
     with torch.no_grad():
@@ -380,16 +427,18 @@ def _collect_greedy_rollout(
             temporal = build_temporal_features_batch(time_el, step_cnt, MAX_DURATION, num_nodes)
             market   = build_market_features_batch(cur_nodes, day_idx, ltr_stack) if ltr_stack is not None \
                        else np.zeros((B, 1), dtype=np.float32)
+            budget   = build_budget_features_batch(vec_env.k_remaining, vec_env.k_restricted)
 
             node_feats_t = torch.from_numpy(node_feats).to(DEVICE)
             temporal_t   = torch.from_numpy(temporal).to(DEVICE)
             market_t     = torch.from_numpy(market).to(DEVICE)
+            budget_t     = torch.from_numpy(budget).to(DEVICE)
             cur_nodes_t  = torch.tensor(cur_nodes, dtype=torch.long, device=DEVICE)
             mask_t       = torch.from_numpy(masks).to(DEVICE)
 
             embeddings, graph_emb = agent.encoder(node_feats_t)
             current_emb = embeddings[torch.arange(B), cur_nodes_t, :]
-            h_t = agent.context_net(graph_emb, current_emb, temporal_t, market_t)
+            h_t = agent.context_net(graph_emb, current_emb, temporal_t, market_t, budget_t)
             actions_t = agent.decoder.greedy_action(h_t, embeddings, mask_t)
             actions = actions_t.cpu().numpy()
 
@@ -520,6 +569,9 @@ def run_am_training(
     eval_rng         = np.random.RandomState(SEED)
     eval_start_nodes = eval_rng.choice(num_nodes, size=n_eval_episodes, replace=False)
     eval_start_days  = eval_rng.randint(0, num_train_days, size=n_eval_episodes)
+    # Niveles de K balanceados sobre el set fijo de evaluación — mismo eval_rng
+    # dedicado (nunca np.random global), calculado una sola vez.
+    eval_k_levels    = _balanced_k_assignment(n_eval_episodes, eval_rng)
 
     episode_rewards = []
     episode_losses  = []
@@ -551,6 +603,12 @@ def run_am_training(
         start_nodes_arr = np.random.permutation(start_nodes_arr).astype(np.int64)
         start_day_idxs  = np.random.randint(0, num_train_days, size=B).astype(np.int64)
 
+        # Balanced K-level sampling: los 6 niveles (5 restringidos + libre) se
+        # reparten balanceados sobre los B episodios, con su propia permutación
+        # (np.random.permutation independiente de la de start_nodes_arr —
+        # cruce aproximadamente balanceado).
+        k_max_arr = _balanced_k_assignment(B, np.random)
+
         # Per-episode accumulators — each is a list of transition dicts.
         # Accumulated separately to keep episodes contiguous in the flat buffer,
         # since episodes of different lengths interleave in the step loop.
@@ -558,7 +616,7 @@ def run_am_training(
         last_values    = np.zeros(B, dtype=np.float32)
         truncated_flags = np.zeros(B, dtype=bool)
 
-        masks  = vec_env.reset(start_nodes_arr, start_day_idxs)   # (B, N)
+        masks  = vec_env.reset(start_nodes_arr, start_day_idxs, k_max_arr=k_max_arr)   # (B, N)
         active = np.ones(B, dtype=bool)
 
         with torch.no_grad():
@@ -583,17 +641,19 @@ def run_am_training(
                 temporal = build_temporal_features_batch(time_el, step_cnt, MAX_DURATION, num_nodes)   # (B, 3)
                 market   = build_market_features_batch(cur_nodes, day_idx, ltr_stack) if ltr_stack is not None \
                            else np.zeros((B, 1), dtype=np.float32)                                     # (B, 1)
+                budget   = build_budget_features_batch(vec_env.k_remaining, vec_env.k_restricted)      # (B, 2)
 
                 # Single forward pass over the full batch
                 node_feats_t = torch.from_numpy(node_feats).to(DEVICE)
                 temporal_t   = torch.from_numpy(temporal).to(DEVICE)
                 market_t     = torch.from_numpy(market).to(DEVICE)
+                budget_t     = torch.from_numpy(budget).to(DEVICE)
                 cur_nodes_t  = torch.tensor(cur_nodes, dtype=torch.long, device=DEVICE)
                 mask_t       = torch.from_numpy(masks).to(DEVICE)
 
                 actions_t, log_probs_t, _, values_t = _forward(
                     agent, critic, node_feats_t, temporal_t, cur_nodes_t, mask_t,
-                    market_feats_t=market_t,
+                    market_feats_t=market_t, budget_feats_t=budget_t,
                 )
                 actions   = actions_t.cpu().numpy()    # (B,) int64
                 log_probs = log_probs_t.cpu().numpy()  # (B,)
@@ -601,6 +661,7 @@ def run_am_training(
 
                 # Vectorized environment step
                 rewards, terminated, next_masks = vec_env.step(actions)
+                time_violation = vec_env.last_time_violation   # (B,) bool — instrumentación §7
 
                 # Write transitions — only for rows active BEFORE this step
                 for b in np.where(active)[0]:
@@ -608,6 +669,7 @@ def run_am_training(
                         "node_feats":   node_feats[b],        # (N, 8)
                         "temporal":     temporal[b],           # (3,)
                         "market_feats": market[b],             # (1,)
+                        "budget_feats": budget[b],              # (2,)
                         "current_node": int(cur_nodes[b]),
                         "mask":         masks[b],              # (N,) int8
                         "action":       int(actions[b]),
@@ -615,6 +677,7 @@ def run_am_training(
                         "log_prob":     float(log_probs[b]),
                         "value":        float(values[b]),
                         "done":         bool(terminated[b]),
+                        "time_violation": bool(time_violation[b]),
                     })
                     if terminated[b]:
                         last_values[b] = 0.0   # MDP termination: no bootstrap
@@ -645,6 +708,9 @@ def run_am_training(
             tf_trunc = build_temporal_features_batch(time_el_post, step_cnt_post, MAX_DURATION, num_nodes)
             mf_trunc = build_market_features_batch(cur_nodes_post, day_idx_post, ltr_stack) if ltr_stack is not None \
                        else np.zeros((len(trunc_idx), 1), dtype=np.float32)
+            bf_trunc = build_budget_features_batch(
+                vec_env.k_remaining[trunc_idx], vec_env.k_restricted[trunc_idx]
+            )
 
             with torch.no_grad():
                 _, _, _, boot_values_t = _forward(
@@ -654,6 +720,7 @@ def run_am_training(
                     torch.tensor(cur_nodes_post, dtype=torch.long, device=DEVICE),
                     torch.from_numpy(masks[trunc_idx]).to(DEVICE),
                     market_feats_t=torch.from_numpy(mf_trunc).to(DEVICE),
+                    budget_feats_t=torch.from_numpy(bf_trunc).to(DEVICE),
                 )
             boot_values = boot_values_t.cpu().numpy()
 
@@ -672,6 +739,7 @@ def run_am_training(
                 rm_pen_stack, time_matrix_arr, distance_arr,
                 trucks_stack, avail_prob_arr, reward_global_p95,
                 ltr_stack, num_nodes,
+                k_max_arr=k_max_arr,
             )
         else:
             greedy_ep_rewards = None
@@ -680,6 +748,9 @@ def run_am_training(
         # Episodes are written sequentially so compute_gae_per_episode sees
         # contiguous segments — its logic is unchanged.
         update_r_greedy = []
+        # Diagnósticos de K (§7): longitud realizada y violación temporal en
+        # retorno forzado, agrupadas por nivel de K asignado al episodio.
+        k_diag = {lvl: {"lengths": [], "time_violations": 0} for lvl in K_TRAINING_LEVELS}
         for b in range(B):
             if not ep_bufs[b]:
                 continue
@@ -696,6 +767,7 @@ def run_am_training(
                     value=trans["value"],
                     done=trans["done"],
                     market_feats=trans["market_feats"],
+                    budget_feats=trans["budget_feats"],
                 )
             ep_end = len(buffer)
             buffer.episode_boundaries.append(
@@ -706,6 +778,11 @@ def run_am_training(
             episode_rewards.append(ep_reward)
             if USE_SELF_CRITICAL:
                 update_r_greedy.append(float(greedy_ep_rewards[b]))
+
+            k_lvl = k_max_arr[b]
+            k_diag[k_lvl]["lengths"].append(len(ep_bufs[b]))
+            if ep_bufs[b][-1]["time_violation"]:
+                k_diag[k_lvl]["time_violations"] += 1
 
         buffer.compute_gae_per_episode(gamma=gamma, gae_lambda=gae_lambda)
 
@@ -760,6 +837,9 @@ def run_am_training(
                 mf_b   = torch.from_numpy(
                     np.stack([buffer.market_feats[i] for i in idx_batch])
                 ).to(DEVICE)                                           # (B, 1)
+                bf_b   = torch.from_numpy(
+                    np.stack([buffer.budget_feats[i] for i in idx_batch])
+                ).to(DEVICE)                                           # (B, 2)
                 cn_b   = torch.tensor(
                     [buffer.current_nodes[i] for i in idx_batch],
                     dtype=torch.long
@@ -809,7 +889,7 @@ def run_am_training(
                     # Forward con gradientes
                     _, new_lp, entropy, new_val = _forward(
                         agent, critic, nf_b, tf_b, cn_b, mask_b,
-                        actions_t=act_b, market_feats_t=mf_b,
+                        actions_t=act_b, market_feats_t=mf_b, budget_feats_t=bf_b,
                     )
 
                     # ── Loss del actor (PPO-Clip) ────────────────────────────
@@ -921,6 +1001,32 @@ def run_am_training(
         avg_sc_loss   = float(np.mean(batch_sc_losses))     if batch_sc_losses     else 0.0
 
         episode_losses.append(avg_loss)
+
+        # ── Diagnósticos de K (§7): resumen por nivel — tasa de conformidad
+        # (debe ser 100% en niveles restringidos, garantizado por máscara),
+        # distribución de longitud realizada y frecuencia de violación
+        # temporal en el retorno forzado. Se calcula cada update (barato,
+        # agregación numpy sobre datos ya recolectados) pero solo se imprime
+        # un resumen en log_freq, igual que el resto de las métricas.
+        k_diagnostics = {}
+        for lvl, d in k_diag.items():
+            lengths = np.array(d["lengths"], dtype=np.int64)
+            key = "free" if lvl is None else str(lvl)
+            if len(lengths) == 0:
+                k_diagnostics[key] = None
+                continue
+            entry = {
+                "n_episodes":        int(len(lengths)),
+                "mean_length":       float(lengths.mean()),
+                "p50_length":        float(np.percentile(lengths, 50)),
+                "p90_length":        float(np.percentile(lengths, 90)),
+                "max_length":        int(lengths.max()),
+                "time_violation_rate": d["time_violations"] / len(lengths),
+            }
+            if lvl is not None:
+                entry["conformity_rate"] = float((lengths <= lvl).mean())
+            k_diagnostics[key] = entry
+
         log_entry = {
             "update":           update + 1,
             "reward":           avg_reward,
@@ -932,6 +1038,7 @@ def run_am_training(
             "clip_fraction":    avg_clip_frac,
             "explained_var":    explained_var,
             "entropy_coef":     entropy_coef,
+            "k_diagnostics":    k_diagnostics,
         }
         if USE_SELF_CRITICAL:
             log_entry["r_greedy_avg"]      = r_greedy_avg
@@ -944,6 +1051,7 @@ def run_am_training(
                 agent, eval_start_nodes, eval_start_days,
                 time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
                 ltr_stack, trucks_stack, avail_prob_arr, reward_global_p95,
+                eval_k_levels=eval_k_levels,
             )
             log_entry["greedy_reward"]     = greedy_reward
             log_entry["greedy_valid_rate"] = greedy_valid_rate
@@ -969,6 +1077,24 @@ def run_am_training(
                 f"| ev {explained_var:.3f}"
                 f"{sc_log_suffix}"
             )
+
+            # Resumen compacto de diagnósticos de K — conformidad debe ser
+            # 1.00 siempre (garantizada por máscara); si no lo es, hay un bug.
+            k_summary_parts = []
+            for lvl in K_TRAINING_LEVELS:
+                key = "free" if lvl is None else str(lvl)
+                d = k_diagnostics.get(key)
+                if d is None:
+                    continue
+                if lvl is None:
+                    k_summary_parts.append(f"free:len={d['mean_length']:.1f}")
+                else:
+                    k_summary_parts.append(
+                        f"K={lvl}:conf={d['conformity_rate']:.2f},"
+                        f"len={d['mean_length']:.1f}/{d['p90_length']:.0f},"
+                        f"tviol={d['time_violation_rate']:.2f}"
+                    )
+            print("    K-diag: " + " | ".join(k_summary_parts))
 
         training_log.append(log_entry)
 

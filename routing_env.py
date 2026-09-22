@@ -30,6 +30,22 @@ La máscara de acciones (info["action_mask"]) excluye:
   · lanes salientes que no existen según el sorteo de disponibilidad del día
   start_node siempre permanece válido (la violación de tiempo al regresar la
   detecta _check_termination, no la máscara).
+
+Presupuesto de cardinalidad K (número de arcos, incluido el retorno)
+----------------------------------------------------------------------
+Se pasa por episodio vía reset(options={"start_node": s, "k_max": K}).
+  · k_max ausente o None → caso libre (comportamiento idéntico al actual):
+    k_restricted=False, k_remaining_norm=1.0 constante.
+  · k_max = K (int) → caso restringido: k_remaining se inicializa en K y se
+    decrementa en 1 por cada arco recorrido (cada llamada a step()).
+Formulación ≤ K (no = K): la política puede cerrar el ciclo antes de agotar
+el presupuesto. La única regla de máscara adicional es: si k_restricted y
+k_remaining == 1, la única acción válida es start_node (retorno forzado).
+Esta regla se aplica DESPUÉS de toda la lógica de máscara existente (incluido
+el self-loop), así que la conformidad ≤ K queda garantizada por construcción,
+nunca por penalización de reward. Si el retorno forzado viola max_duration,
+_check_termination aplica el mismo TIME_VIOLATION_PENALTY que ya existe hoy
+(evento raro, instrumentado en el log de entrenamiento — ver am_training.py).
 """
 
 import numpy as np
@@ -110,6 +126,9 @@ class RoutingEnv(gym.Env):
         self._step_count:         int      = None
         self._start_day_idx:      int      = None
         self._current_lane_exists: np.ndarray = None
+        self._k_max:               int      = None
+        self._k_remaining:         int      = None
+        self._k_restricted:        bool     = False
         # Cache: day_idx → reward_matrix_penalized (np.ndarray).
         # Persists across episodes since build_day_matrices is deterministic.
         self._rm_pen_cache:       dict     = {}
@@ -136,6 +155,18 @@ class RoutingEnv(gym.Env):
         self._visited_set  = {self._start_node}
         self._step_count   = 0
 
+        k_max = None
+        if options is not None and "k_max" in options:
+            k_max = options["k_max"]
+        if k_max is not None:
+            self._k_restricted = True
+            self._k_max        = int(k_max)
+            self._k_remaining   = self._k_max
+        else:
+            self._k_restricted = False
+            self._k_max        = None
+            self._k_remaining   = None
+
         # Sorteo inicial de disponibilidad para las lanes salientes del nodo de inicio.
         # time_elapsed=0 → arrival_day = start_day_idx (sin offset).
         max_day = self._rate_stack.shape[0] - 1
@@ -146,7 +177,11 @@ class RoutingEnv(gym.Env):
         )
 
         obs  = self._build_obs()
-        info = {"action_mask": self._get_action_mask()}
+        info = {
+            "action_mask": self._get_action_mask(),
+            "k_remaining": self._k_remaining,
+            "k_restricted": self._k_restricted,
+        }
         return obs, info
 
     def step(self, action: int):
@@ -170,6 +205,8 @@ class RoutingEnv(gym.Env):
         self._current_node = next_node
         self._time_elapsed = next_time
         self._step_count  += 1
+        if self._k_restricted:
+            self._k_remaining -= 1
 
         # 5. Revelar disponibilidad de lanes desde next_node (post-decisión).
         # Seed basado en (start_day_idx, node, arrival_day): dos rutas que llegan
@@ -189,7 +226,11 @@ class RoutingEnv(gym.Env):
         if not terminated and next_mask.sum() == 0:
             terminated = True
 
-        info = {"action_mask": next_mask}
+        info = {
+            "action_mask": next_mask,
+            "k_remaining": self._k_remaining,
+            "k_restricted": self._k_restricted,
+        }
         return next_obs, float(reward), terminated, False, info
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -296,6 +337,12 @@ class RoutingEnv(gym.Env):
             lane_absent = (self._current_lane_exists == 0)
             mask[non_start & lane_absent] = 0
 
+        # Presupuesto de cardinalidad K (último, gana sobre todo lo anterior):
+        # con un solo arco de margen, la única acción válida es el retorno.
+        if self._k_restricted and self._k_remaining == 1:
+            mask[:] = 0
+            mask[self._start_node] = 1
+
         return mask
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -329,6 +376,14 @@ class RoutingEnv(gym.Env):
     @property
     def current_day_idx(self) -> int:
         return self._get_current_day_idx()
+
+    @property
+    def k_remaining(self):
+        return self._k_remaining
+
+    @property
+    def k_restricted(self) -> bool:
+        return self._k_restricted
 
     # ─────────────────────────────────────────────────────────────────────────
     # Auxiliar interno
@@ -393,6 +448,10 @@ class VectorRoutingEnv:
         self._start_day_idx:       np.ndarray = None   # (B,) int64
         self._current_lane_exists: np.ndarray = None   # (B, N) int8
         self._active:              np.ndarray = None   # (B,) bool
+        self._k_restricted:        np.ndarray = None   # (B,) bool
+        self._k_max:               np.ndarray = None   # (B,) int64 — indefinido donde no restringido
+        self._k_remaining:         np.ndarray = None   # (B,) int64 — indefinido donde no restringido
+        self._last_time_violation: np.ndarray = None   # (B,) bool — poblado por step()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -402,6 +461,7 @@ class VectorRoutingEnv:
         self,
         start_nodes:    np.ndarray,   # (B,) int64
         start_day_idxs: np.ndarray,   # (B,) int64
+        k_max_arr:      list = None,  # length-B list of (int | None); None ⇒ all free
     ) -> np.ndarray:                  # masks (B, N) int8
         B = len(start_nodes)
         N = self.num_nodes
@@ -415,6 +475,20 @@ class VectorRoutingEnv:
         self._step_count    = np.zeros(B, dtype=np.int64)
         self._start_day_idx = np.asarray(start_day_idxs, dtype=np.int64)
         self._active        = np.ones(B, dtype=bool)
+
+        if k_max_arr is None:
+            self._k_restricted = np.zeros(B, dtype=bool)
+            self._k_max        = np.zeros(B, dtype=np.int64)
+            self._k_remaining  = np.zeros(B, dtype=np.int64)
+        else:
+            self._k_restricted = np.array(
+                [k is not None for k in k_max_arr], dtype=bool
+            )
+            self._k_max = np.array(
+                [int(k) if k is not None else 0 for k in k_max_arr], dtype=np.int64
+            )
+            self._k_remaining = self._k_max.copy()
+        self._last_time_violation = np.zeros(B, dtype=bool)
 
         # Initial lane availability: one draw_lane_availability call per row
         max_day = self._rate_stack.shape[0] - 1
@@ -476,6 +550,8 @@ class VectorRoutingEnv:
 
         success   = self._active & (actions == self._start_node) & (next_time <= self.max_duration)
         time_fail = self._active & cond_a & ~success
+        # Instrumentación: violación de tiempo en el retorno (normal o forzado por K).
+        self._last_time_violation = time_fail.copy()
 
         terminal_reward = np.zeros(B, dtype=np.float32)
         if success.any():
@@ -508,6 +584,7 @@ class VectorRoutingEnv:
         self._current_node = np.where(self._active, actions, self._current_node).astype(np.int64)
         self._time_elapsed  = np.where(self._active, next_time, self._time_elapsed)
         self._step_count    = np.where(self._active, self._step_count + 1, self._step_count)
+        self._k_remaining   = np.where(self._active, self._k_remaining - 1, self._k_remaining)
 
         # ── Lane revelation (active rows NOT terminated by condition A) ───────
         max_day = self._rate_stack.shape[0] - 1
@@ -580,6 +657,14 @@ class VectorRoutingEnv:
         # the depot itself, matching the scalar RoutingEnv._get_action_mask() behavior.
         mask[np.arange(B), self._current_node] = 0
 
+        # Presupuesto de cardinalidad K: aplicado al final, gana sobre todo lo
+        # anterior (incluido el self-loop). Con un solo arco de margen, la
+        # única acción válida es el retorno forzado al depot.
+        force_k = self._k_restricted & (self._k_remaining == 1)
+        if force_k.any():
+            mask[force_k, :] = 0
+            mask[force_k, self._start_node[force_k]] = 1
+
         return mask
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -613,3 +698,17 @@ class VectorRoutingEnv:
             self._start_day_idx + (self._time_elapsed // 14).astype(np.int64),
             max_day,
         )
+
+    @property
+    def k_remaining(self) -> np.ndarray:
+        return self._k_remaining
+
+    @property
+    def k_restricted(self) -> np.ndarray:
+        return self._k_restricted
+
+    @property
+    def last_time_violation(self) -> np.ndarray:
+        """(B,) bool — True para filas cuyo step() actual terminó por violar
+        max_duration en el arco de retorno (normal o forzado por K)."""
+        return self._last_time_violation

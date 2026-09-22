@@ -48,9 +48,7 @@ from evaluation import (
     run_solver_comparison, save_results, plot_diagnostics, plot_ppo_diagnostics,
 )
 from stats_analysis import append_stats_sheets_to_excel
-from transfer_learning import build_agent_for_training
-from am_agent import AMRoutingAgent
-from critic_head import CriticHead
+from transfer_learning import build_agent_for_training, load_checkpoint_compatible
 from convergence_check import check_convergence, print_convergence_report, save_convergence_to_excel
 
 
@@ -100,18 +98,21 @@ def _run_am(
 
 
 def _load_agent(checkpoint_dir: str, num_nodes: int) -> tuple:
-    """Carga agente + critic entrenados desde checkpoint sin reentrenar."""
+    """Carga agente + critic entrenados desde checkpoint sin reentrenar.
+
+    Usa load_checkpoint_compatible (transfer_learning.py) en vez de un
+    load_state_dict estricto: tolera checkpoints guardados antes del
+    condicionamiento en K (expansión en cero de context_net.proj — ver §4
+    del plan de cardinalidad de ruta), y es idéntico a un load estricto para
+    checkpoints ya compatibles con la arquitectura actual.
+    """
     path = os.path.join(checkpoint_dir, f"am_checkpoint_{num_nodes}nodes.pt")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint no encontrado: {path}")
-    ckpt  = torch.load(path, map_location=DEVICE)
-    agent = AMRoutingAgent(
-        num_nodes, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, device=DEVICE
+    agent, critic = load_checkpoint_compatible(
+        path, num_nodes, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, verbose=False
     )
-    agent.load_state_dict(ckpt["agent"])
     agent.eval()
-    critic = CriticHead(AM_D_H).to(DEVICE)
-    critic.load_state_dict(ckpt["critic"])
     critic.eval()
     print(f"Checkpoint cargado: {path}")
     return agent, critic

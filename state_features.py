@@ -9,6 +9,14 @@ State layout (length = 2 + num_nodes + 2):
   [2..2+N-1]    one-hot visited encoding     (1 = visited)
   [2+N]         remaining_nodes_fraction     = (num_nodes - len(visited_set)) / num_nodes
   [2+N+1]       progress_fraction            = step / num_nodes
+
+NOTA (condicionamiento en K): este vector NO tiene consumidores activos — el
+agente AM-PPO construye sus propias features desde attention_encoder.py
+(build_node_features / build_temporal_features / build_market_features /
+build_budget_features), no desde build_state()/get_state_size(). Por eso este
+módulo se dejó sin cambios al añadir el presupuesto de cardinalidad K: el
+vector aquí NO refleja k_remaining/k_restricted y no debe usarse como fuente
+de verdad sobre el presupuesto de la ruta.
 """
 
 import numpy as np

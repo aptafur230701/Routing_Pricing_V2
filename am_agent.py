@@ -26,6 +26,8 @@ from attention_encoder import (
     build_node_features,
     build_market_features,
     build_temporal_features,
+    build_budget_features,
+    build_budget_features_batch,
     build_node_features_batch,
     build_temporal_features_batch,
     build_market_features_batch,
@@ -97,9 +99,19 @@ class AMRoutingAgent(nn.Module):
         day_idx:                int,
         avail_prob_arr:         np.ndarray = None, # [num_nodes, num_nodes]
         reward_global_p95:      float      = 1.0,
+        k_remaining:            int        = None, # presupuesto K restante (None = libre)
+        k_restricted:           bool       = False,
+        k_condition_neutral:    bool       = False, # ablación: máscara real, features neutras
     ):
         """
         Construye tensores de entrada y ejecuta encoder + context_net.
+
+        k_remaining/k_restricted describen el presupuesto de cardinalidad K
+        del episodio (ver routing_env.py). Con los defaults (caso libre) el
+        comportamiento es idéntico al de antes del condicionamiento en K.
+        k_condition_neutral fuerza las budget features a neutras
+        (k_restricted=0, k_remaining_norm=1.0) sin afectar la máscara —
+        ablación para cuantificar el aporte del condicionamiento.
 
         Retorna
         -------
@@ -123,16 +135,20 @@ class AMRoutingAgent(nn.Module):
             time_elapsed, step_count, max_duration, self.num_nodes
         )
         market = build_market_features(current_node, day_idx, ltr_stack)
+        budget = build_budget_features(
+            k_remaining, k_restricted and not k_condition_neutral
+        )
 
         feats_t    = torch.from_numpy(node_feats).unsqueeze(0).to(self.device)   # (1,N,N_NODE_FEATURES)
         temporal_t = torch.from_numpy(temporal).unsqueeze(0).to(self.device)     # (1,3)
         market_t   = torch.from_numpy(market).unsqueeze(0).to(self.device)       # (1,1)
+        budget_t   = torch.from_numpy(budget).unsqueeze(0).to(self.device)       # (1,2)
 
         embeddings, graph_emb = self.encoder(feats_t)                            # (1,N,d_h), (1,d_h)
         check_tensor("_encode_step embeddings", embeddings)
         check_tensor("_encode_step graph_emb", graph_emb)
         current_emb = embeddings[:, current_node, :]                             # (1, d_h)
-        h_t = self.context_net(graph_emb, current_emb, temporal_t, market_t)    # (1, d_h)
+        h_t = self.context_net(graph_emb, current_emb, temporal_t, market_t, budget_t)  # (1, d_h)
         check_tensor("_encode_step h_t", h_t)
 
         return embeddings, h_t, node_feats, temporal, market
@@ -413,6 +429,8 @@ class AMRoutingAgent(nn.Module):
         reward_global_p95: float      = 1.0,
         critic:            nn.Module  = None,
         value_coef:        float      = 1.0,
+        k_max:              int       = None,   # presupuesto de cardinalidad K (None = libre)
+        k_condition_neutral: bool     = False,   # ablación: máscara real, features neutras
     ):
         """Beam search con días de mercado dinámicos y disponibilidad estocástica.
 
@@ -421,6 +439,15 @@ class AMRoutingAgent(nn.Module):
         Disponibilidad estocástica: usa el MISMO esquema de semillas que RoutingEnv
           (seed basado en start_day_idx, node y arrival_day), garantizando que DRL y
           baselines compiten sobre la misma realización del mundo.
+
+        k_max acota el número de arcos (incluido el retorno) por beam — cada
+        beam arranca con k_remaining=k_max y lo decrementa por arco recorrido;
+        con k_remaining==1 la única acción válida es start_node (retorno
+        forzado), igual que la máscara de RoutingEnv. k_max=None (default) es
+        el caso libre — comportamiento idéntico al de antes del
+        condicionamiento en K. k_condition_neutral aplica la máscara real de
+        K pero fuerza las budget features vistas por la red a neutras (para
+        la ablación "máscara sin condicionamiento").
         """
         from config import get_beam_width as _get_beam_width
         from problem_data import build_day_matrices
@@ -457,6 +484,7 @@ class AMRoutingAgent(nn.Module):
             "total_reward":  0.0,
             "returned_home": False,
             "lane_exists":   init_lane_exists,
+            "k_remaining":   k_max,
         }]
 
         for step in range(self.num_nodes):
@@ -470,6 +498,7 @@ class AMRoutingAgent(nn.Module):
                 current_node = beam["current_node"]
                 time_elapsed = beam["time_elapsed"]
                 visited_set  = set(beam["visited_set"])
+                k_remaining  = beam["k_remaining"]
 
                 day_offset = int(time_elapsed // 14)
                 day_idx    = min(start_day_idx + day_offset, max_day)
@@ -482,6 +511,9 @@ class AMRoutingAgent(nn.Module):
                     max_duration, ltr_stack, trucks_stack, day_idx,
                     avail_prob_arr=avail_prob_arr,
                     reward_global_p95=reward_global_p95,
+                    k_remaining=k_remaining,
+                    k_restricted=(k_max is not None),
+                    k_condition_neutral=k_condition_neutral,
                 )
 
                 mask_int = self._build_mask(
@@ -502,10 +534,14 @@ class AMRoutingAgent(nn.Module):
                     lane_absent = (beam["lane_exists"] == 0)
                     mask_np[non_start & lane_absent] = 0
 
+                # Presupuesto de cardinalidad K — mismo override que RoutingEnv:
+                # con un solo arco de margen, la única acción válida es el retorno.
+                force_k_return = (k_remaining == 1) and current_node != start_node
+
                 valid_non_start = [j for j in range(self.num_nodes)
                                    if mask_np[j] == 1 and j != start_node]
 
-                if not valid_non_start and current_node != start_node:
+                if (not valid_non_start or force_k_return) and current_node != start_node:
                     candidate_nodes = [start_node]
                 else:
                     bool_mask = (mask_int == 0)
@@ -556,6 +592,7 @@ class AMRoutingAgent(nn.Module):
                         "total_reward":  beam["total_reward"] + step_reward,
                         "returned_home": next_node == start_node,
                         "lane_exists":   child_lane_exists,
+                        "k_remaining":   (k_remaining - 1) if k_remaining is not None else None,
                     })
 
             if not next_beams:
@@ -576,6 +613,9 @@ class AMRoutingAgent(nn.Module):
                             max_duration, ltr_stack, trucks_stack, b_day_idx,
                             avail_prob_arr=avail_prob_arr,
                             reward_global_p95=reward_global_p95,
+                            k_remaining=b["k_remaining"],
+                            k_restricted=(k_max is not None),
+                            k_condition_neutral=k_condition_neutral,
                         )
                     return b["total_reward"] + value_coef * v * REWARD_SCALE_FACTOR
 
@@ -635,6 +675,8 @@ class AMRoutingAgent(nn.Module):
         avail_prob_arr:    np.ndarray = None,   # [num_nodes, num_nodes]
         reward_global_p95: float      = 1.0,
         temperature:       float      = 1.0,
+        k_max:              int       = None,   # presupuesto de cardinalidad K (None = libre)
+        k_condition_neutral: bool     = False,   # ablación: máscara real, features neutras
     ):
         """Decodificación por muestreo: n_samples rollouts independientes.
 
@@ -643,6 +685,16 @@ class AMRoutingAgent(nn.Module):
         y forced return). La diferencia es la selección de acción: en vez
         de top-k determinista sobre los logits, cada muestra samplea de
         Categorical(softmax(logits / temperature)) sobre los nodos válidos.
+
+        k_max acota el número de arcos (incluido el retorno) por muestra —
+        todas las B muestras comparten el mismo start_node/día/K. Se
+        arranca en k_remaining=k_max por fila y se decrementa por arco
+        recorrido; con k_remaining==1 la única acción válida es start_node
+        (retorno forzado), igual que RoutingEnv/beam_search_dynamic.
+        k_max=None (default) es el caso libre — comportamiento idéntico al
+        de antes del condicionamiento en K. k_condition_neutral aplica la
+        máscara real de K pero fuerza las budget features vistas por la red
+        a neutras (ablación "máscara sin condicionamiento").
 
         Los n_samples se vectorizan como batch B=n_samples en el encoder
         (un solo forward por paso para todas las muestras), por lo que el
@@ -688,6 +740,14 @@ class AMRoutingAgent(nn.Module):
         returned_home  = np.zeros(B, dtype=bool)
         active         = np.ones(B, dtype=bool)
 
+        k_restricted_flag = k_max is not None
+        k_restricted_arr  = np.full(B, k_restricted_flag, dtype=bool)
+        k_remaining = (
+            np.full(B, int(k_max), dtype=np.int64) if k_restricted_flag
+            else np.zeros(B, dtype=np.int64)
+        )
+        eff_k_restricted_arr = k_restricted_arr & (not k_condition_neutral)
+
         if avail_prob_arr is not None:
             init_arrival_day = min(start_day_idx, max_day)
             init_row = draw_lane_availability(
@@ -723,16 +783,18 @@ class AMRoutingAgent(nn.Module):
                 if ltr_stack is not None
                 else np.zeros((B, 1), dtype=np.float32)
             )   # (B, 1)
+            budget = build_budget_features_batch(k_remaining, eff_k_restricted_arr)   # (B, 2)
 
             feats_t    = torch.from_numpy(node_feats).to(device)
             temporal_t = torch.from_numpy(temporal).to(device)
             market_t   = torch.from_numpy(market).to(device)
+            budget_t   = torch.from_numpy(budget).to(device)
 
             embeddings, graph_emb = self.encoder(feats_t)             # (B,N,d_h), (B,d_h)
             check_tensor("generate_route_sampling embeddings", embeddings)
             current_node_t = torch.from_numpy(current_node).to(device)
             current_emb    = embeddings[torch.arange(B, device=device), current_node_t]
-            h_t = self.context_net(graph_emb, current_emb, temporal_t, market_t)
+            h_t = self.context_net(graph_emb, current_emb, temporal_t, market_t, budget_t)
 
             # ── Máscara: idéntica lógica a beam_search_dynamic, vectorizada ──
             mask_np = np.ones((B, N), dtype=np.int8)
@@ -750,6 +812,14 @@ class AMRoutingAgent(nn.Module):
                 not_at_start = (current_node != start_node_arr)[:, None]
                 lane_absent  = (lane_exists == 0)
                 mask_np[not_at_start & lane_absent & non_start] = 0
+
+            # Presupuesto de cardinalidad K — mismo override que RoutingEnv/
+            # beam_search_dynamic: con un solo arco de margen, la única acción
+            # válida es el retorno al depot.
+            force_k = k_restricted_arr & (k_remaining == 1) & (current_node != start_node_arr)
+            if force_k.any():
+                mask_np[force_k, :] = 0
+                mask_np[force_k, start_node] = 1
 
             valid_non_start_count = (mask_np * non_start).sum(axis=1)
             not_at_start_flag     = current_node != start_node_arr
@@ -788,6 +858,7 @@ class AMRoutingAgent(nn.Module):
             current_node = np.where(update, next_node, current_node)
             time_elapsed = np.where(update, new_time_elapsed, time_elapsed)
             step_count   = np.where(update, step_count + 1, step_count)
+            k_remaining  = np.where(update, k_remaining - 1, k_remaining)
             total_reward = total_reward + np.where(update, step_reward, 0.0)
             returned_home = returned_home | (just_returned & update)
 
@@ -981,6 +1052,9 @@ class AMRoutingAgent(nn.Module):
         day_idx:                int        = 0,
         avail_prob_arr:         np.ndarray = None,
         reward_global_p95:      float      = 1.0,
+        k_remaining:            int        = None,
+        k_restricted:           bool       = False,
+        k_condition_neutral:    bool       = False,
     ) -> float:
         """Estima V(s) para bootstrap en episodios truncados."""
         _, h_t, _, _, _ = self._encode_step(
@@ -990,5 +1064,8 @@ class AMRoutingAgent(nn.Module):
             max_duration, ltr_stack, trucks_stack, day_idx,
             avail_prob_arr=avail_prob_arr,
             reward_global_p95=reward_global_p95,
+            k_remaining=k_remaining,
+            k_restricted=k_restricted,
+            k_condition_neutral=k_condition_neutral,
         )
         return critic(h_t).item()

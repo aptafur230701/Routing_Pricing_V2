@@ -47,6 +47,106 @@ from config import DEVICE
 NODE_SEQUENCE = [10, 20, 35, 50, 75, 100]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Reconciliación de state_dicts (compatibilidad de checkpoints)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _reconcile_state_dict(target_sd: dict, source_sd: dict) -> tuple:
+    """
+    Fusiona un state_dict de checkpoint (source_sd) en un state_dict destino
+    ya inicializado (target_sd), tolerando cambios de arquitectura.
+
+    Reglas, en orden:
+      1. Shape idéntica → se copia el tensor del checkpoint tal cual.
+      2. Caso especial de expansión de entrada: mismo out_features y
+         in_features del checkpoint < in_features del destino (ej.
+         context_net.proj.0.weight al añadir el bloque de budget features) →
+         se conserva el tensor destino (ya inicializado) pero se ponen TODAS
+         sus columnas en cero y se copian las columnas viejas en las primeras
+         posiciones. Con las columnas nuevas en cero, la contribución de las
+         features añadidas es nula hasta que el fine-tuning las active, así
+         que el forward pass es idéntico al del checkpoint original.
+      3. Cualquier otro mismatch de forma o clave ausente → se omite (el
+         tensor destino queda con su inicialización aleatoria).
+
+    Retorna (merged_sd, transferred: list[str], skipped: list[str]).
+    """
+    merged      = dict(target_sd)
+    transferred = []
+    skipped     = []
+
+    for k, v in source_sd.items():
+        if k not in merged:
+            skipped.append(k)
+            continue
+
+        target_shape = merged[k].shape
+
+        if v.shape == target_shape:
+            merged[k] = v
+            transferred.append(k)
+        elif (
+            v.dim() == 2
+            and target_shape[0] == v.shape[0]
+            and v.shape[1] < target_shape[1]
+        ):
+            new_w = torch.zeros_like(merged[k])
+            new_w[:, : v.shape[1]] = v
+            merged[k] = new_w
+            transferred.append(f"{k} (expandido, columnas nuevas en cero)")
+        else:
+            skipped.append(k)
+
+    return merged, transferred, skipped
+
+
+def load_checkpoint_compatible(
+    checkpoint_path: str,
+    num_nodes:       int,
+    d_h:      int = 128,
+    n_heads:  int = 8,
+    n_layers: int = 3,
+    d_ff:     int = 512,
+    verbose:  bool = True,
+) -> tuple:
+    """
+    Carga un checkpoint del MISMO tamaño de grafo, tolerando la expansión de
+    ContextNetwork.proj introducida por el condicionamiento en K (columnas
+    nuevas inicializadas en cero — ver _reconcile_state_dict). Para un
+    checkpoint ya compatible con la arquitectura actual, el resultado es
+    observacionalmente idéntico a un torch.load + load_state_dict estricto.
+
+    Uso: reemplaza el torch.load + load_state_dict directo en
+    main.py._load_agent e inference.py.load_agent.
+    """
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint no encontrado: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+
+    agent  = AMRoutingAgent(
+        num_nodes=num_nodes, d_h=d_h, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff,
+        device=DEVICE,
+    )
+    critic = CriticHead(d_h).to(DEVICE)
+
+    agent_sd,  transferred_a, skipped_a = _reconcile_state_dict(agent.state_dict(),  checkpoint["agent"])
+    critic_sd, transferred_c, skipped_c = _reconcile_state_dict(critic.state_dict(), checkpoint["critic"])
+
+    agent.load_state_dict(agent_sd)
+    critic.load_state_dict(critic_sd)
+
+    if verbose:
+        total = len(transferred_a) + len(skipped_a) + len(transferred_c) + len(skipped_c)
+        pct   = 100 * (len(transferred_a) + len(transferred_c)) / max(total, 1)
+        print(f"  [load_checkpoint_compatible] {os.path.basename(checkpoint_path)} "
+              f"({len(transferred_a) + len(transferred_c)}/{total} tensores, {pct:.1f}%)", end="")
+        skipped_all = skipped_a + skipped_c
+        print(f" — omitidos: {skipped_all}" if skipped_all else " ✓")
+
+    return agent, critic
+
+
 def get_source_checkpoint(base_dir: str, target_num_nodes: int) -> str | None:
     """
     Dado el tamaño destino, devuelve la ruta al checkpoint del tamaño
@@ -148,31 +248,20 @@ def transfer_checkpoint(
     )
     critic = CriticHead(d_h).to(DEVICE)
 
-    # Transferir pesos — filtrar por forma por seguridad.
-    # Las capas con shape distinta (input_proj, context_net) se omiten y quedan
-    # con inicialización aleatoria, lo que es el comportamiento correcto para
-    # transfer learning parcial entre arquitecturas con distinto número de features.
-    agent_sd  = agent.state_dict()
-    critic_sd = critic.state_dict()
-
-    transferred, skipped = [], []
-
-    for k, v in checkpoint["agent"].items():
-        if k in agent_sd and v.shape == agent_sd[k].shape:
-            agent_sd[k] = v
-            transferred.append(k)
-        else:
-            skipped.append(k)
-
-    for k, v in checkpoint["critic"].items():
-        if k in critic_sd and v.shape == critic_sd[k].shape:
-            critic_sd[k] = v
-            transferred.append(k)
-        else:
-            skipped.append(k)
+    # Transferir pesos — vía _reconcile_state_dict (ver arriba). Las capas con
+    # shape totalmente distinta (ej. encoder.input_proj entre arquitecturas
+    # con distinto N_NODE_FEATURES) se omiten y quedan con inicialización
+    # aleatoria, lo que es el comportamiento correcto para transfer learning
+    # parcial. El caso especial de context_net.proj.0.weight (expansión por
+    # el bloque de budget features) se resuelve con zero-padding, no se omite.
+    agent_sd,  transferred_a, skipped_a = _reconcile_state_dict(agent.state_dict(),  checkpoint["agent"])
+    critic_sd, transferred_c, skipped_c = _reconcile_state_dict(critic.state_dict(), checkpoint["critic"])
 
     agent.load_state_dict(agent_sd)
     critic.load_state_dict(critic_sd)
+
+    transferred = transferred_a + transferred_c
+    skipped     = skipped_a + skipped_c
 
     total = len(agent_sd) + len(critic_sd)
     pct   = 100 * len(transferred) / total

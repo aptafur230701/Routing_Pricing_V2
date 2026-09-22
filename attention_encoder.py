@@ -27,6 +27,12 @@ Features por nodo j (desde la posición actual del camión):
   [6] avail_prior   — P(lane actual→j existe) según historial; prior del Bernoulli
   [7] reward_abs    — reward crudo / REWARD_GLOBAL_P95, clipeado a [0, 1]; 0 si negativo
 
+Condicionamiento en presupuesto de cardinalidad K:
+  ContextNetwork recibe, además del bloque temporal y de mercado, un bloque
+  separado de budget features (ver build_budget_features/_batch): k_remaining
+  normalizado por K_NORM (constante global) y un flag k_restricted. No forma
+  parte de N_NODE_FEATURES (no es una feature por nodo).
+
 Compatibilidad:
   · Sin dependencias de agent.py, training.py, routing_env.py ni evaluation.py.
   · routing_env.py permanece sin cambios.
@@ -38,10 +44,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import LTR_CLIP, TRUCKS_CLIP
+from config import LTR_CLIP, TRUCKS_CLIP, K_NORM
 
 # Número de features por nodo — debe coincidir con build_node_features()
 N_NODE_FEATURES = 8
+
+# Número de features de presupuesto de cardinalidad K — debe coincidir con
+# build_budget_features() / build_budget_features_batch().
+N_BUDGET_FEATURES = 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -307,19 +317,27 @@ class ContextNetwork(nn.Module):
                                         progreso_norm
       · market_features   (n_market)  — MTI, dispersión, forecast (opcional,
                                         por defecto 0 = no se usa)
+      · budget_features   (n_budget)  — presupuesto de cardinalidad K:
+                                        k_remaining_norm, k_restricted.
+                                        Bloque SEPARADO de temporal_features
+                                        (conceptualmente distinto: K acota el
+                                        número de arcos, no el tiempo) — no se
+                                        amplía n_temporal para incorporarlo.
 
-    Entrada total: 2·d_h + 3 + n_market  →  MLP  →  d_h
+    Entrada total: 2·d_h + 3 + n_market + n_budget  →  MLP  →  d_h
 
     Parámetros
     ----------
     d_h      : int — dimensión del embedding (debe coincidir con AttentionEncoder).
-    n_market : int — número de features de mercado adicionales (default 0).
+    n_market : int — número de features de mercado adicionales (default 1).
+    n_budget : int — número de features de presupuesto K (default 2, ver
+               build_budget_features()).
     """
 
-    def __init__(self, d_h: int, n_market: int = 1):
+    def __init__(self, d_h: int, n_market: int = 1, n_budget: int = 2):
         super().__init__()
         n_temporal = 3          # time_norm, remaining_steps_norm, progress_norm
-        d_in = 2 * d_h + n_temporal + n_market
+        d_in = 2 * d_h + n_temporal + n_market + n_budget
         self.proj = nn.Sequential(
             nn.Linear(d_in, d_h),
             nn.ReLU(),
@@ -333,6 +351,7 @@ class ContextNetwork(nn.Module):
         current_node_emb: torch.Tensor,   # (batch, d_h)
         temporal_feats:   torch.Tensor,   # (batch, 3)
         market_feats:     torch.Tensor = None,  # (batch, n_market) | None
+        budget_feats:     torch.Tensor = None,  # (batch, n_budget) | None
     ) -> torch.Tensor:
         """
         Retorna el vector de contexto h_t de forma (batch, d_h).
@@ -340,6 +359,8 @@ class ContextNetwork(nn.Module):
         parts = [graph_emb, current_node_emb, temporal_feats]
         if market_feats is not None:
             parts.append(market_feats)
+        if budget_feats is not None:
+            parts.append(budget_feats)
         h = torch.cat(parts, dim=-1)
         return self.proj(h)
 
@@ -360,6 +381,50 @@ def build_market_features(
     ltr_raw  = float(ltr_stack[current_node, day_idx])
     ltr_norm = min(ltr_raw, LTR_CLIP) / LTR_CLIP
     return np.array([ltr_norm], dtype=np.float32)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utilidad: features de presupuesto de cardinalidad K para ContextNetwork
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_budget_features(
+    k_remaining:  int,
+    k_restricted: bool,
+    k_norm:       float = K_NORM,
+) -> np.ndarray:
+    """Construye el vector de budget features (2,) para ContextNetwork.
+
+    [0] k_remaining_norm — k_remaining / K_NORM (normalizador GLOBAL, no por
+        episodio: así K=4 arranca en 0.5 y K=8 arranca en 1.0, permitiendo
+        distinguir el nivel de K desde el primer paso). 1.0 constante si
+        k_restricted es False (caso libre).
+    [1] k_restricted — 1.0 si el episodio tiene presupuesto K activo, 0.0 si
+        es el caso libre.
+
+    k_remaining puede ser None cuando k_restricted es False (no se
+    dereferencia en ese caso).
+    """
+    if k_restricted:
+        k_remaining_norm = float(k_remaining) / float(k_norm)
+    else:
+        k_remaining_norm = 1.0
+    return np.array([k_remaining_norm, float(bool(k_restricted))], dtype=np.float32)
+
+
+def build_budget_features_batch(
+    k_remaining:  np.ndarray,   # (B,) int64 — indefinido donde k_restricted es False
+    k_restricted: np.ndarray,   # (B,) bool
+    k_norm:       float = K_NORM,
+) -> np.ndarray:                # (B, 2) float32
+    """Batched version of build_budget_features."""
+    restricted = np.asarray(k_restricted, dtype=bool)
+    B = len(restricted)
+    out = np.empty((B, 2), dtype=np.float32)
+    out[:, 0] = np.where(
+        restricted, np.asarray(k_remaining, dtype=np.float32) / float(k_norm), 1.0
+    )
+    out[:, 1] = restricted.astype(np.float32)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
