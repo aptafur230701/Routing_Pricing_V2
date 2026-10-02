@@ -57,7 +57,7 @@ from debug_utils import check_tensor
 
 def _balanced_k_assignment(n: int, rng) -> list:
     """
-    Reparte K_TRAINING_LEVELS (6 niveles, incluido el caso libre None) de
+    Reparte K_TRAINING_LEVELS (K_MAX restringido + caso libre None) de
     forma balanceada sobre n episodios y permuta. Mismo patrón que el
     balanceo ya existente de start_nodes_arr, pero independiente (cruce
     aproximadamente balanceado).
@@ -315,6 +315,7 @@ def _evaluate_greedy(
     avail_prob_arr:   np.ndarray,
     reward_global_p95: float,
     eval_k_levels:    list = None,   # niveles de K por episodio (None ⇒ todos libres)
+    avail_expected_arr: np.ndarray = None,
 ) -> tuple:
     """
     Recompensa promedio en modo greedy (beam_width=1) sobre un set fijo de
@@ -350,6 +351,7 @@ def _evaluate_greedy(
                     avail_prob_arr=avail_prob_arr,
                     reward_global_p95=reward_global_p95,
                     k_max=k_max,
+                    avail_expected_arr=avail_expected_arr,
                 )
                 if route is not None:
                     n_valid += 1
@@ -380,6 +382,7 @@ def _collect_greedy_rollout(
     ltr_stack:       np.ndarray,
     num_nodes:       int,
     k_max_arr:       list = None,   # MISMOS niveles de K que el rollout muestreado del update
+    avail_expected_arr: np.ndarray = None,
 ) -> np.ndarray:
     """
     Rollout greedy (argmax, beam=1) vectorizado sobre los MISMOS
@@ -423,6 +426,7 @@ def _collect_greedy_rollout(
                 trucks_stack_raw=trucks_stack,
                 avail_prob_arr=avail_prob_arr,
                 reward_global_p95=reward_global_p95,
+                avail_expected_arr=avail_expected_arr,
             )
             temporal = build_temporal_features_batch(time_el, step_cnt, MAX_DURATION, num_nodes)
             market   = build_market_features_batch(cur_nodes, day_idx, ltr_stack) if ltr_stack is not None \
@@ -468,6 +472,11 @@ def run_am_training(
     trucks_stack:      np.ndarray = None,   # [num_nodes, 120, 3]
     avail_prob_arr:    np.ndarray = None,   # [num_nodes, num_nodes]
     reward_global_p95: float      = 1.0,
+    avail_expected_arr: np.ndarray = None,  # [num_nodes, num_nodes]
+    trial_callback: callable = None,  # HPO opcional: fn(step, n_updates, log_entry) -> bool
+                                       # (True = detener el entrenamiento ya, p.ej. Optuna pruning).
+                                       # Solo se invoca en los updates de log_freq (donde greedy_reward
+                                       # está disponible). No acopla este módulo a Optuna.
 ) -> tuple:
     """
     Entrena AMRoutingAgent + CriticHead con PPO.
@@ -483,6 +492,12 @@ def run_am_training(
     ltr_stack      : np.ndarray [num_nodes, 120] — LTR por hub y día
     trucks_stack   : np.ndarray [num_nodes, 120, 3] — camiones por hub, día y delta
     avail_prob_arr : np.ndarray [num_nodes, num_nodes] — prior Bernoulli de disponibilidad
+                     (sorteo del entorno, ver draw_lane_availability)
+    avail_expected_arr : np.ndarray [num_nodes, num_nodes] — E[loads] histórico
+                     (train), usado solo como feature de entrada (avail_prior)
+    trial_callback : callable opcional fn(step, n_updates, log_entry) -> bool, invocado en
+                     cada update de log_freq; si devuelve True, el entrenamiento se detiene
+                     ahí mismo (usado por hpo_optuna.py para pruning).
 
     Retorna
     -------
@@ -637,6 +652,7 @@ def run_am_training(
                     trucks_stack_raw=trucks_stack,
                     avail_prob_arr=avail_prob_arr,
                     reward_global_p95=reward_global_p95,
+                    avail_expected_arr=avail_expected_arr,
                 )   # (B, N, 8)
                 temporal = build_temporal_features_batch(time_el, step_cnt, MAX_DURATION, num_nodes)   # (B, 3)
                 market   = build_market_features_batch(cur_nodes, day_idx, ltr_stack) if ltr_stack is not None \
@@ -704,6 +720,7 @@ def run_am_training(
                 trucks_stack_raw=trucks_stack,
                 avail_prob_arr=avail_prob_arr,
                 reward_global_p95=reward_global_p95,
+                avail_expected_arr=avail_expected_arr,
             )
             tf_trunc = build_temporal_features_batch(time_el_post, step_cnt_post, MAX_DURATION, num_nodes)
             mf_trunc = build_market_features_batch(cur_nodes_post, day_idx_post, ltr_stack) if ltr_stack is not None \
@@ -740,6 +757,7 @@ def run_am_training(
                 trucks_stack, avail_prob_arr, reward_global_p95,
                 ltr_stack, num_nodes,
                 k_max_arr=k_max_arr,
+                avail_expected_arr=avail_expected_arr,
             )
         else:
             greedy_ep_rewards = None
@@ -1045,6 +1063,7 @@ def run_am_training(
             log_entry["sc_advantage_mean"] = sc_adv_raw_mean
             log_entry["sc_loss_value"]     = avg_sc_loss
 
+        stop_now = False
         log_freq = max(1, n_updates // 20)
         if (update + 1) % log_freq == 0:
             greedy_reward, greedy_valid_rate = _evaluate_greedy(
@@ -1052,30 +1071,23 @@ def run_am_training(
                 time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
                 ltr_stack, trucks_stack, avail_prob_arr, reward_global_p95,
                 eval_k_levels=eval_k_levels,
+                avail_expected_arr=avail_expected_arr,
             )
             log_entry["greedy_reward"]     = greedy_reward
             log_entry["greedy_valid_rate"] = greedy_valid_rate
 
             episodes_done = (update + 1) * n_episodes_per_update
-            sc_log_suffix = (
-                f" | r_greedy {r_greedy_avg:6.1f}"
-                f" | sc_adv {sc_adv_raw_mean:6.2f}"
-                f" | sc_loss {avg_sc_loss:.4f}"
-            ) if USE_SELF_CRITICAL else ""
+            # Línea compacta; loss/pol/val/clip/r_greedy/sc_adv/sc_loss siguen
+            # en training_log y en las gráficas de plot_ppo_diagnostics.
             print(
                 f"  update {update+1:>5}/{n_updates} "
                 f"| ep {episodes_done:>6}/{total_episodes} "
                 f"| reward {avg_reward:6.1f} "
                 f"| greedy {greedy_reward:6.1f} "
                 f"| greedy_valid {greedy_valid_rate:.2f} "
-                f"| loss {avg_loss:.4f} "
-                f"| pol {avg_pol_loss:.4f} "
-                f"| val {avg_val_loss:.4f} "
                 f"| ent {avg_entropy:.3f} "
                 f"| kl {avg_kl:.4f} "
-                f"| clip {avg_clip_frac:.2f} "
                 f"| ev {explained_var:.3f}"
-                f"{sc_log_suffix}"
             )
 
             # Resumen compacto de diagnósticos de K — conformidad debe ser
@@ -1096,7 +1108,12 @@ def run_am_training(
                     )
             print("    K-diag: " + " | ".join(k_summary_parts))
 
+            if trial_callback is not None:
+                stop_now = bool(trial_callback(update + 1, n_updates, log_entry))
+
         training_log.append(log_entry)
+        if stop_now:
+            break
 
     print("Entrenamiento AM-PPO completo.")
     return agent, critic, episode_rewards, episode_losses, training_log

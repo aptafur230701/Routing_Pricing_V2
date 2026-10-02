@@ -53,6 +53,7 @@ def rollout_drl_env(
     critic                     = None,
     value_coef:     float      = 1.0,
     k_max:          int        = None,
+    avail_expected_arr: np.ndarray = None,
 ) -> tuple:
     """Beam search con días de mercado dinámicos.
 
@@ -62,6 +63,10 @@ def rollout_drl_env(
     k_max : int | None — presupuesto de cardinalidad (nº de arcos, incluido
         el retorno). None (default) = caso libre, comportamiento idéntico al
         de antes de introducir el condicionamiento en K.
+
+    avail_expected_arr se pasa SIEMPRE (Real y Det por igual) — es solo la
+    feature de entrada al agente (avail_prior), no interviene en el sorteo
+    Bernoulli (que sí se desactiva en modo Det vía avail_prob_arr=None).
     """
     agent.eval()
     try:
@@ -74,6 +79,7 @@ def rollout_drl_env(
             beam_width=beam_width,
             critic=critic, value_coef=value_coef,
             k_max=k_max,
+            avail_expected_arr=avail_expected_arr,
         )
     finally:
         agent.train()
@@ -97,6 +103,7 @@ def _run_comparison_cell(
     rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
     ltr_stack, trucks_stack, avail_prob_arr, critic,
     k_max=None, verbose=True,
+    avail_expected_arr=None,
 ) -> tuple:
     """Ejecuta DRL Real + DRL Det + los 8 solvers baseline para un
     (start_node=s, day_idx, k_max) y construye las columnas de resultado.
@@ -127,6 +134,7 @@ def _run_comparison_cell(
         beam_width=get_beam_width_real(num_nodes),
         critic=critic,
         k_max=k_max,
+        avail_expected_arr=avail_expected_arr,
     )
     times['drl_real'] = time.time() - t0
     drl_real_valid = drl_real_route is not None
@@ -150,6 +158,7 @@ def _run_comparison_cell(
         avail_prob_arr=None,   # sin Bernoulli → mundo determinista
         critic=critic,
         k_max=k_max,
+        avail_expected_arr=avail_expected_arr,
     )
     drl_det_valid = drl_det_route is not None
     if drl_det_valid:
@@ -353,7 +362,8 @@ def run_solver_comparison(agent, time_matrix,
                            rate_stack, loads_stack, distance_arr, diesel_arr,
                            num_nodes,
                            ltr_stack=None, trucks_stack=None, avail_prob_arr=None,
-                           n_days_per_node=3, critic=None):
+                           n_days_per_node=3, critic=None,
+                           avail_expected_arr=None):
     """Run DRL Real + DRL Det + HGA-LNS + RH-Greedy for every start node.
 
     Para cada nodo de inicio se usan n_days_per_node días del set de evaluación
@@ -397,6 +407,7 @@ def run_solver_comparison(agent, time_matrix,
                 rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
                 ltr_stack, trucks_stack, avail_prob_arr, critic,
                 k_max=None, verbose=True,
+                avail_expected_arr=avail_expected_arr,
             )
             row.update(cell_row)
             for key, val in cell_times.items():
@@ -426,15 +437,17 @@ def run_solver_comparison_by_k(agent, time_matrix,
                                 num_nodes,
                                 k_levels=None,
                                 ltr_stack=None, trucks_stack=None, avail_prob_arr=None,
-                                n_days_per_node=1, critic=None):
+                                n_days_per_node=1, critic=None,
+                                avail_expected_arr=None):
     """Como run_solver_comparison, pero repite la comparación completa (DRL +
     los 8 solvers baseline) para cada nivel de K en k_levels, añadiendo una
     columna 'K' a cada fila resultante — permite comparar el gap DRL-vs-
     oráculo (y vs. el resto de baselines) bajo presupuesto de cardinalidad
     restringido, no solo en el caso libre.
 
-    k_levels por defecto es K_LEVELS (config.py: [4, 5, 6, 7, 8]) — el caso
-    libre ya lo cubre run_solver_comparison, así que no se repite aquí.
+    k_levels por defecto es K_LEVELS (config.py: [K_MAX], un solo nivel — la
+    restricción real de negocio) — el caso libre ya lo cubre
+    run_solver_comparison, así que no se repite aquí.
 
     n_days_per_node por defecto es 1 (no 3 como en run_solver_comparison):
     el costo ya se multiplica por len(k_levels) sobre solvers que incluyen
@@ -488,6 +501,7 @@ def run_solver_comparison_by_k(agent, time_matrix,
                     rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
                     ltr_stack, trucks_stack, avail_prob_arr, critic,
                     k_max=k_max, verbose=True,
+                    avail_expected_arr=avail_expected_arr,
                 )
                 row.update(cell_row)
                 for key, val in cell_times.items():

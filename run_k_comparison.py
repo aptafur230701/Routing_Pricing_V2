@@ -7,14 +7,15 @@ evaluation.run_solver_comparison_by_k (opt-in, ver plan de K en Solvers.py /
 evaluation.py).
 
 Carga un checkpoint ya entrenado (no reentrena nada) y evalúa, para cada
-K en K_LEVELS (config.py: [4, 5, 6, 7, 8]), todos los solvers — incluido el
-oráculo LS-Oracle bajo K — para poder medir el gap real DRL-vs-óptimo por
-nivel de cardinalidad, no solo en el caso libre.
+K en K_LEVELS (config.py: [K_MAX], el único nivel restringido — la
+restricción real de negocio), todos los solvers — incluido el oráculo
+LS-Oracle bajo K — para poder medir el gap real DRL-vs-óptimo bajo esa
+restricción, no solo en el caso libre.
 
 Uso
 ---
   python run_k_comparison.py                         # NUM_NODES=10, K_LEVELS completo
-  python run_k_comparison.py --num-nodes 10 --k 4 6 8
+  python run_k_comparison.py --num-nodes 10 --k 5
   python run_k_comparison.py --n-days-per-node 2
 
 Salida
@@ -107,7 +108,7 @@ def run(num_nodes: int, k_levels, n_days_per_node: int, checkpoint_dir: str = No
     critic.eval()
 
     time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
-        ltr_stack, trucks_stack, avail_prob_arr, reward_global_p95 = load_matrices(num_nodes)
+        ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95 = load_matrices(num_nodes)
 
     # Mismo split train/eval que main.py — el modelo no vio estos días.
     rate_eval  = rate_stack[TRAIN_DAYS:]
@@ -118,6 +119,7 @@ def run(num_nodes: int, k_levels, n_days_per_node: int, checkpoint_dir: str = No
         k_levels=k_levels,
         ltr_stack=ltr_stack, trucks_stack=trucks_stack, avail_prob_arr=avail_prob_arr,
         n_days_per_node=n_days_per_node, critic=critic,
+        avail_expected_arr=avail_expected_arr,
     )
 
     summary = _summarize_by_k(df)

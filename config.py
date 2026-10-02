@@ -49,18 +49,18 @@ PPO_BATCH_SIZE            = 256    # Tamaño de batch para entrenamiento PPO. Su
                                     # está dominada por overhead de lanzamiento de kernels a batch
                                     # pequeño (tiempo/batch ~constante de 64 a 700), así que un batch
                                     # mayor da ~3.4x más rápido por update con caída mínima de EV.
-PPO_LR                    = 3e-5   # Learning rate para el actor. Subido de 1e-5: la KL media
+PPO_LR                    = 7.574781400016766e-05   # Learning rate para el actor. Subido de 1e-5: la KL media
                                     # iba muy por debajo del target 0.02 con clip < 0.10,
                                     # indicando under-stepping. knob: subir hacia 5e-5 si KL se
                                     # mantiene < ~0.015 y el reward sigue subiendo pasado update 150.
 PPO_GAMMA                 = 0.99   # Factor de descuento para las recompensas futuras
-PPO_GAE_LAMBDA            = 0.95   # Factor de GAE
-PPO_CLIP_EPS              = 0.15   # Clip PPO para limitar cambios de política
+PPO_GAE_LAMBDA            = 0.9738083627173082   # Factor de GAE
+PPO_CLIP_EPS              = 0.22021368918814568   # Clip PPO para limitar cambios de política
 PPO_ENTROPY_COEF          = 0.05   # Coeficiente de entropía para PPO (valor de referencia; el entrenamiento usa START/END)
-PPO_ENTROPY_COEF_START    = 0.08   # coeficiente de entropía al inicio del entrenamiento
-PPO_ENTROPY_COEF_END      = 0.02   # coeficiente de entropía al final del entrenamiento (decay lineal)
-PPO_GRAD_CLIP             = 0.5    # Clipping de gradiente para PPO
-PPO_WEIGHT_DECAY          = 1e-4   # Weight decay (AdamW) del actor. Regularizador PRIMARIO
+PPO_ENTROPY_COEF_START    = 0.07842497176858756   # coeficiente de entropía al inicio del entrenamiento
+PPO_ENTROPY_COEF_END      = 0.022646509161679096   # coeficiente de entropía al final del entrenamiento (decay lineal)
+PPO_GRAD_CLIP             = 1.7476269465868015    # Clipping de gradiente para PPO
+PPO_WEIGHT_DECAY          = 6.093123878168306e-05  # Weight decay (AdamW) del actor. Regularizador PRIMARIO
                                     # PPO-safe: no corrompe el ratio de importancia como el
                                     # dropout en el path de logits.
 PPO_LR_DECAY              = False  # Scheduler de LR lineal decreciente (espeja el decay de
@@ -79,20 +79,28 @@ SELF_CRITICAL_WARMUP_UPDATES = 50      # no aplicar self-critical hasta este upd
                                         # (deja que el crítico se estabilice primero)
 
 # ── Cardinalidad de ruta (K) ───────────────────────────────────
-K_MIN  = 4    # mínimo K entrenado — pertinencia operativa (4-5 cargas por tour)
-K_MAX  = 8    # máximo K entrenado
-K_NORM = K_MAX  # normalizador GLOBAL de k_remaining_norm (no por episodio): con
-                # K_NORM=8, K=4 arranca en 0.5 y K=8 arranca en 1.0, permitiendo
-                # que la red distinga el nivel de K desde el primer paso.
-K_LEVELS          = [4, 5, 6, 7, 8]      # niveles restringidos de entrenamiento
-K_TRAINING_LEVELS = K_LEVELS + [None]    # + caso libre (None) — 6 niveles en total
+# K_MAX es el único techo restringido que se entrena — la restricción real de
+# la operación (no un rango arbitrario: antes había K_MIN=4..K_MAX=8, un rango
+# sin justificación de negocio para el extremo superior). Formulación ≤K: con
+# un solo nivel, el caso libre (K_TRAINING_LEVELS incluye None) sigue siendo
+# necesario — no es redundante con K_MAX, representa la generalidad del método
+# (aporte científico: el modelo resuelve la familia general del problema, sin
+# presupuesto de cardinalidad), mientras que K_MAX=5 es la instancia puntual
+# que sirve a la operación real.
+K_MAX  = 5    # techo de cardinalidad real de negocio (nº de cargas por tour)
+K_NORM = K_MAX  # normalizador GLOBAL de k_remaining_norm: con K_NORM=5,
+                # k_remaining_norm va de 1.0 (presupuesto completo) a 0.2
+                # (último arco antes del retorno forzado).
+K_LEVELS          = [K_MAX]              # un solo nivel restringido — la constraint real
+K_TRAINING_LEVELS = K_LEVELS + [None]    # + caso libre (None) — 2 niveles en total
 
 # ── Train / eval split ───────────────────────────────────────
 TRAIN_DAYS = 90   # días usados para entrenamiento; el resto (días 90-119) queda para evaluación
 
 # ── Market signal normalisation clamps ───────────────────────
-LTR_CLIP    = 200.0   # p95 del LTR es 124; 200 es techo seguro
-TRUCKS_CLIP =  50.0   # p95 de trucks delta=1 es 45
+LTR_CLIP           = 200.0   # p95 del LTR es 124; 200 es techo seguro
+TRUCKS_CLIP        =  50.0   # p95 de trucks delta=1 es 45
+LOADS_EXPECTED_CLIP = 100.0  # p95 de E[loads] por lane (train, excl. diagonal) es ~66; 100 es techo seguro
 
 # ── Reproducibility ───────────────────────────────────────────
 SEED = 42
@@ -103,7 +111,8 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def get_episodes_per_node(num_nodes: int) -> int:
     """Episodes per start-node for the full training run."""
-    if num_nodes <= 10:  return 5000
+    if num_nodes <= 10:  return 20000  # subido de 5000: a 5000 (71 updates) reward/entropy
+                                        # no se aplanaban; 20000 da ~285 updates de margen
     if num_nodes <= 20:  return 15000
     if num_nodes <= 35:  return 10000   # bajado de 25000: la política saturaba ~update 400;
                                         # con ~700 ep/update da ~500-600 updates, holgura sobre

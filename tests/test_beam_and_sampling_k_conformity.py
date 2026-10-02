@@ -21,7 +21,7 @@ import torch
 from config import DEVICE, K_LEVELS
 from am_agent import AMRoutingAgent
 
-N = 9   # > K_MAX (8): un ciclo puede visitar hasta N-1 intermedios + retorno = N arcos,
+N = 9   # > max(K_LEVELS): un ciclo puede visitar hasta N-1 intermedios + retorno = N arcos,
         # así que todos los niveles de K_LEVELS son físicamente alcanzables.
 
 

@@ -88,7 +88,6 @@ nodos, ver `NODE_SEQUENCE`).
 |---|---|
 | [evaluation.py](evaluation.py) | Corre la comparación DRL vs. todos los solvers de `Solvers.py`, genera diagnósticos y guarda resultados. |
 | [excel_report.py](excel_report.py) | Formato del Excel de resultados (hojas Summary / Per Node). |
-| [convergence_check.py](convergence_check.py) | Chequeo automático de convergencia del entrenamiento PPO (reward, explained variance, KL, entropía) sobre `training_log`. |
 | [stats_analysis.py](stats_analysis.py) | Robustez estadística: descriptivos + test de Wilcoxon pareado de DRL contra cada baseline estocástico. |
 
 
@@ -109,13 +108,10 @@ nodos, ver `NODE_SEQUENCE`).
    `USE_TRANSFER = True` para partir del checkpoint del tamaño anterior en
    `NODE_SEQUENCE` (o `False` para pesos aleatorios). `python main.py`.
 2. **Solo evaluar** un checkpoint existente sin reentrenar: `EVAL_ONLY = True`.
-3. **Revisar convergencia**: la consola imprime el reporte de
-   `convergence_check.py` al final del entrenamiento; también queda una hoja
-   en el Excel de resultados.
-4. **Comparar contra baselines**: `results/<N>nodes/DRL_Routing_Summary_AM.xlsx`
+3. **Comparar contra baselines**: `results/<N>nodes/DRL_Routing_Summary_AM.xlsx`
    trae el gap de DRL contra cada solver de `Solvers.py`, más las hojas de
    estadística de `stats_analysis.py` (Wilcoxon pareado).
-5. **Inferencia puntual**: `python inference.py` con un checkpoint ya
+4. **Inferencia puntual**: `python inference.py` con un checkpoint ya
    guardado en `checkpoints/`.
 
 ## Requisitos

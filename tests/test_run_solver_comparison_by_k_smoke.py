@@ -42,7 +42,7 @@ def test_run_solver_comparison_free_case_unchanged_shape(agent_and_data):
     cambiar la interfaz ni las columnas de run_solver_comparison."""
     agent, data = agent_and_data
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-     ltr_stack, trucks_stack, avail_prob_arr, reward_global_p95) = data
+     ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95) = data
 
     df, timing = run_solver_comparison(
         agent, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, NUM_NODES,
@@ -66,7 +66,7 @@ def test_run_solver_comparison_free_case_unchanged_shape(agent_and_data):
 def test_run_solver_comparison_by_k_smoke(agent_and_data):
     agent, data = agent_and_data
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-     ltr_stack, trucks_stack, avail_prob_arr, reward_global_p95) = data
+     ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95) = data
 
     k_levels = [4, 5]
     df, timing = run_solver_comparison_by_k(

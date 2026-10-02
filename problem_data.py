@@ -5,7 +5,7 @@ Data loading and matrix computation.
 
 load_matrices(num_nodes)
     → time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-      ltr_stack, trucks_stack, avail_prob_arr
+      ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr
 
 build_day_matrices(rate_day, loads_day, distance_arr, diesel_arr, num_nodes)
     → reward_matrix, reward_matrix_penalized
@@ -45,9 +45,21 @@ def build_day_matrices(
     -------
     reward_matrix            : np.ndarray (num_nodes × num_nodes)
     reward_matrix_penalized  : np.ndarray (diagonal = BIG_M_PENALTY)
+
+    Nota (existencia — dos capas, no una redundante): esta función excluye un
+    arco solo si el registro histórico de ESE día puntual no muestra ninguna
+    carga (`loads_day <= 0`) — hecho real del día, no un promedio de otros
+    días. Esta es la ÚNICA capa de existencia que ve el mundo determinista
+    (LS-Exact, DRL Det, HGA-LNS, RH-*-deterministas: corren con
+    `avail_prob_arr=None`, sin sorteo Bernoulli). El mundo estocástico agrega
+    ENCIMA de esta capa un segundo filtro — `draw_lane_availability`, calibrado
+    solo con días de train — que modela algo distinto: aunque el día haya
+    tenido carga publicada, no hay garantía de que este camión puntual la
+    consiga para cuando llega. El umbral es `<= 0` (antes `<= 1`, sin
+    justificación documentada — excluía también el caso `loads_day == 1`).
     """
     revenue = (rate_day * distance_arr).copy()
-    revenue[loads_day <= 1] = 0
+    revenue[loads_day <= 0] = 0
     cost       = distance_arr * (diesel_arr / MPG) + distance_arr * MARGINAL_COST_SIN_DIESEL
     reward_arr = np.round(revenue - cost, 0)
 
@@ -130,6 +142,13 @@ def load_matrices(num_nodes: int) -> tuple:
     trucks_stack   : np.ndarray    (num_nodes × 120 × 3)  — solo deltas 1,2,3
     avail_prob_arr : np.ndarray    (num_nodes × num_nodes) float32
                      mean over train days of (loads > 0); prior Bernoulli per arc.
+                     Usado SOLO por draw_lane_availability (mecanismo de sorteo
+                     del entorno) — no confundir con avail_expected_arr.
+    avail_expected_arr : np.ndarray (num_nodes × num_nodes) float32
+                     E[loads] over train days per arc (valor esperado, no
+                     umbralizado a existencia). Usado SOLO como feature de
+                     entrada al agente (avail_prior, feature [6] en
+                     attention_encoder.py) — no interviene en ningún sorteo.
     """
     cwd = os.path.dirname(os.path.abspath(__file__))
 
@@ -163,14 +182,27 @@ def load_matrices(num_nodes: int) -> tuple:
     rate_stack  = rate_stack_raw[:num_days, :num_nodes, :num_nodes].astype(float)
     loads_stack = loads_stack_raw[:num_days, :num_nodes, :num_nodes].astype(float)
 
-    # ── Availability prior: P(lane i→j exists on a given day) ────────────────
-    # Computed over the full historical window (train + eval) so the prior is
-    # the same regardless of how many days are split off for training.
-    avail_prob_arr = (loads_stack > 0).mean(axis=0).astype(np.float32)
-
     train_days = min(TRAIN_DAYS, num_days)
     eval_days  = num_days - train_days
     print(f"Multi-day data  : {num_days} días totales | train={train_days} | eval={eval_days}")
+
+    # ── Availability prior: P(lane i→j sigue disponible cuando el camión llega) ─
+    # Calibrado SOLO con días de train — nunca con días de eval, para que el
+    # sorteo estocástico (draw_lane_availability) no filtre información del
+    # período de evaluación hacia el entrenamiento (antes se calibraba sobre
+    # train+eval combinados). Es una capa ADICIONAL a la de build_day_matrices,
+    # no la reemplaza: build_day_matrices ya excluye arcos sin ningún registro
+    # de carga ese día puntual (hecho real, ve incluso el mundo determinista);
+    # este prior modela, solo en el mundo estocástico, el riesgo de que la
+    # carga publicada ese día ya no esté disponible para este camión puntual
+    # cuando llega.
+    avail_prob_arr = (loads_stack[:train_days] > 0).mean(axis=0).astype(np.float32)
+
+    # ── Valor esperado de carga por lane (feature, no interviene en sorteos) ──
+    # E[loads] sobre días de train, sin umbralizar a existencia. Reemplaza el
+    # uso de avail_prob_arr como feature de entrada al agente: preserva la
+    # magnitud real (loads va de 0 a >1900) en vez de colapsarla a P(loads>0).
+    avail_expected_arr = loads_stack[:train_days].mean(axis=0).astype(np.float32)
 
     # P95 de los valores positivos del rate_stack de entrenamiento.
     # Usado como normalizador global de rewards en la feature [7] del encoder.
@@ -180,7 +212,7 @@ def load_matrices(num_nodes: int) -> tuple:
     print(f"REWARD_GLOBAL_P95: {reward_global_p95:.4f}")
 
     return time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
-           ltr_stack, trucks_stack, avail_prob_arr, reward_global_p95
+           ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95
 
 
 

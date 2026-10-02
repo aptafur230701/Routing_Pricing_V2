@@ -102,6 +102,7 @@ class AMRoutingAgent(nn.Module):
         k_remaining:            int        = None, # presupuesto K restante (None = libre)
         k_restricted:           bool       = False,
         k_condition_neutral:    bool       = False, # ablación: máscara real, features neutras
+        avail_expected_arr:     np.ndarray = None, # [num_nodes, num_nodes] — E[loads] histórico (train)
     ):
         """
         Construye tensores de entrada y ejecuta encoder + context_net.
@@ -130,6 +131,7 @@ class AMRoutingAgent(nn.Module):
             trucks_stack=trucks_day,
             avail_prob_arr=avail_prob_arr,
             reward_global_p95=reward_global_p95,
+            avail_expected_arr=avail_expected_arr,
         )
         temporal = build_temporal_features(
             time_elapsed, step_count, max_duration, self.num_nodes
@@ -187,6 +189,7 @@ class AMRoutingAgent(nn.Module):
         reward_global_p95:      float      = 1.0,
         critic:                 nn.Module  = None,
         value_coef:             float      = 1.0,
+        avail_expected_arr:     np.ndarray = None, # [num_nodes, num_nodes] — E[loads] histórico (train)
     ):
         """
         Rollout unificado con beam search para cualquier beam_width >= 1.
@@ -235,6 +238,7 @@ class AMRoutingAgent(nn.Module):
                     max_duration, ltr_stack, trucks_stack, day_idx,
                     avail_prob_arr=avail_prob_arr,
                     reward_global_p95=reward_global_p95,
+                    avail_expected_arr=avail_expected_arr,
                 )
 
                 # Máscara base: self-loop + intermedios visitados
@@ -311,6 +315,7 @@ class AMRoutingAgent(nn.Module):
                             max_duration, ltr_stack, trucks_stack, day_idx,
                             avail_prob_arr=avail_prob_arr,
                             reward_global_p95=reward_global_p95,
+                            avail_expected_arr=avail_expected_arr,
                         )
                     return b["total_reward"] + value_coef * v * REWARD_SCALE_FACTOR
 
@@ -370,6 +375,7 @@ class AMRoutingAgent(nn.Module):
         reward_global_p95:      float      = 1.0,
         critic:                 nn.Module  = None,
         value_coef:             float      = 1.0,
+        avail_expected_arr:     np.ndarray = None,   # [num_nodes, num_nodes] — E[loads] histórico (train)
     ):
         """
         Rollout determinista (sin gradientes) con el modelo actual.
@@ -407,6 +413,7 @@ class AMRoutingAgent(nn.Module):
                 avail_prob_arr=avail_prob_arr,
                 reward_global_p95=reward_global_p95,
                 critic=critic, value_coef=value_coef,
+                avail_expected_arr=avail_expected_arr,
             )
         finally:
             self.train()
@@ -431,6 +438,7 @@ class AMRoutingAgent(nn.Module):
         value_coef:        float      = 1.0,
         k_max:              int       = None,   # presupuesto de cardinalidad K (None = libre)
         k_condition_neutral: bool     = False,   # ablación: máscara real, features neutras
+        avail_expected_arr: np.ndarray = None,   # [num_nodes, num_nodes] — E[loads] histórico (train)
     ):
         """Beam search con días de mercado dinámicos y disponibilidad estocástica.
 
@@ -514,6 +522,7 @@ class AMRoutingAgent(nn.Module):
                     k_remaining=k_remaining,
                     k_restricted=(k_max is not None),
                     k_condition_neutral=k_condition_neutral,
+                    avail_expected_arr=avail_expected_arr,
                 )
 
                 mask_int = self._build_mask(
@@ -616,6 +625,7 @@ class AMRoutingAgent(nn.Module):
                             k_remaining=b["k_remaining"],
                             k_restricted=(k_max is not None),
                             k_condition_neutral=k_condition_neutral,
+                            avail_expected_arr=avail_expected_arr,
                         )
                     return b["total_reward"] + value_coef * v * REWARD_SCALE_FACTOR
 
@@ -677,6 +687,7 @@ class AMRoutingAgent(nn.Module):
         temperature:       float      = 1.0,
         k_max:              int       = None,   # presupuesto de cardinalidad K (None = libre)
         k_condition_neutral: bool     = False,   # ablación: máscara real, features neutras
+        avail_expected_arr: np.ndarray = None,   # [num_nodes, num_nodes] — E[loads] histórico (train)
     ):
         """Decodificación por muestreo: n_samples rollouts independientes.
 
@@ -774,6 +785,7 @@ class AMRoutingAgent(nn.Module):
                 trucks_stack_raw=trucks_stack,
                 avail_prob_arr=avail_prob_arr,
                 reward_global_p95=reward_global_p95,
+                avail_expected_arr=avail_expected_arr,
             )   # (B, N, 8)
             temporal = build_temporal_features_batch(
                 time_elapsed, step_count, max_duration, N
@@ -930,6 +942,7 @@ class AMRoutingAgent(nn.Module):
         day_idx:                int        = 0,
         avail_prob_arr:         np.ndarray = None,
         reward_global_p95:      float      = 1.0,
+        avail_expected_arr:     np.ndarray = None,
     ) -> int:
         """Selección determinista (argmax de logits) para evaluación env-based."""
         embeddings, h_t, _, _, _ = self._encode_step(
@@ -939,6 +952,7 @@ class AMRoutingAgent(nn.Module):
             max_duration, ltr_stack, trucks_stack, day_idx,
             avail_prob_arr=avail_prob_arr,
             reward_global_p95=reward_global_p95,
+            avail_expected_arr=avail_expected_arr,
         )
         mask_t    = torch.from_numpy(action_mask).unsqueeze(0).to(self.device)
         bool_mask = (mask_t == 0)
@@ -962,6 +976,7 @@ class AMRoutingAgent(nn.Module):
         day_idx:                int        = 0,
         avail_prob_arr:         np.ndarray = None,
         reward_global_p95:      float      = 1.0,
+        avail_expected_arr:     np.ndarray = None,
     ):
         """
         Paso estocástico para entrenamiento PPO.
@@ -979,6 +994,7 @@ class AMRoutingAgent(nn.Module):
             max_duration, ltr_stack, trucks_stack, day_idx,
             avail_prob_arr=avail_prob_arr,
             reward_global_p95=reward_global_p95,
+            avail_expected_arr=avail_expected_arr,
         )
         mask_t = torch.from_numpy(action_mask).unsqueeze(0).to(self.device)
         action_t, log_prob, entropy = self.decoder.act(h_t, embeddings, mask_t)
@@ -1002,6 +1018,7 @@ class AMRoutingAgent(nn.Module):
         day_idx:                int        = 0,
         avail_prob_arr:         np.ndarray = None,
         reward_global_p95:      float      = 1.0,
+        avail_expected_arr:     np.ndarray = None,
     ):
         """
         Paso estocástico para recolección PPO: samplea acción y estima valor.
@@ -1023,6 +1040,7 @@ class AMRoutingAgent(nn.Module):
             max_duration, ltr_stack, trucks_stack, day_idx,
             avail_prob_arr=avail_prob_arr,
             reward_global_p95=reward_global_p95,
+            avail_expected_arr=avail_expected_arr,
         )
         critic_val = critic(h_t)                                            # (1,1) on device
         mask_t     = torch.from_numpy(action_mask).unsqueeze(0).to(self.device)
@@ -1055,6 +1073,7 @@ class AMRoutingAgent(nn.Module):
         k_remaining:            int        = None,
         k_restricted:           bool       = False,
         k_condition_neutral:    bool       = False,
+        avail_expected_arr:     np.ndarray = None,
     ) -> float:
         """Estima V(s) para bootstrap en episodios truncados."""
         _, h_t, _, _, _ = self._encode_step(
@@ -1067,5 +1086,6 @@ class AMRoutingAgent(nn.Module):
             k_remaining=k_remaining,
             k_restricted=k_restricted,
             k_condition_neutral=k_condition_neutral,
+            avail_expected_arr=avail_expected_arr,
         )
         return critic(h_t).item()

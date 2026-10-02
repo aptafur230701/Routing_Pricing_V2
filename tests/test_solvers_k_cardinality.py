@@ -29,7 +29,7 @@ from Solvers import (
     solve_label_setting_oracle,
 )
 
-N = 9   # > K_MAX (8): un ciclo puede alcanzar hasta N arcos, así que todos
+N = 9   # > max(K_LEVELS): un ciclo puede alcanzar hasta N arcos, así que todos
         # los niveles de K_LEVELS son físicamente alcanzables.
 
 

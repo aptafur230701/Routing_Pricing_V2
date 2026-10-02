@@ -26,7 +26,7 @@ N_TRIALS_PER_LEVEL = 60   # episodios por nivel de K en el test escalar
 @pytest.fixture(scope="module")
 def data():
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-     ltr_stack, trucks_stack, avail_prob_arr, reward_global_p95) = load_matrices(NUM_NODES)
+     ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95) = load_matrices(NUM_NODES)
     return dict(
         time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack,
         distance_arr=distance_arr, diesel_arr=diesel_arr,

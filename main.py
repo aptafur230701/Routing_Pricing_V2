@@ -49,7 +49,6 @@ from evaluation import (
 )
 from stats_analysis import append_stats_sheets_to_excel
 from transfer_learning import build_agent_for_training, load_checkpoint_compatible
-from convergence_check import check_convergence, print_convergence_report, save_convergence_to_excel
 
 
 def set_seeds(seed: int):
@@ -65,7 +64,7 @@ def _run_am(
     distance_arr, diesel_arr, cwd,
     pretrained_agent=None, pretrained_critic=None,
     ltr_stack=None, trucks_stack=None, avail_prob_arr=None,
-    reward_global_p95=1.0,
+    reward_global_p95=1.0, avail_expected_arr=None,
 ):
     """Pipeline AM: entrenamiento PPO → checkpoint."""
     from am_training import run_am_training
@@ -86,6 +85,7 @@ def _run_am(
         ltr_stack=ltr_stack, trucks_stack=trucks_stack,
         avail_prob_arr=avail_prob_arr,
         reward_global_p95=reward_global_p95,
+        avail_expected_arr=avail_expected_arr,
     )
     train_time = time.time() - t0
     print(f"Training time: {train_time:.1f} s")
@@ -123,7 +123,7 @@ def _evaluate_and_report(
     distance_arr, diesel_arr, ep_rewards, ep_losses,
     train_time, summary_rows, cwd, label,
     ltr_stack=None, trucks_stack=None, avail_prob_arr=None,
-    n_days_per_node=1, critic=None,
+    n_days_per_node=1, critic=None, avail_expected_arr=None,
 ):
     """Comparación de solvers + resumen + guardado de archivos."""
     results_df, timing = run_solver_comparison(
@@ -134,6 +134,7 @@ def _evaluate_and_report(
         avail_prob_arr=avail_prob_arr,
         n_days_per_node=n_days_per_node,
         critic=critic,
+        avail_expected_arr=avail_expected_arr,
     )
 
     def avg_valid(col, valid_col):
@@ -257,7 +258,7 @@ def _evaluate_and_report(
 
 def main():
     # ── Cambia estos valores según lo que quieras hacer ───────────────────────
-    NUM_NODES       = 20     # opciones: 10 · 20 · 35 · 50 · 75 · 100
+    NUM_NODES       = 10     # opciones: 10 · 20 · 35 · 50 · 75 · 100
     EVAL_ONLY       = False   # True: carga checkpoint y salta entrenamiento
     USE_TRANSFER    = True   # True: warm-start desde el checkpoint del tamaño anterior en
                               # NODE_SEQUENCE (requiere mismo AM_D_H/AM_N_LAYERS que la fuente).
@@ -282,7 +283,7 @@ def main():
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
-        ltr_stack, trucks_stack, avail_prob_arr, reward_global_p95 = load_matrices(NUM_NODES)
+        ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
 
     # ── Train / eval split (temporal — el modelo no ve los días de eval) ──────
     rate_train  = rate_stack[:TRAIN_DAYS]
@@ -290,7 +291,6 @@ def main():
     rate_eval   = rate_stack[TRAIN_DAYS:]
     loads_eval  = loads_stack[TRAIN_DAYS:]
 
-    conv_result = None
 
     if EVAL_ONLY:
         agent_am, critic  = _load_agent(checkpoint_dir, NUM_NODES)
@@ -307,6 +307,7 @@ def main():
             ltr_stack=ltr_stack, trucks_stack=trucks_stack,
             avail_prob_arr=avail_prob_arr,
             reward_global_p95=reward_global_p95,
+            avail_expected_arr=avail_expected_arr,
         )
         ppo_plot_path = os.path.join(output_dir, "PPO_Diagnostics_AM.png")
         plot_ppo_diagnostics(training_log, NUM_NODES, ppo_plot_path)
@@ -321,10 +322,6 @@ def main():
         pd.DataFrame(training_log).to_excel(tlog_xlsx_path, index=False)
         print(f"training_log (Excel) guardado en: {tlog_xlsx_path}")
 
-        if training_log:
-            conv_result = check_convergence(training_log)
-            print_convergence_report(conv_result)
-
     _evaluate_and_report(
         agent_am, NUM_NODES, time_matrix, rate_eval, loads_eval,
         distance_arr, diesel_arr, ep_r, ep_l, t,
@@ -333,11 +330,8 @@ def main():
         avail_prob_arr=avail_prob_arr,
         n_days_per_node=N_DAYS_PER_NODE,
         critic=critic,
+        avail_expected_arr=avail_expected_arr,
     )
-
-    if conv_result is not None:
-        excel_path = os.path.join(output_dir, "DRL_Routing_Summary_AM.xlsx")
-        save_convergence_to_excel(conv_result, NUM_NODES, excel_path)
 
     print(f"\nDone! Checkpoint guardado en: checkpoints/am_checkpoint_{NUM_NODES}nodes.pt")
 

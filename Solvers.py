@@ -1010,7 +1010,8 @@ def solve_HGA_LNS_metaheuristic(
         el retorno). None (default) = caso libre. Se propaga a todos los
         generadores/operadores de la población (mismo max_route_len
         generalizado que usan). El "sweep" garantizado de rutas de 2-3
-        paradas no necesita condición: siempre es ≤K bajo K_MIN=4.
+        paradas no necesita condición: siempre es ≤K bajo el único nivel
+        restringido entrenado, K_MAX=5.
 
     Returns: status, route, total_reward, total_duration
     """

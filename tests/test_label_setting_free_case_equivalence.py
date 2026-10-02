@@ -53,7 +53,7 @@ def data():
 
 def test_free_case_matches_pre_k_conditioning_baseline(data):
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-     ltr_stack, trucks_stack, avail_prob_arr, reward_global_p95) = data
+     ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95) = data
     time_matrix_np = np.array(time_matrix, dtype=float)
 
     r = solve_heuristic_rolling_horizon(

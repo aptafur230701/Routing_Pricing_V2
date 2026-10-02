@@ -24,7 +24,12 @@ Features por nodo j (desde la posición actual del camión):
   [3] is_depot      — 1.0 si j es el nodo de inicio del episodio, 0.0 si no
   [4] visited       — 1.0 si j ya fue visitado en el episodio, 0.0 si no
   [5] trucks_norm   — camiones disponibles en j para el delta correspondiente
-  [6] avail_prior   — P(lane actual→j existe) según historial; prior del Bernoulli
+  [6] avail_prior   — E[loads] histórico (train) del arco actual→j, normalizado por
+                      LOADS_EXPECTED_CLIP y clipeado a [0, 1]. Antes era P(lane existe)
+                      (mismo array que el sorteo Bernoulli del entorno); ahora es un
+                      array separado (avail_expected_arr) que preserva la magnitud
+                      real en vez de colapsarla a una probabilidad de existencia —
+                      no interviene en ningún sorteo, es puramente descriptivo.
   [7] reward_abs    — reward crudo / REWARD_GLOBAL_P95, clipeado a [0, 1]; 0 si negativo
 
 Condicionamiento en presupuesto de cardinalidad K:
@@ -44,7 +49,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import LTR_CLIP, TRUCKS_CLIP, K_NORM
+from config import LTR_CLIP, TRUCKS_CLIP, LOADS_EXPECTED_CLIP, K_NORM
 
 # Número de features por nodo — debe coincidir con build_node_features()
 N_NODE_FEATURES = 8
@@ -69,8 +74,9 @@ def build_node_features(
     max_duration:            float,
     trucks_stack:            np.ndarray = None,  # (N, 3) — camiones por nodo×delta
     time_matrix_arr:         np.ndarray = None,  # unused; kept for API compatibility
-    avail_prob_arr:          np.ndarray = None,  # (N, N) — prior Bernoulli por arco
+    avail_prob_arr:          np.ndarray = None,  # (N, N) — prior Bernoulli por arco; NO se usa aquí (ver avail_expected_arr)
     reward_global_p95:       float      = 1.0,
+    avail_expected_arr:      np.ndarray = None,  # (N, N) — E[loads] histórico (train), usado en feature [6]
 ) -> np.ndarray:
     """
     Construye la matriz de features de nodos para el encoder (vectorizada).
@@ -108,9 +114,9 @@ def build_node_features(
         trucks_vals = trucks_stack[np.arange(num_nodes), delta_idx]           # (N,)
         feats[:, 5] = np.minimum(trucks_vals, TRUCKS_CLIP) / TRUCKS_CLIP
 
-    # Column 6: avail_prior
-    if avail_prob_arr is not None:
-        feats[:, 6] = avail_prob_arr[current_node]
+    # Column 6: avail_prior — E[loads] histórico (train), no P(existe).
+    if avail_expected_arr is not None:
+        feats[:, 6] = np.minimum(avail_expected_arr[current_node], LOADS_EXPECTED_CLIP) / LOADS_EXPECTED_CLIP
 
     # Recortar reward para evitar BIG_M_PENALTY (-1e9) en la diagonal
     feats[:, 0] = np.clip(feats[:, 0], -1e4, 1e4)
@@ -394,10 +400,10 @@ def build_budget_features(
 ) -> np.ndarray:
     """Construye el vector de budget features (2,) para ContextNetwork.
 
-    [0] k_remaining_norm — k_remaining / K_NORM (normalizador GLOBAL, no por
-        episodio: así K=4 arranca en 0.5 y K=8 arranca en 1.0, permitiendo
-        distinguir el nivel de K desde el primer paso). 1.0 constante si
-        k_restricted es False (caso libre).
+    [0] k_remaining_norm — k_remaining / K_NORM, escala el presupuesto
+        restante a [0, 1] (con K_NORM = K_MAX, arranca en 1.0 y baja a
+        1/K_MAX en el último arco antes del retorno forzado). 1.0 constante
+        si k_restricted es False (caso libre).
     [1] k_restricted — 1.0 si el episodio tiene presupuesto K activo, 0.0 si
         es el caso libre.
 
@@ -442,8 +448,9 @@ def build_node_features_batch(
     num_nodes:         int,
     max_duration:      float,
     trucks_stack_raw:  np.ndarray = None,   # (N, num_days_ltr, 3)
-    avail_prob_arr:    np.ndarray = None,   # (N, N)
+    avail_prob_arr:    np.ndarray = None,   # (N, N) — prior Bernoulli; NO se usa aquí (ver avail_expected_arr)
     reward_global_p95: float      = 1.0,
+    avail_expected_arr: np.ndarray = None,  # (N, N) — E[loads] histórico (train), usado en feature [6]
 ) -> np.ndarray:                            # (B, N, N_NODE_FEATURES=8) float32
     """
     Batched version of build_node_features.
@@ -490,9 +497,12 @@ def build_node_features_batch(
         ]                                                                # (B, N)
         feats[:, :, 5] = np.minimum(trucks_val, TRUCKS_CLIP) / TRUCKS_CLIP
 
-    # ── f6: lane availability prior ───────────────────────────────────────────
-    if avail_prob_arr is not None:
-        feats[:, :, 6] = avail_prob_arr[current_node, :]       # (B, N)
+    # ── f6: lane availability prior — E[loads] histórico (train), no P(existe) ─
+    if avail_expected_arr is not None:
+        feats[:, :, 6] = (
+            np.minimum(avail_expected_arr[current_node, :], LOADS_EXPECTED_CLIP)
+            / LOADS_EXPECTED_CLIP
+        )       # (B, N)
 
     # ── Clip reward before normalization (avoids BIG_M_PENALTY overflow) ─────
     feats[:, :, 0] = np.clip(feats[:, :, 0], -1e4, 1e4)
