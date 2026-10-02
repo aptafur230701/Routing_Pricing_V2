@@ -4,7 +4,7 @@ evaluation.py
 Post-training evaluation:
   · generate_optimal_route  — deterministic greedy rollout with trained agent
   · evaluate_stochastic     — N-episode stochastic reward distribution
-  · run_solver_comparison   — DRL vs Greedy vs 2-Opt vs GA vs LNS
+  · run_solver_comparison   — DRL vs Greedy, HGA-LNS, rolling-horizon, MC-Rollout y label-setting
   · save_results            — Excel output
   · plot_diagnostics        — 2×2 training diagnostics figure
 """
@@ -48,7 +48,7 @@ def rollout_drl_env(
     max_duration:   float      = MAX_DURATION,
     ltr_stack:      np.ndarray = None,
     trucks_stack:   np.ndarray = None,
-    avail_prob_arr: np.ndarray = None,
+    lane_filter:    bool       = False,
     beam_width:     int        = None,
     critic                     = None,
     value_coef:     float      = 1.0,
@@ -65,8 +65,8 @@ def rollout_drl_env(
         de antes de introducir el condicionamiento en K.
 
     avail_expected_arr se pasa SIEMPRE (Real y Det por igual) — es solo la
-    feature de entrada al agente (avail_prior), no interviene en el sorteo
-    Bernoulli (que sí se desactiva en modo Det vía avail_prob_arr=None).
+    feature de entrada al agente (avail_prior), no interviene en el filtrado
+    de lanes (que sí se desactiva en modo Det vía lane_filter=False).
     """
     agent.eval()
     try:
@@ -75,7 +75,7 @@ def rollout_drl_env(
             time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
             max_duration,
             ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-            avail_prob_arr=avail_prob_arr,
+            lane_filter=lane_filter,
             beam_width=beam_width,
             critic=critic, value_coef=value_coef,
             k_max=k_max,
@@ -101,7 +101,7 @@ def _run_comparison_cell(
     agent, s, day_idx, rep,
     time_matrix, time_matrix_np,
     rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
-    ltr_stack, trucks_stack, avail_prob_arr, critic,
+    ltr_stack, trucks_stack, critic,
     k_max=None, verbose=True,
     avail_expected_arr=None,
 ) -> tuple:
@@ -130,7 +130,7 @@ def _run_comparison_cell(
         agent, s, day_idx,
         time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
         ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-        avail_prob_arr=avail_prob_arr,
+        lane_filter=True,
         beam_width=get_beam_width_real(num_nodes),
         critic=critic,
         k_max=k_max,
@@ -146,8 +146,8 @@ def _run_comparison_cell(
     })
     _p_drl_real = f"  DRL Real:       {drl_real_route} | reward {drl_real_reward:.1f}"
 
-    # ── DRL Det — ruta construida y evaluada sin Bernoulli ───────────────
-    # avail_prob_arr=None desactiva el filtrado de lanes en beam_search_dynamic.
+    # ── DRL Det — ruta construida y evaluada sin filtrado de lanes ───────
+    # lane_filter=False (default) desactiva el filtrado de lanes en beam_search_dynamic.
     # El reward se recomputa explícitamente con simulate_route_reward para
     # garantizar paridad bit-a-bit con el mundo determinista.
     t0 = time.time()
@@ -155,7 +155,6 @@ def _run_comparison_cell(
         agent, s, day_idx,
         time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
         ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-        avail_prob_arr=None,   # sin Bernoulli → mundo determinista
         critic=critic,
         k_max=k_max,
         avail_expected_arr=avail_expected_arr,
@@ -165,7 +164,6 @@ def _run_comparison_cell(
         drl_det_reward, drl_det_duration = simulate_route_reward(
             drl_det_route, s, day_idx,
             time_matrix_np, rate_stack, loads_stack, distance_arr, diesel_arr,
-            avail_prob_arr=None,
         )
     else:
         drl_det_reward, drl_det_duration = -np.inf, np.inf
@@ -218,7 +216,7 @@ def _run_comparison_cell(
         solve_heuristic_rolling_horizon_stochastic(
             s, time_matrix, rate_stack, loads_stack,
             distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-            start_day_idx=day_idx, avail_prob_arr=avail_prob_arr, k_max=k_max,
+            start_day_idx=day_idx, k_max=k_max,
         )
     times['rh_stoch'] = time.time() - t0
     row.update({
@@ -235,7 +233,7 @@ def _run_comparison_cell(
         solve_heuristic_rolling_horizon_lookahead_stochastic(
             s, time_matrix, rate_stack, loads_stack,
             distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-            start_day_idx=day_idx, avail_prob_arr=avail_prob_arr, lookahead=3, k_max=k_max,
+            start_day_idx=day_idx, lookahead=3, k_max=k_max,
         )
     times['rh_lookahead_stoch'] = time.time() - t0
     row.update({
@@ -252,7 +250,7 @@ def _run_comparison_cell(
         solve_mc_rollout_stochastic(
             s, time_matrix, rate_stack, loads_stack,
             distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-            start_day_idx=day_idx, avail_prob_arr=avail_prob_arr, k_max=k_max,
+            start_day_idx=day_idx, k_max=k_max,
         )
     times['mc_rollout'] = time.time() - t0
     row.update({
@@ -319,7 +317,6 @@ def _run_comparison_cell(
         s, time_matrix_np, rate_stack, loads_stack,
         distance_arr, diesel_arr, MAX_DURATION, num_nodes,
         start_day_idx=day_idx,
-        avail_prob_arr=avail_prob_arr,
         time_limit_seconds=300,
         k_max=k_max,
     )
@@ -337,7 +334,7 @@ def _run_comparison_cell(
     assert lso_reward >= row.get('DRL Real Reward', -np.inf) - 1e-3, (
         f"LS-Oracle ({lso_reward:.1f}) no debería ser superado por DRL Real "
         f"({row.get('DRL Real Reward', float('nan')):.1f}) en start={s} day={day_idx} "
-        f"k_max={k_max} — revisar alineación de semillas Bernoulli."
+        f"k_max={k_max} — revisar alineación del filtrado de lanes."
     )
     _p_ls_oracle = f"  LS-Oracle:      {lso_route} | reward {lso_reward:.1f} [{lso_status}]"
 
@@ -361,7 +358,7 @@ def _run_comparison_cell(
 def run_solver_comparison(agent, time_matrix,
                            rate_stack, loads_stack, distance_arr, diesel_arr,
                            num_nodes,
-                           ltr_stack=None, trucks_stack=None, avail_prob_arr=None,
+                           ltr_stack=None, trucks_stack=None,
                            n_days_per_node=3, critic=None,
                            avail_expected_arr=None):
     """Run DRL Real + DRL Det + HGA-LNS + RH-Greedy for every start node.
@@ -405,7 +402,7 @@ def run_solver_comparison(agent, time_matrix,
                 agent, s, day_idx, rep,
                 time_matrix, time_matrix_np,
                 rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
-                ltr_stack, trucks_stack, avail_prob_arr, critic,
+                ltr_stack, trucks_stack, critic,
                 k_max=None, verbose=True,
                 avail_expected_arr=avail_expected_arr,
             )
@@ -436,7 +433,7 @@ def run_solver_comparison_by_k(agent, time_matrix,
                                 rate_stack, loads_stack, distance_arr, diesel_arr,
                                 num_nodes,
                                 k_levels=None,
-                                ltr_stack=None, trucks_stack=None, avail_prob_arr=None,
+                                ltr_stack=None, trucks_stack=None,
                                 n_days_per_node=1, critic=None,
                                 avail_expected_arr=None):
     """Como run_solver_comparison, pero repite la comparación completa (DRL +
@@ -499,7 +496,7 @@ def run_solver_comparison_by_k(agent, time_matrix,
                     agent, s, day_idx, rep,
                     time_matrix, time_matrix_np,
                     rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
-                    ltr_stack, trucks_stack, avail_prob_arr, critic,
+                    ltr_stack, trucks_stack, critic,
                     k_max=k_max, verbose=True,
                     avail_expected_arr=avail_expected_arr,
                 )

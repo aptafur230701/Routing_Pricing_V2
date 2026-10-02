@@ -63,7 +63,7 @@ def _run_am(
     NUM_NODES, time_matrix, rate_stack, loads_stack,
     distance_arr, diesel_arr, cwd,
     pretrained_agent=None, pretrained_critic=None,
-    ltr_stack=None, trucks_stack=None, avail_prob_arr=None,
+    ltr_stack=None, trucks_stack=None,
     reward_global_p95=1.0, avail_expected_arr=None,
 ):
     """Pipeline AM: entrenamiento PPO → checkpoint."""
@@ -83,7 +83,6 @@ def _run_am(
         pretrained_agent=pretrained_agent,
         pretrained_critic=pretrained_critic,
         ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-        avail_prob_arr=avail_prob_arr,
         reward_global_p95=reward_global_p95,
         avail_expected_arr=avail_expected_arr,
     )
@@ -122,7 +121,7 @@ def _evaluate_and_report(
     agent, NUM_NODES, time_matrix, rate_stack, loads_stack,
     distance_arr, diesel_arr, ep_rewards, ep_losses,
     train_time, summary_rows, cwd, label,
-    ltr_stack=None, trucks_stack=None, avail_prob_arr=None,
+    ltr_stack=None, trucks_stack=None,
     n_days_per_node=1, critic=None, avail_expected_arr=None,
 ):
     """Comparación de solvers + resumen + guardado de archivos."""
@@ -131,7 +130,6 @@ def _evaluate_and_report(
         rate_stack, loads_stack, distance_arr, diesel_arr,
         NUM_NODES,
         ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-        avail_prob_arr=avail_prob_arr,
         n_days_per_node=n_days_per_node,
         critic=critic,
         avail_expected_arr=avail_expected_arr,
@@ -283,7 +281,7 @@ def main():
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
-        ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
+        ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
 
     # ── Train / eval split (temporal — el modelo no ve los días de eval) ──────
     rate_train  = rate_stack[:TRAIN_DAYS]
@@ -305,7 +303,6 @@ def main():
             distance_arr, diesel_arr, checkpoint_dir,
             agent_pretrained, critic_pretrained,
             ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-            avail_prob_arr=avail_prob_arr,
             reward_global_p95=reward_global_p95,
             avail_expected_arr=avail_expected_arr,
         )
@@ -327,7 +324,6 @@ def main():
         distance_arr, diesel_arr, ep_r, ep_l, t,
         summary_rows, output_dir, label="AM",
         ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-        avail_prob_arr=avail_prob_arr,
         n_days_per_node=N_DAYS_PER_NODE,
         critic=critic,
         avail_expected_arr=avail_expected_arr,

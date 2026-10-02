@@ -26,11 +26,10 @@ N_TRIALS_PER_LEVEL = 60   # episodios por nivel de K en el test escalar
 @pytest.fixture(scope="module")
 def data():
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-     ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95) = load_matrices(NUM_NODES)
+     ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95) = load_matrices(NUM_NODES)
     return dict(
         time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack,
         distance_arr=distance_arr, diesel_arr=diesel_arr,
-        avail_prob_arr=avail_prob_arr,
     )
 
 
@@ -51,7 +50,6 @@ def test_scalar_env_random_policy_respects_k(data):
         loads_stack=data["loads_stack"],
         distance_arr=data["distance_arr"],
         diesel_arr=data["diesel_arr"],
-        avail_prob_arr=data["avail_prob_arr"],
         num_nodes=NUM_NODES,
         max_duration=MAX_DURATION,
     )
@@ -94,7 +92,6 @@ def test_scalar_env_backward_compatible_when_k_max_absent(data):
         loads_stack=data["loads_stack"],
         distance_arr=data["distance_arr"],
         diesel_arr=data["diesel_arr"],
-        avail_prob_arr=data["avail_prob_arr"],
         num_nodes=NUM_NODES,
         max_duration=MAX_DURATION,
     )
@@ -118,7 +115,6 @@ def test_vector_env_random_policy_respects_k(data):
         loads_stack=data["loads_stack"],
         distance_arr=data["distance_arr"],
         diesel_arr=data["diesel_arr"],
-        avail_prob_arr=data["avail_prob_arr"],
         rm_pen_stack=rm_pen_stack,
         num_nodes=NUM_NODES,
         max_duration=MAX_DURATION,

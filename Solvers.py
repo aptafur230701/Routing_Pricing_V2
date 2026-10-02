@@ -4,12 +4,7 @@ from collections import namedtuple
 # ── Constantes de dominio (antes números mágicos dispersos por el archivo) ────
 DAYS_PER_PERIOD = 14            # día de mercado:  day_idx = start + int(t // 14)
 TIME_EPS = 1e-6                 # tolerancia de holgura temporal
-INSERTION_TIME_PENALTY = 1e-3  # peso del castigo por tiempo en la inserción LNS
-_BERNOULLI_SEED_A = 9973       # constantes de semilla del MC rollout
-_BERNOULLI_SEED_B = 97
-
-# torch se importa de forma PEREZOSA dentro de generate_optimal_route_pytorch,
-# de modo que importar Solvers no arrastre dependencias pesadas/opcionales.
+INSERTION_TIME_PENALTY = 1e-3  # peso del castigo por tiempo en la inserción LNS (reparación de HGA-LNS)
 
 # ── Tipos de resultado (namedtuple = 100% compatible con desempaquetado por
 #    tupla, así que los llamadores existentes siguen funcionando sin cambios) ──
@@ -53,7 +48,7 @@ def _make_rm_cache(rate_stack, loads_stack, distance_arr, diesel_arr,
 def _close_cycle_and_finalize(route, current_node, time_elapsed, start_node,
                               time_m, max_d, start_day_idx,
                               rate_stack, loads_stack, distance_arr, diesel_arr,
-                              avail_prob_arr):
+                              lane_filter=False):
     """Cierra el ciclo (regreso al depósito si es factible en tiempo), valida y
     re-evalúa el reward de forma canónica con simulate_route_reward.
 
@@ -76,120 +71,12 @@ def _close_cycle_and_finalize(route, current_node, time_elapsed, start_node,
     total_reward, total_duration = simulate_route_reward(
         route, start_node, start_day_idx,
         time_m, rate_stack, loads_stack, distance_arr, diesel_arr,
-        avail_prob_arr=avail_prob_arr,
+        lane_filter=lane_filter,
     )
     is_valid = total_duration <= max_d
     status = "Optimal" if is_valid else "Infeasible"
     return RHResult(status, route, total_reward, total_duration, is_valid)
 
-
-def generate_optimal_route_pytorch(agent, start_node, time_matrix, reward_matrix,
-                                   NUM_NODES, MAX_DURATION, MAX_STEPS_PER_EPISODE):
-    """Genera una ruta con la política aprendida (selección greedy), evitando
-    revisitar nodos intermedios. Si se alcanza max_steps intenta el regreso
-    forzado si es factible, y valida la ventana de duración final.
-
-    Devuelve (route, total_reward, time_elapsed) si forma un ciclo válido, o
-    (None, -inf, inf) si no logra cerrar el ciclo.
-    """
-    import torch  # import perezoso: única función del módulo que usa torch
-
-    max_steps = MAX_STEPS_PER_EPISODE
-    agent.epsilon = 0
-    agent.policy_net.eval()
-    current_node = start_node
-    time_elapsed = 0.0
-    state = np.array([current_node, time_elapsed / MAX_DURATION], dtype=np.float32)
-    route = [start_node]
-    visited_intermediate_nodes = set()  # nodos visitados distintos de start_node
-    total_reward = 0.0
-    returned_home = False
-
-    try:
-        with torch.no_grad():
-            for step in range(max_steps):
-                # --- Selección de acción ---
-                state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(agent.device)
-                q_values = agent.policy_net(state_tensor)
-                q_values_numpy = q_values.cpu().data.numpy()[0]
-
-                # --- Enmascarar acciones inválidas ---
-                q_values_numpy[current_node] = -np.inf  # no quedarse en el mismo nodo
-                for visited_node_idx in visited_intermediate_nodes:
-                    if 0 <= visited_node_idx < len(q_values_numpy):
-                        q_values_numpy[visited_node_idx] = -np.inf
-
-                # --- Mejor acción válida ---
-                next_node = np.argmax(q_values_numpy)
-
-                # ¿existe alguna acción válida?
-                if q_values_numpy[next_node] == -np.inf:
-                    # Sin movimientos válidos: intentar regreso forzado al depósito.
-                    if current_node != start_node:
-                        return_time = time_matrix[current_node][start_node]
-                        if time_elapsed + return_time <= MAX_DURATION + TIME_EPS:
-                            next_node = start_node  # forzar regreso
-                        else:
-                            returned_home = False
-                            break  # no se puede continuar
-                    else:  # atascado en el depósito (no debería pasar con el masking)
-                        returned_home = False
-                        break
-
-                # --- Simular paso ---
-                step_time = time_matrix[current_node][next_node]
-                step_reward = reward_matrix[current_node][next_node]
-
-                # --- Violación inmediata de tiempo ---
-                if time_elapsed + step_time > MAX_DURATION + TIME_EPS and next_node != start_node:
-                    returned_home = False
-                    break
-
-                # --- Actualizar estado ---
-                time_elapsed += step_time
-                total_reward += step_reward
-                current_node = next_node
-                route.append(current_node)
-                if current_node != start_node:
-                    visited_intermediate_nodes.add(current_node)
-
-                state = np.array([current_node, min(time_elapsed, MAX_DURATION) / MAX_DURATION],
-                                 dtype=np.float32)
-
-                # --- Regreso natural ---
-                if current_node == start_node:
-                    returned_home = True
-                    break
-
-            # --- Regreso forzado si se agotaron los pasos ---
-            if not returned_home and current_node != start_node:
-                return_time = time_matrix[current_node][start_node]
-                return_reward = reward_matrix[current_node][start_node]
-                if time_elapsed + return_time <= MAX_DURATION + TIME_EPS:
-                    time_elapsed += return_time
-                    total_reward += return_reward
-                    current_node = start_node
-                    route.append(start_node)
-                    returned_home = True
-    finally:
-        # Garantiza que la red vuelva a modo entrenamiento incluso si algo falla
-        # a mitad (el original solo lo hacía en la ruta feliz).
-        agent.policy_net.train()
-
-    # --- Validación final ---
-    is_cycle = (returned_home and route[0] == start_node
-                and route[-1] == start_node and len(route) > 1)
-    if not is_cycle:
-        return None, -np.inf, np.inf  # ruta fallida
-
-    intermediate_nodes = route[1:-1]
-    has_duplicates = len(intermediate_nodes) != len(set(intermediate_nodes))
-    if has_duplicates:
-        print(f"Warning: DRL route {route} has duplicate intermediate nodes despite masking!")
-
-    # En ambos casos (válido o con duración/nodos inválidos) se devuelven los
-    # detalles del ciclo, igual que en el original.
-    return route, total_reward, time_elapsed
 
 def solve_heuristic(start_node, time_m, reward_m, max_d, num_n, k_max=None):
     """Greedy con horizonte estático (día fijo). Usado standalone (dead
@@ -247,256 +134,6 @@ def solve_heuristic(start_node, time_m, reward_m, max_d, num_n, k_max=None):
     status = "Optimal" if is_valid else "Infeasible"
     return RHResult(status, route, total_reward, time_elapsed, is_valid)
 
-
-
-def _node_insertion_pass(route, time_m, reward_m, max_d, num_n):
-    """
-    Intenta insertar nodos no visitados en la mejor posición de la ruta.
-    Acepta la inserción solo si mejora el reward total y es factible en tiempo.
-    Repite hasta que ninguna inserción mejore.
-    """
-    max_arcs = num_n - 1
-    improved = True
-    best_route = route[:]
-    best_reward = sum(reward_m[best_route[k]][best_route[k+1]]
-                      for k in range(len(best_route) - 1))
-    best_time = sum(time_m[best_route[k]][best_route[k+1]]
-                    for k in range(len(best_route) - 1))
-
-    while improved:
-        improved = False
-        visited = set(best_route)
-        unvisited = [n for n in range(num_n) if n not in visited]
-
-        for node in unvisited:
-            if len(best_route) - 1 >= max_arcs:
-                break  # ruta ya en el límite de arcos
-
-            best_gain = 0  # solo aceptar si hay ganancia neta positiva
-            best_pos = None
-
-            for pos in range(1, len(best_route)):
-                a = best_route[pos - 1]
-                b = best_route[pos]
-
-                delta_time = (time_m[a][node] + time_m[node][b]
-                              - time_m[a][b])
-                delta_reward = (reward_m[a][node] + reward_m[node][b]
-                                - reward_m[a][b])
-
-                if best_time + delta_time <= max_d and delta_reward > best_gain:
-                    best_gain = delta_reward
-                    best_pos = pos
-
-            if best_pos is not None:
-                best_route.insert(best_pos, node)
-                best_reward += best_gain
-                best_time = sum(time_m[best_route[k]][best_route[k+1]]
-                                for k in range(len(best_route) - 1))
-                improved = True
-                break  # reiniciar con la ruta actualizada
-
-    return best_route, best_reward, best_time
-
-
-def solve_2opt_heuristic(start_node, time_m, reward_m, max_d, num_n):
-    status, route, total_reward, total_time, is_valid = solve_heuristic(
-        start_node, time_m, reward_m, max_d, num_n
-    )
-    if not is_valid:
-        return RHResult(status, route, total_reward, total_time, is_valid)
-
-    best_route = route[:]
-    best_reward = total_reward
-    best_time = total_time
-    outer_improved = True
-
-    while outer_improved:
-        outer_improved = False
-
-        # Fase 1: 2-opt swaps
-        swap_improved = True
-        while swap_improved:
-            swap_improved = False
-            for i in range(1, len(best_route) - 2):
-                for j in range(i + 1, len(best_route) - 1):
-                    new_route = (best_route[:i]
-                                 + best_route[i:j+1][::-1]
-                                 + best_route[j+1:])
-                    new_time = sum(time_m[new_route[k]][new_route[k+1]]
-                                   for k in range(len(new_route) - 1))
-                    new_reward = sum(reward_m[new_route[k]][new_route[k+1]]
-                                     for k in range(len(new_route) - 1))
-                    if (new_time <= max_d
-                            and new_route[0] == start_node
-                            and new_route[-1] == start_node
-                            and new_reward > best_reward):
-                        best_route = new_route
-                        best_reward = new_reward
-                        best_time = new_time
-                        swap_improved = True
-                        outer_improved = True
-                        break
-                if swap_improved:
-                    break
-
-        # Fase 2: inserción de nodos no visitados
-        inserted_route, inserted_reward, inserted_time = _node_insertion_pass(
-            best_route, time_m, reward_m, max_d, num_n
-        )
-        if inserted_reward > best_reward:
-            best_route = inserted_route
-            best_reward = inserted_reward
-            best_time = inserted_time
-            outer_improved = True
-
-    is_valid = (best_time <= max_d
-                and best_route[0] == start_node
-                and best_route[-1] == start_node)
-    status = "Optimal" if is_valid else "Infeasible"
-    return RHResult(status, best_route, best_reward, best_time, is_valid)
-
-
-def solve_LNS_metaheuristic(start_node, time_m, reward_m, max_d, num_n, seed=None):
-    """
-    Large Neighborhood Search (LNS) metaheuristic:
-    1. Start with a greedy initial solution
-    2. Iteratively destroy and repair neighborhoods
-    3. Accept solutions if they improve best known or pass probabilistic criterion
-    Returns: status, route, total_reward, total_duration
-    """
-    # Aislamiento del RNG: guardamos el estado global y lo restauramos antes de
-    # cada return, para no contaminar el RNG global del proceso. Seguimos usando
-    # np.random.seed(seed) para que la SECUENCIA de números sea idéntica a la del
-    # original (no se cambia a default_rng, que produciría otra secuencia).
-    _rng_state = np.random.get_state() if seed is not None else None
-    if seed is not None:
-        np.random.seed(seed)
-    max_arcs = num_n - 1
-
-    # --- Step 1: Generate initial solution using greedy heuristic ---
-    status, init_route, init_reward, init_time, is_valid = solve_heuristic(
-        start_node, time_m, reward_m, max_d, num_n
-    )
-
-    # Bug 3 fix: heuristic may reject all arcs (e.g. all rewards negative) and
-    # return an invalid seed. Fall back to the nearest feasible out-and-back.
-    if not is_valid or init_route == [start_node]:
-        fallback_route = None
-        fallback_reward = -np.inf
-        fallback_time = np.inf
-        for neighbor in range(num_n):
-            if neighbor == start_node:
-                continue
-            t = time_m[start_node][neighbor] + time_m[neighbor][start_node]
-            if t <= max_d:
-                r = reward_m[start_node][neighbor] + reward_m[neighbor][start_node]
-                if fallback_route is None or r > fallback_reward:
-                    fallback_route = [start_node, neighbor, start_node]
-                    fallback_reward = r
-                    fallback_time = t
-        if fallback_route is None:
-            if _rng_state is not None:
-                np.random.set_state(_rng_state)
-            return MetaResult("Infeasible", None, -np.inf, np.inf)
-        init_route = fallback_route
-        init_reward = fallback_reward
-        init_time = fallback_time
-
-    best_route = init_route[:]
-    best_reward = init_reward
-    best_time = init_time
-    current_route = init_route[:]
-    current_reward = init_reward
-    current_time = init_time
-
-    # --- LNS Parameters ---
-    max_iterations = max(50, num_n * num_n)
-    neighborhood_size = max(2, min(4, len(best_route) - 2))  # Size of segment to destroy
-    temperature = best_reward * 0.1  # For simulated annealing acceptance
-    cooling_rate = 0.95
-    patience = 20
-    no_improve_count = 0
-
-    # --- Step 2: LNS Main Loop ---
-    for iteration in range(max_iterations):
-
-        # --- Destroy Phase: Remove a neighborhood (segment) ---
-        if len(current_route) > 3:
-            max_start = len(current_route) - neighborhood_size - 1
-            if max_start > 1:
-                destroy_start = np.random.randint(1, max_start)
-                destroy_end = min(destroy_start + neighborhood_size, len(current_route) - 1)
-                destroyed_route = current_route[:destroy_start] + current_route[destroy_end:]
-            else:
-                # Route too short to safely destroy, skip this iteration
-                destroyed_route = current_route[:]
-        else:
-            destroyed_route = current_route[:]
-
-        # --- Repair Phase: Reinsert removed nodes optimally ---
-        removed_segment = current_route[destroy_start:destroy_end] if len(current_route) > 3 and max_start > 1 else []
-        repaired_route, repaired_reward, repaired_time = _repair_route_lns_best_position(
-            destroyed_route, removed_segment,
-            start_node, time_m, reward_m, max_d
-        )
-
-        # --- Evaluate repaired solution ---
-        if repaired_route is not None:
-            # Check feasibility
-            is_feasible = (repaired_time <= max_d and
-                          repaired_route[0] == start_node and
-                          repaired_route[-1] == start_node and
-                          len(repaired_route) - 1 <= max_arcs)  # Max steps constraint
-
-            if is_feasible:
-                # --- Acceptance Criterion: Simulated Annealing ---
-                delta_reward = repaired_reward - current_reward
-
-                if delta_reward > 0:
-                    # Accept improving solution
-                    current_route = repaired_route
-                    current_reward = repaired_reward
-                    current_time = repaired_time
-                    no_improve_count = 0
-
-                    # Update best known solution
-                    if current_reward > best_reward:
-                        best_route = current_route[:]
-                        best_reward = current_reward
-                        best_time = current_time
-
-                else:
-                    # Accept worse solution with probability (diversification)
-                    acceptance_prob = np.exp(delta_reward / max(temperature, 1e-6))
-                    if np.random.rand() < acceptance_prob:
-                        current_route = repaired_route
-                        current_reward = repaired_reward
-                        current_time = repaired_time
-                    no_improve_count += 1
-            else:
-                no_improve_count += 1
-        else:
-            no_improve_count += 1
-
-        # --- Cooling and Early Stopping ---
-        temperature *= cooling_rate
-
-        if no_improve_count >= patience:
-            break
-
-    # --- Final Validation ---
-    is_valid = (best_route is not None and
-                best_route[0] == start_node and
-                best_route[-1] == start_node and
-                best_time <= max_d and
-                len(best_route) - 1 <= max_arcs)
-
-    final_status = "Optimal" if is_valid else "Infeasible"
-
-    if _rng_state is not None:
-        np.random.set_state(_rng_state)
-    return MetaResult(final_status, best_route, best_reward, best_time)
 
 
 def _repair_route_lns_best_position(destroyed_route, removed_nodes, start_node, time_m, reward_m, max_d):
@@ -603,135 +240,6 @@ def _repair_route_lns_best_position(destroyed_route, removed_nodes, start_node, 
         current_route.append(start_node)
 
     return current_route, current_reward, current_time
-
-def solve_genetic_algorithm(start_node, time_m, reward_m, max_d, num_n, seed=None):
-    """
-    Hybrid Genetic Algorithm for routing:
-    1. Initialize population with diverse feasible routes (max 6 nodes: 5 steps)
-    2. Apply crossover, mutation (2-opt), and local search operators
-    3. Return best solution from population
-    Returns: status, route, total_reward, total_duration
-    """
-    # Aislamiento del RNG global (ver nota en solve_LNS_metaheuristic).
-    _rng_state = np.random.get_state() if seed is not None else None
-    if seed is not None:
-        np.random.seed(seed)
-    max_route_len = num_n
-
-    # --- GA Parameters (scaled by problem size) ---
-    population_size = max(10, num_n * num_n)
-    num_generations = max(30, num_n * 3)
-    mutation_rate = 0.5
-    crossover_rate = 0.5
-    elite_size = max(2, population_size // 5)
-
-    # --- Step 1: Initialize Population with Diverse Solutions ---
-    population = []
-
-    # Seed 1: Greedy heuristic
-    status, route, reward, duration, is_valid = solve_heuristic(start_node, time_m, reward_m, max_d, num_n)
-    if is_valid and len(route) <= max_route_len:
-        population.append({'route': route, 'reward': reward, 'duration': duration})
-    # Seed 2: Nearest neighbor with randomization
-    for _ in range(max(2, population_size // 4)):
-        route = _generate_route_nearest_neighbor(start_node, time_m, reward_m, max_d, num_n)
-        if route and len(route) <= max_route_len:
-            duration = sum(time_m[route[i]][route[i+1]] for i in range(len(route) - 1))
-            reward = sum(reward_m[route[i]][route[i+1]] for i in range(len(route) - 1))
-            if duration <= max_d:
-                population.append({'route': route, 'reward': reward, 'duration': duration})
-    # Seed 3: Random feasible routes
-    for _ in range(max(2, population_size // 4)):
-        route = _generate_random_feasible_route(start_node, time_m, reward_m, max_d, num_n)
-        if route and len(route) <= max_route_len:
-            duration = sum(time_m[route[i]][route[i+1]] for i in range(len(route) - 1))
-            reward = sum(reward_m[route[i]][route[i+1]] for i in range(len(route) - 1))
-            population.append({'route': route, 'reward': reward, 'duration': duration})
-    # Fill remaining population slots
-    while len(population) < population_size:
-        route = _generate_route_nearest_neighbor(start_node, time_m, reward_m, max_d, num_n)
-        if route and len(route) <= max_route_len:
-            duration = sum(time_m[route[i]][route[i+1]] for i in range(len(route) - 1))
-            reward = sum(reward_m[route[i]][route[i+1]] for i in range(len(route) - 1))
-            if duration <= max_d:
-                population.append({'route': route, 'reward': reward, 'duration': duration})
-    if not population:
-        if _rng_state is not None:
-            np.random.set_state(_rng_state)
-        return MetaResult("Infeasible", None, -np.inf, np.inf)
-
-    best_overall = max(population, key=lambda x: x['reward'])
-    gens = 0
-    # --- Step 2: GA Main Loop (Generations) ---
-    for generation in range(num_generations):
-        # --- Selection: Keep elite + tournament selection ---
-        population.sort(key=lambda x: x['reward'], reverse=True)
-        elite = population[:elite_size]
-
-        # Tournament selection for remaining population
-        new_population = elite[:]
-        while len(new_population) < population_size:
-            # Select 3 random individuals, pick best
-            tournament = [population[np.random.randint(0, len(population))] for _ in range(3)]
-            winner = max(tournament, key=lambda x: x['reward'])
-            new_population.append(winner)
-        # --- Crossover and Mutation ---
-        offspring = elite[:]  # Keep elite
-        while len(offspring) < population_size:
-            if np.random.rand() < crossover_rate:
-                # Crossover: Combine two routes
-                parent1 = new_population[np.random.randint(0, len(new_population))]
-                parent2 = new_population[np.random.randint(0, len(new_population))]
-
-                child_route = _crossover_routes(
-                    parent1['route'], parent2['route'], start_node, time_m, reward_m, max_d, num_n
-                )
-
-                if child_route and len(child_route) <= max_route_len:
-                    # Apply mutation (2-opt improvement)
-                    if np.random.rand() < mutation_rate:
-                        child_route = _apply_2opt_mutation(child_route, start_node, time_m, reward_m, max_d, num_n)
-
-                    # Evaluate child
-                    child_duration = sum(time_m[child_route[i]][child_route[i+1]] for i in range(len(child_route) - 1))
-                    child_reward = sum(reward_m[child_route[i]][child_route[i+1]] for i in range(len(child_route) - 1))
-
-                    if child_duration <= max_d and len(child_route) <= max_route_len:
-                        offspring.append({'route': child_route, 'reward': child_reward, 'duration': child_duration})
-            else:
-                # Pure mutation (2-opt on existing solution)
-                parent = new_population[np.random.randint(0, len(new_population))]
-                mutant_route = _apply_2opt_mutation(parent['route'][:], start_node, time_m, reward_m, max_d, num_n)
-
-                if mutant_route and len(mutant_route) <= max_route_len:
-                    mutant_duration = sum(time_m[mutant_route[i]][mutant_route[i+1]] for i in range(len(mutant_route) - 1))
-                    mutant_reward = sum(reward_m[mutant_route[i]][mutant_route[i+1]] for i in range(len(mutant_route) - 1))
-
-                    if mutant_duration <= max_d and len(mutant_route) <= max_route_len:
-                        offspring.append({'route': mutant_route, 'reward': mutant_reward, 'duration': mutant_duration})
-        # --- Replace population (keep best from offspring) ---
-        population = offspring[:population_size]
-
-        # --- Track best solution ---
-        current_best = max(population, key=lambda x: x['reward'])
-        if current_best['reward'] > best_overall['reward']:
-            best_overall = current_best
-        gens +=1
-    # --- Final Validation ---
-    is_valid = (best_overall is not None and
-                best_overall['route'][0] == start_node and
-                best_overall['route'][-1] == start_node and
-                best_overall['duration'] <= max_d and
-                len(best_overall['route']) <= max_route_len and
-                len(best_overall['route']) >= 2)
-
-    final_status = "Optimal" if is_valid else "Infeasible"
-
-    if _rng_state is not None:
-        np.random.set_state(_rng_state)
-    return MetaResult(final_status, best_overall['route'],
-                      best_overall['reward'], best_overall['duration'])
-
 
 def _generate_route_nearest_neighbor(start_node, time_m, reward_m, max_d, num_n, k_max=None):
     """
@@ -1001,7 +509,7 @@ def solve_HGA_LNS_metaheuristic(
     · 2-opt refinement polishes each offspring's geometry after repair.
 
     Internal fitness uses simulate_route_reward() with sequential arrival days
-    (avail_prob_arr=None, deterministic world), so every individual in the
+    (lane_filter=False, deterministic world), so every individual in the
     population is evaluated on the same footing as DRL Det.
     Search operators (crossover, LNS repair, 2-opt) still use the static day-0
     reward matrix for fast local decisions.
@@ -1022,13 +530,13 @@ def solve_HGA_LNS_metaheuristic(
     time_m_np = np.array(time_m, dtype=float)
 
     # Caché de matrices de reward (numpy) por día, vía el helper compartido.
-    # Semánticamente idéntico a simulate_route_reward(..., avail_prob_arr=None):
+    # Semánticamente idéntico a simulate_route_reward(..., lane_filter=False):
     # construye la matriz del día bajo demanda y la cachea durante esta llamada.
     max_day = rate_stack.shape[0] - 1
     _get_rm = _make_rm_cache(rate_stack, loads_stack, distance_arr, diesel_arr,
                              start_day_idx, max_day, as_numpy=True)
 
-    # Aislamiento del RNG global (ver nota en solve_LNS_metaheuristic).
+    # Aislamiento del RNG global: si hay seed, se restaura el estado al terminar.
     _rng_state = np.random.get_state() if seed is not None else None
     if seed is not None:
         np.random.seed(seed)
@@ -1042,7 +550,7 @@ def solve_HGA_LNS_metaheuristic(
     elite_size       = max(2, population_size // 5)
     destroy_size     = max(1, min(2, num_n - 3))  # nodes removed per destroy op
 
-    # --- Step 1: Initialize Population (identical seeding strategy to GA) ---
+    # --- Step 1: Initialize Population (greedy + nearest-neighbor + random feasible) ---
     population = []
 
     def _eval(route):
@@ -1186,7 +694,6 @@ def solve_HGA_LNS_metaheuristic(
                 _r, _d = simulate_route_reward(
                     candidate, start_node, start_day_idx,
                     time_m_np, rate_stack, loads_stack, distance_arr, diesel_arr,
-                    avail_prob_arr=None,
                 )
                 if _d <= max_d and _r > fallback_best_reward:
                     fallback_best_reward = _r
@@ -1201,7 +708,6 @@ def solve_HGA_LNS_metaheuristic(
                 _r, _d = simulate_route_reward(
                     candidate, start_node, start_day_idx,
                     time_m_np, rate_stack, loads_stack, distance_arr, diesel_arr,
-                    avail_prob_arr=None,
                 )
                 if _d <= max_d and _r > fallback_best_reward:
                     fallback_best_reward = _r
@@ -1220,11 +726,10 @@ def solve_HGA_LNS_metaheuristic(
     # Canonical re-evaluation via simulate_route_reward guarantees bit-exact
     # parity with all other solvers. The internal _eval uses pre-cached numpy
     # arrays (_rm_cache) whose float accumulation can diverge slightly from
-    # simulate_route_reward. Passing avail_prob_arr=None keeps this deterministic.
+    # simulate_route_reward. Leaving lane_filter=False keeps this deterministic.
     total_reward, total_duration = simulate_route_reward(
         best_overall['route'], start_node, start_day_idx,
         time_m_np, rate_stack, loads_stack, distance_arr, diesel_arr,
-        avail_prob_arr=None,
     )
     if _rng_state is not None:
         np.random.set_state(_rng_state)
@@ -1235,22 +740,23 @@ def simulate_route_reward(
     route, start_node, start_day_idx,
     time_matrix_np, rate_stack, loads_stack,
     distance_arr, diesel_arr,
-    avail_prob_arr=None,
+    lane_filter=False,
 ):
     """Compute the actual reward for a fixed route using sequential arrival days
-    and the same Bernoulli lane-availability draws as beam_search_dynamic.
+    and the same lane-availability filter as beam_search_dynamic.
 
     Replicates beam_search_dynamic exactly:
     - day_idx = min(start_day_idx + int(time_elapsed // 14), max_day)
-    - draw_lane_availability(start_day_idx, node=i, arrival_day=day_idx, ...)
+    - draw_lane_availability(
+        i, day_idx, loads_stack,
+    )
       applied on every arc except those departing from or arriving at start_node,
       matching the skip-condition on line "current_node != start_node" in
       beam_search_dynamic.
     - If a lane is blocked (lane_exists[j] == 0), that arc yields 0 reward
       (no cargo to haul).
 
-    If avail_prob_arr is None, no Bernoulli filtering is applied (backward
-    compatible with callers that do not supply availability data).
+    If lane_filter is False, no lane filtering is applied (deterministic world).
     """
     from problem_data import draw_lane_availability
 
@@ -1274,14 +780,13 @@ def simulate_route_reward(
         rm      = _get_rm(time_elapsed)
         arc_r   = float(rm[i, j])
 
-        # Mirror beam_search_dynamic: skip Bernoulli when departing from or
+        # Mirror beam_search_dynamic: skip lane filtering when departing from or
         # arriving at start_node (those arcs are always available).
-        if (avail_prob_arr is not None
+        if (lane_filter
                 and i != start_node
                 and j != start_node):
             lane_exists = draw_lane_availability(
-                start_day_idx, node=i, arrival_day=day_idx,
-                avail_prob_arr=avail_prob_arr, num_nodes=num_nodes,
+                i, day_idx, loads_stack,
             )
             if lane_exists[j] == 0:
                 arc_r = 0.0
@@ -1429,14 +934,13 @@ def _label_setting_core(
 def _label_setting_core_stochastic(
     start_node, time_matrix_np, rate_stack, loads_stack,
     distance_arr, diesel_arr, max_d, num_n, start_day_idx,
-    avail_prob_arr,
     time_limit_seconds=None,
     k_max=None,
 ):
-    """Label Setting DP for the Orienteering Problem with Bernoulli lane filtering.
+    """Label Setting DP for the Orienteering Problem with lane filtering.
 
     Identical to _label_setting_core but filters arc expansions using
-    draw_lane_availability (same Bernoulli draws as beam_search_dynamic and
+    draw_lane_availability (same lane availability as beam_search_dynamic and
     simulate_route_reward). The return-to-depot closure is never filtered.
 
     k_max : ver _label_setting_core — mismo filtro por popcount del bitmask.
@@ -1484,8 +988,7 @@ def _label_setting_core_stochastic(
 
         arrival_day = _day_index(start_day_idx, t_el, max_day)
         lane_exists = draw_lane_availability(
-            start_day_idx, node=cur_node, arrival_day=arrival_day,
-            avail_prob_arr=avail_prob_arr, num_nodes=num_n,
+            cur_node, arrival_day, loads_stack,
         )
 
         for next_node in range(num_n):
@@ -1557,15 +1060,14 @@ def _label_setting_core_stochastic(
 def solve_label_setting_oracle(
     start_node, time_matrix_np, rate_stack, loads_stack,
     distance_arr, diesel_arr, max_d, num_n, start_day_idx,
-    avail_prob_arr,
     time_limit_seconds=None,
     k_max=None,
 ):
     """Cota superior clarividente (posterior bound) para el mundo estocástico.
 
     Resuelve el Orienteering Problem de forma exacta vía Label Setting DP,
-    pero con la disponibilidad Bernoulli de cada arco ya revelada de antemano
-    (misma semilla que DRL Real). Esto le da al solver información que ninguna
+    pero con la disponibilidad de cada arco ya revelada de antemano
+    (mismo criterio que DRL Real). Esto le da al solver información que ninguna
     política causal real posee al momento de decidir — por lo tanto este valor
     es un upper bound informacional, NO el óptimo de política (Bellman-óptimo)
     del MDP estocástico. Sirve como techo de referencia para el Bloque 2, en el
@@ -1580,7 +1082,6 @@ def solve_label_setting_oracle(
     route, _label_r, _label_d, timed_out = _label_setting_core_stochastic(
         start_node, time_matrix_np, rate_stack, loads_stack,
         distance_arr, diesel_arr, max_d, num_n, start_day_idx,
-        avail_prob_arr=avail_prob_arr,
         time_limit_seconds=time_limit_seconds,
         k_max=k_max,
     )
@@ -1593,7 +1094,7 @@ def solve_label_setting_oracle(
     total_reward, total_duration = simulate_route_reward(
         route, start_node, start_day_idx,
         time_matrix_np, rate_stack, loads_stack, distance_arr, diesel_arr,
-        avail_prob_arr=avail_prob_arr,
+        lane_filter=True,
     )
 
     status = "Time-Limited" if timed_out else "Optimal"
@@ -1603,7 +1104,6 @@ def solve_label_setting_oracle(
 def solve_label_setting_exact(
     start_node, time_matrix_np, rate_stack, loads_stack,
     distance_arr, diesel_arr, max_d, num_n, start_day_idx,
-    avail_prob_arr=None,        # accepted and ignored (deterministic world only)
     time_limit_seconds=None,
     k_max=None,
 ):
@@ -1631,7 +1131,6 @@ def solve_label_setting_exact(
     total_reward, total_duration = simulate_route_reward(
         route, start_node, start_day_idx,
         time_matrix_np, rate_stack, loads_stack, distance_arr, diesel_arr,
-        avail_prob_arr=None,
     )
 
     status = "Time-Limited" if timed_out else "Optimal"
@@ -1705,7 +1204,6 @@ def solve_heuristic_rolling_horizon(
     return _close_cycle_and_finalize(
         route, current_node, time_elapsed, start_node, time_m, max_d,
         start_day_idx, rate_stack, loads_stack, distance_arr, diesel_arr,
-        avail_prob_arr=None,
     )
 
 
@@ -1847,26 +1345,23 @@ def solve_heuristic_rolling_horizon_lookahead(
     return _close_cycle_and_finalize(
         route, current_node, time_elapsed, start_node, time_m, max_d,
         start_day_idx, rate_stack, loads_stack, distance_arr, diesel_arr,
-        avail_prob_arr=None,
     )
 
 
 def solve_heuristic_rolling_horizon_lookahead_stochastic(
     start_node, time_m, rate_stack, loads_stack,
     distance_arr, diesel_arr, max_d, num_n, start_day_idx,
-    avail_prob_arr,
     lookahead=3,
     k_max=None,
 ):
     """Extensión estocástica de solve_heuristic_rolling_horizon_lookahead.
 
-    Reemplaza el scoring determinista de cada sub-paso del lookahead por sorteos
-    Bernoulli con las mismas semillas que el resto del sistema: en cada nivel de
-    recursión se llama a draw_lane_availability con seed basada en
-    (start_day_idx, node, arrival_day), exactamente igual que
+    Reemplaza el scoring determinista de cada sub-paso del lookahead por el
+    filtrado de lanes del resto del sistema: en cada nivel de recursión se
+    llama a draw_lane_availability(node, arrival_day, loads_stack), igual que
     solve_heuristic_rolling_horizon_stochastic y RoutingEnv.
 
-    La evaluación final usa simulate_route_reward(..., avail_prob_arr=avail_prob_arr)
+    La evaluación final usa simulate_route_reward(..., lane_filter=True)
     para garantizar paridad bit-exact con DRL Real y RH-Greedy Real.
 
     Con lookahead=1 la función es idéntica a solve_heuristic_rolling_horizon_stochastic.
@@ -1891,7 +1386,7 @@ def solve_heuristic_rolling_horizon_lookahead_stochastic(
 
     def _lookahead_score(node, t_elapsed, visited_set, depth):
         """
-        Mejor reward acumulado greedy (con filtrado Bernoulli) de `depth` pasos
+        Mejor reward acumulado greedy (con filtrado de lanes) de `depth` pasos
         desde `node`.  Retorna el reward del retorno directo si ningún candidato
         es factible o depth==0.
         """
@@ -1903,8 +1398,7 @@ def solve_heuristic_rolling_horizon_lookahead_stochastic(
 
         arrival_day = _day_index(start_day_idx, t_elapsed, max_day)
         lane_exists = draw_lane_availability(
-            start_day_idx, node=node, arrival_day=arrival_day,
-            avail_prob_arr=avail_prob_arr, num_nodes=num_n,
+            node, arrival_day, loads_stack,
         )
 
         best_extended = -np.inf
@@ -1912,7 +1406,7 @@ def solve_heuristic_rolling_horizon_lookahead_stochastic(
         for cand in range(num_n):
             if cand == node or cand in visited_set:
                 continue
-            # Filtro Bernoulli — se omite cuando salimos desde start_node,
+            # Filtro de lanes — se omite cuando salimos desde start_node,
             # consistente con solve_heuristic_rolling_horizon_stochastic.
             if node != start_node and lane_exists[cand] != 1:
                 continue
@@ -1943,8 +1437,7 @@ def solve_heuristic_rolling_horizon_lookahead_stochastic(
         rm = _get_rm(time_elapsed)
         arrival_day = _day_index(start_day_idx, time_elapsed, max_day)
         lane_exists = draw_lane_availability(
-            start_day_idx, node=current_node, arrival_day=arrival_day,
-            avail_prob_arr=avail_prob_arr, num_nodes=num_n,
+            current_node, arrival_day, loads_stack,
         )
 
         best_score     = -np.inf
@@ -1983,7 +1476,7 @@ def solve_heuristic_rolling_horizon_lookahead_stochastic(
     return _close_cycle_and_finalize(
         route, current_node, time_elapsed, start_node, time_m, max_d,
         start_day_idx, rate_stack, loads_stack, distance_arr, diesel_arr,
-        avail_prob_arr=avail_prob_arr,
+        lane_filter=True,
     )
 
 
@@ -1991,7 +1484,6 @@ def _rh_greedy_stoch_from_state(
     current_node, time_elapsed, visited,
     start_node, time_m, rate_stack, loads_stack,
     distance_arr, diesel_arr, max_d, num_n, start_day_idx,
-    avail_prob_arr,
     k_max=None,
 ):
     """Greedy estocástico desde un estado arbitrario (current_node, time_elapsed, visited).
@@ -2001,9 +1493,9 @@ def _rh_greedy_stoch_from_state(
     arbitrario en lugar de siempre desde (start_node, t=0, visited={start_node}).
 
     Retorna el reward acumulado desde current_node hasta cerrar el ciclo en start_node,
-    usando el mismo filtrado Bernoulli y la misma lógica de día dinámico que el resto
+    usando el mismo filtrado de lanes y la misma lógica de día dinámico que el resto
     del sistema. No recibe seed: draw_lane_availability es determinista dado
-    (start_day_idx, node, arrival_day), así que una sola llamada es suficiente.
+    (node, arrival_day), así que una sola llamada es suficiente.
 
     k_max : int | None — presupuesto de cardinalidad ABSOLUTO (no restante):
         `steps = len(visited) - 1` ya cuenta los arcos usados desde el
@@ -2032,8 +1524,7 @@ def _rh_greedy_stoch_from_state(
         rm = _get_rm(t)
         arrival_day = _day_index(start_day_idx, t, max_day)
         lane_exists = draw_lane_availability(
-            start_day_idx, node=node, arrival_day=arrival_day,
-            avail_prob_arr=avail_prob_arr, num_nodes=num_n,
+            node, arrival_day, loads_stack,
         )
 
         best_score = -np.inf
@@ -2073,7 +1564,6 @@ def _rh_greedy_stoch_from_state(
 def solve_mc_rollout_stochastic(
     start_node, time_m, rate_stack, loads_stack,
     distance_arr, diesel_arr, max_d, num_n, start_day_idx,
-    avail_prob_arr,
     n_simulations=1,
     lookahead_base_policy='rh_greedy',
     k_max=None,
@@ -2129,8 +1619,7 @@ def solve_mc_rollout_stochastic(
         rm = _get_rm(time_elapsed)
         arrival_day = _day_index(start_day_idx, time_elapsed, max_day)
         lane_exists = draw_lane_availability(
-            start_day_idx, node=current_node, arrival_day=arrival_day,
-            avail_prob_arr=avail_prob_arr, num_nodes=num_n,
+            current_node, arrival_day, loads_stack,
         )
 
         # Candidatos factibles en tiempo con lane disponible
@@ -2160,7 +1649,6 @@ def solve_mc_rollout_stochastic(
                 j, t_after, visited_after,
                 start_node, time_m, rate_stack, loads_stack,
                 distance_arr, diesel_arr, max_d, num_n, start_day_idx,
-                avail_prob_arr,
                 k_max=k_max,
             )
 
@@ -2182,21 +1670,21 @@ def solve_mc_rollout_stochastic(
     return _close_cycle_and_finalize(
         route, current_node, time_elapsed, start_node, time_m, max_d,
         start_day_idx, rate_stack, loads_stack, distance_arr, diesel_arr,
-        avail_prob_arr=avail_prob_arr,
+        lane_filter=True,
     )
 
 
 
 def solve_heuristic_rolling_horizon_stochastic(
     start_node, time_m, rate_stack, loads_stack,
-    distance_arr, diesel_arr, max_d, num_n, start_day_idx, avail_prob_arr,
+    distance_arr, diesel_arr, max_d, num_n, start_day_idx,
     k_max=None,
 ):
     """Variante estocástica de solve_heuristic_rolling_horizon.
 
     Idéntica a la versión determinista salvo que en cada paso descarta los
-    nodos cuya lane está bloqueada según draw_lane_availability (mundo Bernoulli).
-    La evaluación final usa simulate_route_reward con avail_prob_arr.
+    nodos cuya lane está bloqueada según draw_lane_availability (mundo con filtrado de lanes).
+    La evaluación final usa simulate_route_reward con lane_filter=True.
 
     k_max : int | None — presupuesto de cardinalidad (ver
         solve_heuristic_rolling_horizon). None (default) = caso libre.
@@ -2223,8 +1711,7 @@ def solve_heuristic_rolling_horizon_stochastic(
         rm = _get_rm(time_elapsed)
         current_arrival_day = _day_index(start_day_idx, time_elapsed, num_days - 1)
         lane_exists = draw_lane_availability(
-            start_day_idx, node=current_node, arrival_day=current_arrival_day,
-            avail_prob_arr=avail_prob_arr, num_nodes=num_n,
+            current_node, current_arrival_day, loads_stack,
         )
 
         best_score = -np.inf
@@ -2232,7 +1719,7 @@ def solve_heuristic_rolling_horizon_stochastic(
 
         for next_node in range(num_n):
             if next_node != current_node and next_node not in visited:
-                # No aplicar filtro Bernoulli desde el nodo de inicio, igual que
+                # No aplicar filtro de lanes desde el nodo de inicio, igual que
                 # beam_search_dynamic, que omite lane filtering cuando
                 # current_node == start_node.
                 if current_node != start_node and lane_exists[next_node] != 1:
@@ -2258,5 +1745,5 @@ def solve_heuristic_rolling_horizon_stochastic(
     return _close_cycle_and_finalize(
         route, current_node, time_elapsed, start_node, time_m, max_d,
         start_day_idx, rate_stack, loads_stack, distance_arr, diesel_arr,
-        avail_prob_arr=avail_prob_arr,
+        lane_filter=True,
     )

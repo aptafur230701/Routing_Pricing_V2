@@ -3,7 +3,7 @@ transfer_learning.py
 ====================
 Transfer learning estandarizado para la cadena de escalado:
 
-    10 → 20 → 35 → 50 → 75 → 97 nodos
+    10 → 20 → 35 → 50 → 75 → 100 nodos
 
 Por qué el transfer es siempre 100% en este modelo
 ---------------------------------------------------
@@ -12,9 +12,9 @@ que dependan de num_nodes. El Transformer opera sobre conjuntos de
 embeddings de tamaño variable — lo que cambia entre tamaños es el
 número de nodos en runtime, no los pesos del modelo.
 
-  encoder.input_proj   : 5 → d_h          (independiente de N)
+  encoder.input_proj   : 8 → d_h          (independiente de N)
   encoder.layers[i]    : d_h → d_h        (independiente de N)
-  context_net.proj     : 2·d_h+3 → d_h   (independiente de N)
+  context_net.proj     : 2·d_h+3+n_market+n_budget → d_h  (independiente de N)
   decoder.glimpse      : d_h → d_h        (independiente de N)
   decoder.pointer      : d_h → logit      (independiente de N)
   critic.net           : d_h → 1          (independiente de N)
@@ -216,12 +216,12 @@ def transfer_checkpoint(
     """
     Transfiere los pesos de un checkpoint entrenado a un agente de mayor tamaño.
 
-    Transfer parcial intencional cuando la arquitectura fuente difiere de la destino
-    (por ejemplo, checkpoints entrenados con N_NODE_FEATURES=5 / n_market=0):
-      · encoder.input_proj  — shape [d_h, 5] → [d_h, 6]: se descarta, se re-inicializa.
-      · context_net.proj    — shape depende de n_market: se descarta, se re-inicializa.
-      · Resto de capas (Transformer, decoder, critic): se transfieren íntegras.
-    La comparación de shapes por key garantiza esto sin strict=False.
+    Los pesos independientes de N se copian tal cual. Si la arquitectura del
+    checkpoint fuente es más antigua que la actual, _reconcile_state_dict lo
+    tolera: las capas lineales con menos columnas de entrada (p. ej.
+    context_net.proj al añadir budget features) se expanden con columnas nuevas
+    en cero, y cualquier otro mismatch de forma se omite y queda con su
+    inicialización aleatoria.
 
     Parámetros
     ----------
@@ -248,12 +248,8 @@ def transfer_checkpoint(
     )
     critic = CriticHead(d_h).to(DEVICE)
 
-    # Transferir pesos — vía _reconcile_state_dict (ver arriba). Las capas con
-    # shape totalmente distinta (ej. encoder.input_proj entre arquitecturas
-    # con distinto N_NODE_FEATURES) se omiten y quedan con inicialización
-    # aleatoria, lo que es el comportamiento correcto para transfer learning
-    # parcial. El caso especial de context_net.proj.0.weight (expansión por
-    # el bloque de budget features) se resuelve con zero-padding, no se omite.
+    # Transferir pesos — vía _reconcile_state_dict (ver arriba): copia directa,
+    # zero-padding de columnas de entrada nuevas, u omisión si la forma no encaja.
     agent_sd,  transferred_a, skipped_a = _reconcile_state_dict(agent.state_dict(),  checkpoint["agent"])
     critic_sd, transferred_c, skipped_c = _reconcile_state_dict(critic.state_dict(), checkpoint["critic"])
 

@@ -27,12 +27,11 @@ def small_run(monkeypatch):
     monkeypatch.setattr(am_training, "get_episodes_per_node", lambda n: 6)   # 60 ep total, 2 updates
 
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-     ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95) = load_matrices(NUM_NODES)
+     ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95) = load_matrices(NUM_NODES)
 
     agent, critic, ep_rewards, ep_losses, training_log = am_training.run_am_training(
         time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, NUM_NODES,
-        ltr_stack=ltr_stack, trucks_stack=trucks_stack, avail_prob_arr=avail_prob_arr,
-        reward_global_p95=reward_global_p95,
+        ltr_stack=ltr_stack, trucks_stack=trucks_stack, reward_global_p95=reward_global_p95,
     )
     return training_log
 

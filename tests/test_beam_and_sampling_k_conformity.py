@@ -34,14 +34,13 @@ def synthetic_data():
     diesel_arr   = np.ones((N, N)) * 3.0
     rate_stack   = np.ones((3, N, N)) * 5.0
     loads_stack  = np.ones((3, N, N)) * 5.0
-    avail_prob_arr = np.ones((N, N), dtype=np.float32)   # lanes siempre existen
     trucks_stack = np.ones((N, 3, 3), dtype=np.float32) * 2.0
     ltr_stack    = np.ones((N, 3), dtype=np.float32) * 10.0
     max_duration = 30.0   # con time_matrix=1.0/arco, permite hasta 30 arcos — K es el binding
     return dict(
         time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack,
         distance_arr=distance_arr, diesel_arr=diesel_arr,
-        avail_prob_arr=avail_prob_arr, trucks_stack=trucks_stack, ltr_stack=ltr_stack,
+        lane_filter=True, trucks_stack=trucks_stack, ltr_stack=ltr_stack,
         max_duration=max_duration,
     )
 

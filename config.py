@@ -66,12 +66,6 @@ PPO_WEIGHT_DECAY          = 6.093123878168306e-05  # Weight decay (AdamW) del ac
 PPO_LR_DECAY              = False  # Scheduler de LR lineal decreciente (espeja el decay de
                                     # entropía). Apagado por default; opcional.
 
-# ── Reward shaping ablacionable ───────────────────────────────
-TEMPORAL_WARNING_COEF = 0.05   # Coeficiente del término temporal_warning (callejón temporal).
-                                # Hipótesis: enseña cautela prematura y contribuye al
-                                # under-visiting. Default 0.05 reproduce el comportamiento
-                                # actual; 0.0 lo desactiva.
-
 # ── Self-critical baseline (Camino B: híbrido sobre actor-critic) ────────────
 USE_SELF_CRITICAL            = True   # término self-critical sobre el argmax greedy
 SELF_CRITICAL_COEF           = 0.5     # peso del término self-critical en el loss total

@@ -42,12 +42,11 @@ def synthetic_data():
     diesel_arr   = np.ones((N, N)) * 3.0
     rate_stack   = np.ones((3, N, N)) * 5.0
     loads_stack  = np.ones((3, N, N)) * 5.0
-    avail_prob_arr = np.ones((N, N), dtype=np.float32)   # lanes siempre existen
     max_duration = 30.0   # con time_matrix=1.0/arco, permite hasta 30 arcos
     return dict(
         time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack,
         distance_arr=distance_arr, diesel_arr=diesel_arr,
-        avail_prob_arr=avail_prob_arr, max_duration=max_duration,
+        max_duration=max_duration,
     )
 
 
@@ -88,7 +87,7 @@ def test_rh_stochastic_respects_k(synthetic_data, solver_name, fn):
         status, route, reward, duration, is_valid = fn(
             0, d["time_matrix"], d["rate_stack"], d["loads_stack"],
             d["distance_arr"], d["diesel_arr"], d["max_duration"], N,
-            start_day_idx=0, avail_prob_arr=d["avail_prob_arr"], k_max=k,
+            start_day_idx=0, k_max=k,
         )
         n = _n_arcs(route)
         if n is not None:
@@ -139,7 +138,7 @@ def test_label_setting_oracle_respects_k(synthetic_data):
         status, route, reward, duration = solve_label_setting_oracle(
             0, time_matrix_np, d["rate_stack"], d["loads_stack"],
             d["distance_arr"], d["diesel_arr"], d["max_duration"], N,
-            start_day_idx=0, avail_prob_arr=d["avail_prob_arr"], time_limit_seconds=30, k_max=k,
+            start_day_idx=0, time_limit_seconds=30, k_max=k,
         )
         n = _n_arcs(route)
         assert n == k, f"LS-Oracle K={k}: solución óptima debería usar exactamente K arcos (n_arcos={n})"

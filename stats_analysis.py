@@ -2,7 +2,7 @@
 stats_analysis.py
 ==================
 Análisis de robustez estadística sobre el panel de evaluación estocástica
-(mundo real con Bernoulli). Compara DRL Real contra cada baseline estocástico
+(mundo real con filtrado de lanes). Compara DRL Real contra cada baseline estocástico
 (RH-Greedy Real, RH-Lookahead Real, MC-Rollout) usando:
   · Descriptivos: media, std, percentiles P25/P50/P75, min, max — sobre
     instancias donde el método es válido.

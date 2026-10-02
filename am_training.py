@@ -312,7 +312,6 @@ def _evaluate_greedy(
     diesel_arr:       np.ndarray,
     ltr_stack:        np.ndarray,
     trucks_stack:     np.ndarray,
-    avail_prob_arr:   np.ndarray,
     reward_global_p95: float,
     eval_k_levels:    list = None,   # niveles de K por episodio (None ⇒ todos libres)
     avail_expected_arr: np.ndarray = None,
@@ -348,7 +347,7 @@ def _evaluate_greedy(
                     time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
                     MAX_DURATION, beam_width=1,
                     ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-                    avail_prob_arr=avail_prob_arr,
+                    lane_filter=True,
                     reward_global_p95=reward_global_p95,
                     k_max=k_max,
                     avail_expected_arr=avail_expected_arr,
@@ -377,7 +376,6 @@ def _collect_greedy_rollout(
     time_matrix_arr: np.ndarray,
     distance_arr:    np.ndarray,
     trucks_stack:    np.ndarray,
-    avail_prob_arr:  np.ndarray,
     reward_global_p95: float,
     ltr_stack:       np.ndarray,
     num_nodes:       int,
@@ -391,8 +389,8 @@ def _collect_greedy_rollout(
     Reutiliza VectorRoutingEnv (el mismo step() que la recolección muestreada)
     en vez de beam_search_dynamic, para que la fórmula de recompensa
     (REWARD_SCALE_FACTOR, bono de éxito, penalización por tiempo, warning
-    temporal) y la realización estocástica del mundo (draw_lane_availability,
-    determinista en start_day_idx/node/arrival_day) sean IDÉNTICAS a las del
+    temporal) y la disponibilidad de lanes (draw_lane_availability,
+    determinista en node/arrival_day) sean IDÉNTICAS a las del
     rollout muestreado — condición necesaria para que la ventaja self-critical
     (R_sample - R_greedy) compare en las mismas unidades. k_max_arr DEBE ser
     el mismo del rollout muestreado: si el baseline se calcula con un K
@@ -424,7 +422,6 @@ def _collect_greedy_rollout(
                 rm_pen_stack, time_matrix_arr, distance_arr,
                 day_idx, num_nodes, MAX_DURATION,
                 trucks_stack_raw=trucks_stack,
-                avail_prob_arr=avail_prob_arr,
                 reward_global_p95=reward_global_p95,
                 avail_expected_arr=avail_expected_arr,
             )
@@ -470,7 +467,6 @@ def run_am_training(
     pretrained_critic: CriticHead     = None,
     ltr_stack:         np.ndarray = None,   # [num_nodes, 120]
     trucks_stack:      np.ndarray = None,   # [num_nodes, 120, 3]
-    avail_prob_arr:    np.ndarray = None,   # [num_nodes, num_nodes]
     reward_global_p95: float      = 1.0,
     avail_expected_arr: np.ndarray = None,  # [num_nodes, num_nodes]
     trial_callback: callable = None,  # HPO opcional: fn(step, n_updates, log_entry) -> bool
@@ -491,8 +487,6 @@ def run_am_training(
     num_nodes      : int
     ltr_stack      : np.ndarray [num_nodes, 120] — LTR por hub y día
     trucks_stack   : np.ndarray [num_nodes, 120, 3] — camiones por hub, día y delta
-    avail_prob_arr : np.ndarray [num_nodes, num_nodes] — prior Bernoulli de disponibilidad
-                     (sorteo del entorno, ver draw_lane_availability)
     avail_expected_arr : np.ndarray [num_nodes, num_nodes] — E[loads] histórico
                      (train), usado solo como feature de entrada (avail_prior)
     trial_callback : callable opcional fn(step, n_updates, log_entry) -> bool, invocado en
@@ -566,7 +560,6 @@ def run_am_training(
         loads_stack=loads_stack,
         distance_arr=distance_arr,
         diesel_arr=diesel_arr,
-        avail_prob_arr=avail_prob_arr,
         rm_pen_stack=rm_pen_stack,
         num_nodes=num_nodes,
         max_duration=MAX_DURATION,
@@ -650,7 +643,6 @@ def run_am_training(
                     rm_pen_stack, time_matrix_arr, distance_arr,
                     day_idx, num_nodes, MAX_DURATION,
                     trucks_stack_raw=trucks_stack,
-                    avail_prob_arr=avail_prob_arr,
                     reward_global_p95=reward_global_p95,
                     avail_expected_arr=avail_expected_arr,
                 )   # (B, N, 8)
@@ -718,7 +710,6 @@ def run_am_training(
                 rm_pen_stack, time_matrix_arr, distance_arr,
                 day_idx_post, num_nodes, MAX_DURATION,
                 trucks_stack_raw=trucks_stack,
-                avail_prob_arr=avail_prob_arr,
                 reward_global_p95=reward_global_p95,
                 avail_expected_arr=avail_expected_arr,
             )
@@ -754,7 +745,7 @@ def run_am_training(
             greedy_ep_rewards = _collect_greedy_rollout(
                 agent, vec_env, start_nodes_arr, start_day_idxs,
                 rm_pen_stack, time_matrix_arr, distance_arr,
-                trucks_stack, avail_prob_arr, reward_global_p95,
+                trucks_stack, reward_global_p95,
                 ltr_stack, num_nodes,
                 k_max_arr=k_max_arr,
                 avail_expected_arr=avail_expected_arr,
@@ -1069,7 +1060,7 @@ def run_am_training(
             greedy_reward, greedy_valid_rate = _evaluate_greedy(
                 agent, eval_start_nodes, eval_start_days,
                 time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-                ltr_stack, trucks_stack, avail_prob_arr, reward_global_p95,
+                ltr_stack, trucks_stack, reward_global_p95,
                 eval_k_levels=eval_k_levels,
                 avail_expected_arr=avail_expected_arr,
             )

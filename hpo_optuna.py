@@ -161,7 +161,6 @@ def make_objective(num_nodes: int, updates_per_trial: int, data: dict, seeds: li
                     data["time_matrix"], data["rate_stack"], data["loads_stack"],
                     data["distance_arr"], data["diesel_arr"], num_nodes,
                     ltr_stack=data["ltr_stack"], trucks_stack=data["trucks_stack"],
-                    avail_prob_arr=data["avail_prob_arr"],
                     reward_global_p95=data["reward_global_p95"],
                     avail_expected_arr=data["avail_expected_arr"],
                     trial_callback=_cb,
@@ -196,13 +195,13 @@ def run(num_nodes: int, n_trials: int, updates_per_trial: int,
 
     print(f"Cargando datos de {num_nodes} nodos...")
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-     ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr,
+     ltr_stack, trucks_stack, avail_expected_arr,
      reward_global_p95) = load_matrices(num_nodes)
     data = dict(
         time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack,
         distance_arr=distance_arr, diesel_arr=diesel_arr,
         ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-        avail_prob_arr=avail_prob_arr, avail_expected_arr=avail_expected_arr,
+        avail_expected_arr=avail_expected_arr,
         reward_global_p95=reward_global_p95,
     )
 

@@ -25,11 +25,9 @@ Features por nodo j (desde la posición actual del camión):
   [4] visited       — 1.0 si j ya fue visitado en el episodio, 0.0 si no
   [5] trucks_norm   — camiones disponibles en j para el delta correspondiente
   [6] avail_prior   — E[loads] histórico (train) del arco actual→j, normalizado por
-                      LOADS_EXPECTED_CLIP y clipeado a [0, 1]. Antes era P(lane existe)
-                      (mismo array que el sorteo Bernoulli del entorno); ahora es un
-                      array separado (avail_expected_arr) que preserva la magnitud
-                      real en vez de colapsarla a una probabilidad de existencia —
-                      no interviene en ningún sorteo, es puramente descriptivo.
+                      LOADS_EXPECTED_CLIP y clipeado a [0, 1]. Preserva la magnitud
+                      real (avail_expected_arr) en vez de colapsarla a una
+                      probabilidad de existencia; es puramente descriptivo.
   [7] reward_abs    — reward crudo / REWARD_GLOBAL_P95, clipeado a [0, 1]; 0 si negativo
 
 Condicionamiento en presupuesto de cardinalidad K:
@@ -74,7 +72,6 @@ def build_node_features(
     max_duration:            float,
     trucks_stack:            np.ndarray = None,  # (N, 3) — camiones por nodo×delta
     time_matrix_arr:         np.ndarray = None,  # unused; kept for API compatibility
-    avail_prob_arr:          np.ndarray = None,  # (N, N) — prior Bernoulli por arco; NO se usa aquí (ver avail_expected_arr)
     reward_global_p95:       float      = 1.0,
     avail_expected_arr:      np.ndarray = None,  # (N, N) — E[loads] histórico (train), usado en feature [6]
 ) -> np.ndarray:
@@ -448,7 +445,6 @@ def build_node_features_batch(
     num_nodes:         int,
     max_duration:      float,
     trucks_stack_raw:  np.ndarray = None,   # (N, num_days_ltr, 3)
-    avail_prob_arr:    np.ndarray = None,   # (N, N) — prior Bernoulli; NO se usa aquí (ver avail_expected_arr)
     reward_global_p95: float      = 1.0,
     avail_expected_arr: np.ndarray = None,  # (N, N) — E[loads] histórico (train), usado en feature [6]
 ) -> np.ndarray:                            # (B, N, N_NODE_FEATURES=8) float32

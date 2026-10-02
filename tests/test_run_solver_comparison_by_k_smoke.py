@@ -42,12 +42,11 @@ def test_run_solver_comparison_free_case_unchanged_shape(agent_and_data):
     cambiar la interfaz ni las columnas de run_solver_comparison."""
     agent, data = agent_and_data
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-     ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95) = data
+     ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95) = data
 
     df, timing = run_solver_comparison(
         agent, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, NUM_NODES,
-        ltr_stack=ltr_stack, trucks_stack=trucks_stack, avail_prob_arr=avail_prob_arr,
-        n_days_per_node=1,
+        ltr_stack=ltr_stack, trucks_stack=trucks_stack, n_days_per_node=1,
     )
     assert len(df) == NUM_NODES   # 1 rep por nodo
     assert 'K' not in df.columns   # caso libre: sin columna K
@@ -66,14 +65,13 @@ def test_run_solver_comparison_free_case_unchanged_shape(agent_and_data):
 def test_run_solver_comparison_by_k_smoke(agent_and_data):
     agent, data = agent_and_data
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-     ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95) = data
+     ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95) = data
 
     k_levels = [4, 5]
     df, timing = run_solver_comparison_by_k(
         agent, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, NUM_NODES,
         k_levels=k_levels,
-        ltr_stack=ltr_stack, trucks_stack=trucks_stack, avail_prob_arr=avail_prob_arr,
-        n_days_per_node=1,
+        ltr_stack=ltr_stack, trucks_stack=trucks_stack, n_days_per_node=1,
     )
     assert 'K' in df.columns
     assert set(df['K'].unique()) == set(k_levels)

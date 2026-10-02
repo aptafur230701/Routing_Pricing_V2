@@ -53,7 +53,7 @@ def data():
 
 def test_free_case_matches_pre_k_conditioning_baseline(data):
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-     ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95) = data
+     ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95) = data
     time_matrix_np = np.array(time_matrix, dtype=float)
 
     r = solve_heuristic_rolling_horizon(
@@ -70,19 +70,19 @@ def test_free_case_matches_pre_k_conditioning_baseline(data):
 
     r = solve_heuristic_rolling_horizon_stochastic(
         START_NODE, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-        MAX_DURATION, NUM_NODES, start_day_idx=DAY, avail_prob_arr=avail_prob_arr,
+        MAX_DURATION, NUM_NODES, start_day_idx=DAY,
     )
     assert (r.route, r.reward) == EXPECTED["rh_greedy_stoch"]
 
     r = solve_heuristic_rolling_horizon_lookahead_stochastic(
         START_NODE, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-        MAX_DURATION, NUM_NODES, start_day_idx=DAY, avail_prob_arr=avail_prob_arr,
+        MAX_DURATION, NUM_NODES, start_day_idx=DAY,
     )
     assert (r.route, r.reward) == EXPECTED["rh_lookahead_stoch"]
 
     r = solve_mc_rollout_stochastic(
         START_NODE, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-        MAX_DURATION, NUM_NODES, start_day_idx=DAY, avail_prob_arr=avail_prob_arr,
+        MAX_DURATION, NUM_NODES, start_day_idx=DAY,
     )
     assert (r.route, r.reward) == EXPECTED["mc_rollout"]
 
@@ -104,6 +104,6 @@ def test_free_case_matches_pre_k_conditioning_baseline(data):
     status, route, reward, duration = solve_label_setting_oracle(
         START_NODE, time_matrix_np, rate_stack, loads_stack,
         distance_arr, diesel_arr, MAX_DURATION, NUM_NODES,
-        start_day_idx=DAY, avail_prob_arr=avail_prob_arr, time_limit_seconds=60,
+        start_day_idx=DAY, time_limit_seconds=60,
     )
     assert (route, reward) == EXPECTED["ls_oracle"]

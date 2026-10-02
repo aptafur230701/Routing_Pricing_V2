@@ -28,7 +28,6 @@ problem_data.py ──► matrices (tiempo, tarifa, carga, distancia, diesel, LT
                               │
                               ▼
                     routing_env.py (RoutingEnv / VectorRoutingEnv)
-                              │  state_features.py construye el vector de estado
                               ▼
         ┌─────────────────────────────────────────────┐
         │                am_agent.py                   │
@@ -71,7 +70,6 @@ nodos, ver `NODE_SEQUENCE`).
 | [config.py](config.py) | Todas las constantes globales e hiperparámetros (arquitectura, PPO, reward shaping). |
 | [problem_data.py](problem_data.py) | Carga de `datos/` y construcción de matrices de recompensa por día. |
 | [routing_env.py](routing_env.py) | Entorno Gymnasium (`RoutingEnv`, `VectorRoutingEnv`) para el DVRP estocástico. |
-| [state_features.py](state_features.py) | Construcción del vector de estado que consume el agente. |
 | [attention_encoder.py](attention_encoder.py) | `AttentionEncoder` (Transformer) + `ContextNetwork`. |
 | [attention_decoder.py](attention_decoder.py) | `AttentionDecoder` (pointer network) con glimpse + pointer attention. |
 | [critic_head.py](critic_head.py) | `CriticHead`: estima V(s_t) para la ventaja PPO. |
@@ -79,7 +77,7 @@ nodos, ver `NODE_SEQUENCE`).
 | [am_training.py](am_training.py) | Loop de entrenamiento PPO-Clip + GAE. |
 | [debug_utils.py](debug_utils.py) | `check_tensor`: verificación de NaN/Inf en el forward pass (falla rápido en vez de silenciar con `nan_to_num`). Usado en producción por el encoder/decoder/training, no es un script de debug puntual. |
 | [transfer_learning.py](transfer_learning.py) | Warm-start de pesos entre tamaños de grafo (`NODE_SEQUENCE`). |
-| [Solvers.py](Solvers.py) | Baselines de comparación: heurística greedy, 2-Opt, LNS, GA, HGA-LNS, rolling-horizon (determinista y estocástico), MC-Rollout, label-setting exacto/oráculo. |
+| [Solvers.py](Solvers.py) | Baselines de comparación: heurística greedy, HGA-LNS (GA + LNS + 2-opt híbrido), rolling-horizon (determinista y estocástico), MC-Rollout, label-setting exacto/oráculo. |
 | [inference.py](inference.py) | Inferencia standalone: carga un checkpoint y genera una ruta desde un nodo dado. |
 
 ### Validación final del modelo

@@ -97,7 +97,6 @@ class AMRoutingAgent(nn.Module):
         ltr_stack:              np.ndarray,        # [num_nodes, 120]
         trucks_stack:           np.ndarray,        # [num_nodes, 120, 3]
         day_idx:                int,
-        avail_prob_arr:         np.ndarray = None, # [num_nodes, num_nodes]
         reward_global_p95:      float      = 1.0,
         k_remaining:            int        = None, # presupuesto K restante (None = libre)
         k_restricted:           bool       = False,
@@ -129,7 +128,6 @@ class AMRoutingAgent(nn.Module):
             reward_matrix_penalized, time_matrix, distance_arr,
             self.num_nodes, max_duration,
             trucks_stack=trucks_day,
-            avail_prob_arr=avail_prob_arr,
             reward_global_p95=reward_global_p95,
             avail_expected_arr=avail_expected_arr,
         )
@@ -185,7 +183,6 @@ class AMRoutingAgent(nn.Module):
         ltr_stack:              np.ndarray,        # [num_nodes, 120]
         trucks_stack:           np.ndarray,        # [num_nodes, 120, 3]
         day_idx:                int,
-        avail_prob_arr:         np.ndarray = None, # [num_nodes, num_nodes]
         reward_global_p95:      float      = 1.0,
         critic:                 nn.Module  = None,
         value_coef:             float      = 1.0,
@@ -236,7 +233,6 @@ class AMRoutingAgent(nn.Module):
                     time_elapsed, step,
                     reward_matrix_penalized, time_matrix, distance_arr,
                     max_duration, ltr_stack, trucks_stack, day_idx,
-                    avail_prob_arr=avail_prob_arr,
                     reward_global_p95=reward_global_p95,
                     avail_expected_arr=avail_expected_arr,
                 )
@@ -313,7 +309,6 @@ class AMRoutingAgent(nn.Module):
                             b["time_elapsed"], step + 1,
                             reward_matrix_penalized, time_matrix, distance_arr,
                             max_duration, ltr_stack, trucks_stack, day_idx,
-                            avail_prob_arr=avail_prob_arr,
                             reward_global_p95=reward_global_p95,
                             avail_expected_arr=avail_expected_arr,
                         )
@@ -371,7 +366,6 @@ class AMRoutingAgent(nn.Module):
         ltr_stack:              np.ndarray = None,   # [num_nodes, 120]
         trucks_stack:           np.ndarray = None,   # [num_nodes, 120, 3]
         day_idx:                int        = 0,
-        avail_prob_arr:         np.ndarray = None,   # [num_nodes, num_nodes]
         reward_global_p95:      float      = 1.0,
         critic:                 nn.Module  = None,
         value_coef:             float      = 1.0,
@@ -385,9 +379,8 @@ class AMRoutingAgent(nn.Module):
         que el greedy original).
 
         Cuando beam_width es None, lo resuelve automáticamente vía
-        get_beam_width(self.num_nodes): modelos pequeños (≤10 nodos) usan
-        beam=5, tamaños intermedios (≤35) usan beam=3, y modelos grandes
-        usan beam=1 (política robusta, greedy suficiente).
+        get_beam_width(self.num_nodes) (ver config.get_beam_width_det: el
+        ancho decrece con el tamaño del grafo, de 5 en ≤10 nodos a 3 en >75).
 
         El techo de pasos en _beam_search() es self.num_nodes — techo
         defensivo contra bucles infinitos; la terminación natural ocurre al
@@ -410,7 +403,6 @@ class AMRoutingAgent(nn.Module):
                 start_node, reward_matrix_penalized, time_matrix,
                 distance_arr, max_duration, beam_width,
                 ltr_stack, trucks_stack, day_idx,
-                avail_prob_arr=avail_prob_arr,
                 reward_global_p95=reward_global_p95,
                 critic=critic, value_coef=value_coef,
                 avail_expected_arr=avail_expected_arr,
@@ -432,7 +424,7 @@ class AMRoutingAgent(nn.Module):
         beam_width:        int        = None,
         ltr_stack:         np.ndarray = None,   # [num_nodes, 120]
         trucks_stack:      np.ndarray = None,   # [num_nodes, 120, 3]
-        avail_prob_arr:    np.ndarray = None,   # [num_nodes, num_nodes]
+        lane_filter:       bool       = False,
         reward_global_p95: float      = 1.0,
         critic:            nn.Module  = None,
         value_coef:        float      = 1.0,
@@ -444,9 +436,10 @@ class AMRoutingAgent(nn.Module):
 
         Features del agente: matriz del día corriente de cada beam (igual que training).
         Recompensa acumulada: misma matriz del día corriente según time_elapsed de cada beam.
-        Disponibilidad estocástica: usa el MISMO esquema de semillas que RoutingEnv
-          (seed basado en start_day_idx, node y arrival_day), garantizando que DRL y
-          baselines compiten sobre la misma realización del mundo.
+        lane_filter=True: excluye lanes sin carga en el día de llegada
+          (draw_lane_availability), el mismo criterio que RoutingEnv, de modo
+          que DRL y baselines compiten sobre la misma realización del mundo.
+          lane_filter=False: sin filtrado de lanes (mundo determinista).
 
         k_max acota el número de arcos (incluido el retorno) por beam — cada
         beam arranca con k_remaining=k_max y lo decrementa por arco recorrido;
@@ -473,12 +466,11 @@ class AMRoutingAgent(nn.Module):
                 day_cache[day_idx] = rm
             return day_cache[day_idx]
 
-        # Sorteo inicial: lanes desde start_node al llegar con time_elapsed=0
-        if avail_prob_arr is not None:
+        # Disponibilidad inicial: lanes desde start_node al llegar con time_elapsed=0
+        if lane_filter:
             init_arrival_day   = min(start_day_idx, max_day)
             init_lane_exists   = draw_lane_availability(
-                start_day_idx, start_node, init_arrival_day,
-                avail_prob_arr, self.num_nodes,
+                start_node, init_arrival_day, loads_stack,
             )
         else:
             init_lane_exists = None
@@ -517,7 +509,6 @@ class AMRoutingAgent(nn.Module):
                     time_elapsed, step,
                     rm_day, time_matrix, distance_arr,
                     max_duration, ltr_stack, trucks_stack, day_idx,
-                    avail_prob_arr=avail_prob_arr,
                     reward_global_p95=reward_global_p95,
                     k_remaining=k_remaining,
                     k_restricted=(k_max is not None),
@@ -537,7 +528,7 @@ class AMRoutingAgent(nn.Module):
                 over_budget = (time_elapsed + t_to_j + t_j_start) > max_duration + 1e-6
                 mask_np[non_start & over_budget] = 0
 
-                # Disponibilidad estocástica (vectorizado) — mismo esquema que RoutingEnv.
+                # Filtrado de lanes (vectorizado) — mismo criterio que RoutingEnv.
                 # No se aplica cuando current_node == start_node (primer paso del beam).
                 if beam["lane_exists"] is not None and current_node != start_node:
                     lane_absent = (beam["lane_exists"] == 0)
@@ -573,15 +564,13 @@ class AMRoutingAgent(nn.Module):
                     step_reward = float(rm_day[current_node, next_node])
                     new_time_elapsed = time_elapsed + step_time
 
-                    # Sorteo de disponibilidad para next_node al llegar.
-                    # Seed idéntico al de RoutingEnv: f(start_day_idx, node, arrival_day).
-                    if avail_prob_arr is not None:
+                    # Disponibilidad de lanes desde next_node al llegar (mismo criterio que RoutingEnv).
+                    if lane_filter:
                         child_arrival_day  = min(
                             start_day_idx + int(new_time_elapsed // 14), max_day
                         )
                         child_lane_exists = draw_lane_availability(
-                            start_day_idx, next_node, child_arrival_day,
-                            avail_prob_arr, self.num_nodes,
+                            next_node, child_arrival_day, loads_stack,
                         )
                     else:
                         child_lane_exists = None
@@ -620,7 +609,6 @@ class AMRoutingAgent(nn.Module):
                             b["time_elapsed"], step + 1,
                             b_rm_day, time_matrix, distance_arr,
                             max_duration, ltr_stack, trucks_stack, b_day_idx,
-                            avail_prob_arr=avail_prob_arr,
                             reward_global_p95=reward_global_p95,
                             k_remaining=b["k_remaining"],
                             k_restricted=(k_max is not None),
@@ -682,7 +670,7 @@ class AMRoutingAgent(nn.Module):
         max_duration:      float      = MAX_DURATION,
         ltr_stack:         np.ndarray = None,   # [num_nodes, 120]
         trucks_stack:      np.ndarray = None,   # [num_nodes, 120, 3]
-        avail_prob_arr:    np.ndarray = None,   # [num_nodes, num_nodes]
+        lane_filter:       bool       = False,
         reward_global_p95: float      = 1.0,
         temperature:       float      = 1.0,
         k_max:              int       = None,   # presupuesto de cardinalidad K (None = libre)
@@ -759,10 +747,10 @@ class AMRoutingAgent(nn.Module):
         )
         eff_k_restricted_arr = k_restricted_arr & (not k_condition_neutral)
 
-        if avail_prob_arr is not None:
+        if lane_filter:
             init_arrival_day = min(start_day_idx, max_day)
             init_row = draw_lane_availability(
-                start_day_idx, start_node, init_arrival_day, avail_prob_arr, N,
+                start_node, init_arrival_day, loads_stack,
             )
             lane_exists = np.tile(init_row, (B, 1))   # (B, N)
         else:
@@ -783,7 +771,6 @@ class AMRoutingAgent(nn.Module):
                 rm_pen_stack, time_matrix_arr, distance_arr,
                 day_idx, N, max_duration,
                 trucks_stack_raw=trucks_stack,
-                avail_prob_arr=avail_prob_arr,
                 reward_global_p95=reward_global_p95,
                 avail_expected_arr=avail_expected_arr,
             )   # (B, N, 8)
@@ -880,8 +867,7 @@ class AMRoutingAgent(nn.Module):
                 )
                 new_lane_rows = np.stack([
                     draw_lane_availability(
-                        start_day_idx, int(next_node[b]), int(child_arrival_day[b]),
-                        avail_prob_arr, N,
+                        int(next_node[b]), int(child_arrival_day[b]), loads_stack,
                     )
                     for b in range(B)
                 ])
@@ -940,7 +926,6 @@ class AMRoutingAgent(nn.Module):
         ltr_stack:              np.ndarray = None,
         trucks_stack:           np.ndarray = None,
         day_idx:                int        = 0,
-        avail_prob_arr:         np.ndarray = None,
         reward_global_p95:      float      = 1.0,
         avail_expected_arr:     np.ndarray = None,
     ) -> int:
@@ -950,7 +935,6 @@ class AMRoutingAgent(nn.Module):
             time_elapsed, step_count,
             reward_matrix_penalized, time_matrix, distance_arr,
             max_duration, ltr_stack, trucks_stack, day_idx,
-            avail_prob_arr=avail_prob_arr,
             reward_global_p95=reward_global_p95,
             avail_expected_arr=avail_expected_arr,
         )
@@ -974,7 +958,6 @@ class AMRoutingAgent(nn.Module):
         ltr_stack:              np.ndarray = None,
         trucks_stack:           np.ndarray = None,
         day_idx:                int        = 0,
-        avail_prob_arr:         np.ndarray = None,
         reward_global_p95:      float      = 1.0,
         avail_expected_arr:     np.ndarray = None,
     ):
@@ -992,7 +975,6 @@ class AMRoutingAgent(nn.Module):
             time_elapsed, step_count,
             reward_matrix_penalized, time_matrix, distance_arr,
             max_duration, ltr_stack, trucks_stack, day_idx,
-            avail_prob_arr=avail_prob_arr,
             reward_global_p95=reward_global_p95,
             avail_expected_arr=avail_expected_arr,
         )
@@ -1016,7 +998,6 @@ class AMRoutingAgent(nn.Module):
         ltr_stack:              np.ndarray = None,
         trucks_stack:           np.ndarray = None,
         day_idx:                int        = 0,
-        avail_prob_arr:         np.ndarray = None,
         reward_global_p95:      float      = 1.0,
         avail_expected_arr:     np.ndarray = None,
     ):
@@ -1038,7 +1019,6 @@ class AMRoutingAgent(nn.Module):
             time_elapsed, step_count,
             reward_matrix_penalized, time_matrix, distance_arr,
             max_duration, ltr_stack, trucks_stack, day_idx,
-            avail_prob_arr=avail_prob_arr,
             reward_global_p95=reward_global_p95,
             avail_expected_arr=avail_expected_arr,
         )
@@ -1068,7 +1048,6 @@ class AMRoutingAgent(nn.Module):
         ltr_stack:              np.ndarray = None,
         trucks_stack:           np.ndarray = None,
         day_idx:                int        = 0,
-        avail_prob_arr:         np.ndarray = None,
         reward_global_p95:      float      = 1.0,
         k_remaining:            int        = None,
         k_restricted:           bool       = False,
@@ -1081,7 +1060,6 @@ class AMRoutingAgent(nn.Module):
             time_elapsed, step_count,
             reward_matrix_penalized, time_matrix, distance_arr,
             max_duration, ltr_stack, trucks_stack, day_idx,
-            avail_prob_arr=avail_prob_arr,
             reward_global_p95=reward_global_p95,
             k_remaining=k_remaining,
             k_restricted=k_restricted,

@@ -108,7 +108,7 @@ def run(num_nodes: int, k_levels, n_days_per_node: int, checkpoint_dir: str = No
     critic.eval()
 
     time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
-        ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95 = load_matrices(num_nodes)
+        ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95 = load_matrices(num_nodes)
 
     # Mismo split train/eval que main.py — el modelo no vio estos días.
     rate_eval  = rate_stack[TRAIN_DAYS:]
@@ -117,8 +117,7 @@ def run(num_nodes: int, k_levels, n_days_per_node: int, checkpoint_dir: str = No
     df, timing = run_solver_comparison_by_k(
         agent, time_matrix, rate_eval, loads_eval, distance_arr, diesel_arr, num_nodes,
         k_levels=k_levels,
-        ltr_stack=ltr_stack, trucks_stack=trucks_stack, avail_prob_arr=avail_prob_arr,
-        n_days_per_node=n_days_per_node, critic=critic,
+        ltr_stack=ltr_stack, trucks_stack=trucks_stack, n_days_per_node=n_days_per_node, critic=critic,
         avail_expected_arr=avail_expected_arr,
     )
 

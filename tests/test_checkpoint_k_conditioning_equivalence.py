@@ -21,10 +21,9 @@ demuestre que las columnas de presupuesto siguen en cero (dejó de ser cierto
 tras el reentrenamiento — se quitó la aserción correspondiente).
 
 ACTUALIZACIÓN: los valores se re-capturaron después de corregir
-problem_data.py (umbral de existencia loads_day<=1 → <=0, y avail_prob_arr
-calibrado solo con días de train en vez de train+eval). Ese cambio modifica
-la matriz de reward y el prior Bernoulli que ve este MISMO checkpoint ya
-entrenado, así que algunas rutas cambiaron sin que se haya reentrenado nada
+problem_data.py (umbral de existencia loads_day<=1 → <=0). Ese cambio modifica
+la matriz de reward y la disponibilidad de lanes que ve este MISMO checkpoint
+ya entrenado, así que algunas rutas cambiaron sin que se haya reentrenado nada
 — es el comportamiento esperado del cambio, no una regresión. Ver auditoría:
 el checkpoint de 10 nodos, evaluado con el pipeline de datos corregido, deja
 de tomar el arco (6→1) en dos de los seis casos.
@@ -43,14 +42,15 @@ CHECKPOINT_PATH = os.path.join(
     "checkpoints", f"am_checkpoint_{NUM_NODES}nodes.pt",
 )
 
-# Re-capturado tras la corrección de problem_data.py (ver NOTA arriba).
+# Re-capturado tras hacer que draw_lane_availability lea loads_day>0 del
+# registro histórico (ver NOTA arriba).
 EXPECTED = {
-    (0, 0):  {"route": [0, 6, 0],       "reward": 847.0},
+    (0, 0):  {"route": [0, 6, 1, 0],    "reward": 1490.0},
     (0, 10): {"route": [0, 6, 0],       "reward": 971.0},
     (3, 0):  {"route": [3, 5, 3],       "reward": 690.0},
     (3, 10): {"route": [3, 5, 3],       "reward": 710.0},
     (7, 0):  {"route": [7, 6, 7],       "reward": 1281.0},
-    (7, 10): {"route": [7, 6, 7],       "reward": -611.0},
+    (7, 10): {"route": [7, 6, 8, 7],    "reward": 484.0},
 }
 
 
@@ -70,14 +70,14 @@ def loaded():
 def test_free_case_rollout_matches_pre_k_conditioning_baseline(loaded):
     agent, data = loaded
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-     ltr_stack, trucks_stack, avail_prob_arr, avail_expected_arr, reward_global_p95) = data
+     ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95) = data
 
     for (start_node, start_day), expected in EXPECTED.items():
         route, reward, _ = agent.beam_search_dynamic(
             start_node, start_day, time_matrix, rate_stack, loads_stack,
             distance_arr, diesel_arr, beam_width=1,
             ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-            avail_prob_arr=avail_prob_arr, reward_global_p95=reward_global_p95,
+            lane_filter=True, reward_global_p95=reward_global_p95,
             k_max=None,   # caso libre — k_restricted=0
         )
         assert route == expected["route"], (
