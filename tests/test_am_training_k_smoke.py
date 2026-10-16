@@ -1,7 +1,7 @@
 """
 test_am_training_k_smoke.py
 =============================
-Fase 3 — §8 paso 3: smoke run corto de run_am_training en NUM_NODES=10 (pocos
+Smoke run corto de run_am_training en NUM_NODES=10 (pocos
 updates), verificando que los niveles de K (K_TRAINING_LEVELS: K_MAX
 restringido + caso libre) aparecen balanceados en el batch de recolección y
 que training_log incluye las claves de diagnóstico nuevas, con conformidad

@@ -37,8 +37,7 @@ Condicionamiento en presupuesto de cardinalidad K:
   parte de N_NODE_FEATURES (no es una feature por nodo).
 
 Compatibilidad:
-  · Sin dependencias de agent.py, training.py, routing_env.py ni evaluation.py.
-  · routing_env.py permanece sin cambios.
+  · Sin dependencias de am_agent.py, am_training.py, routing_env.py ni evaluation.py.
   · Las matrices (reward, time, distance) aceptan pd.DataFrame o np.ndarray.
 """
 
@@ -71,7 +70,6 @@ def build_node_features(
     num_nodes:               int,
     max_duration:            float,
     trucks_stack:            np.ndarray = None,  # (N, 3) — camiones por nodo×delta
-    time_matrix_arr:         np.ndarray = None,  # unused; kept for API compatibility
     reward_global_p95:       float      = 1.0,
     avail_expected_arr:      np.ndarray = None,  # (N, N) — E[loads] histórico (train), usado en feature [6]
 ) -> np.ndarray:
@@ -103,8 +101,7 @@ def build_node_features(
 
     # Column 5: trucks_norm (vectorized delta_idx via fancy indexing)
     if trucks_stack is not None:
-        tm = time_matrix_arr if time_matrix_arr is not None else time_matrix
-        travel_hours = tm[current_node]                                       # (N,)
+        travel_hours = time_matrix[current_node]                                  # (N,)
         delta_idx = np.clip(
             np.ceil(travel_hours / 14.0).astype(np.int32) - 1, 0, 2
         )                                                                      # (N,) int32

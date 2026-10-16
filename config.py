@@ -15,14 +15,12 @@ MARGINAL_COST_SIN_DIESEL = 1.73
 # ── Environment constraints ───────────────────────────────────
 DURATION_LIMIT      = 70.0
 DURATION_TOLERANCE  = 0.10
-MIN_DURATION        = DURATION_LIMIT * (1 - DURATION_TOLERANCE)
 MAX_DURATION        = DURATION_LIMIT * (1 + DURATION_TOLERANCE)
 
 # ── Reward shaping ────────────────────────────────────────────
 REWARD_SCALE_FACTOR    = 100.0
 RETURN_SUCCESS_BONUS   =  500.0 / REWARD_SCALE_FACTOR
 TIME_VIOLATION_PENALTY =  -3000.0 / REWARD_SCALE_FACTOR
-INCOMPLETE_PENALTY     =  -2000.0 / REWARD_SCALE_FACTOR
 BIG_M_PENALTY          = -1e9
 
 # ── Evaluation ────────────────────────────────────────────────
@@ -56,17 +54,14 @@ PPO_LR                    = 7.574781400016766e-05   # Learning rate para el acto
 PPO_GAMMA                 = 0.99   # Factor de descuento para las recompensas futuras
 PPO_GAE_LAMBDA            = 0.9738083627173082   # Factor de GAE
 PPO_CLIP_EPS              = 0.22021368918814568   # Clip PPO para limitar cambios de política
-PPO_ENTROPY_COEF          = 0.05   # Coeficiente de entropía para PPO (valor de referencia; el entrenamiento usa START/END)
 PPO_ENTROPY_COEF_START    = 0.07842497176858756   # coeficiente de entropía al inicio del entrenamiento
 PPO_ENTROPY_COEF_END      = 0.022646509161679096   # coeficiente de entropía al final del entrenamiento (decay lineal)
 PPO_GRAD_CLIP             = 1.7476269465868015    # Clipping de gradiente para PPO
 PPO_WEIGHT_DECAY          = 6.093123878168306e-05  # Weight decay (AdamW) del actor. Regularizador PRIMARIO
                                     # PPO-safe: no corrompe el ratio de importancia como el
                                     # dropout en el path de logits.
-PPO_LR_DECAY              = False  # Scheduler de LR lineal decreciente (espeja el decay de
-                                    # entropía). Apagado por default; opcional.
 
-# ── Self-critical baseline (Camino B: híbrido sobre actor-critic) ────────────
+# ── Self-critical baseline (híbrido sobre actor-critic) ────────────
 USE_SELF_CRITICAL            = True   # término self-critical sobre el argmax greedy
 SELF_CRITICAL_COEF           = 0.5     # peso del término self-critical en el loss total
 SELF_CRITICAL_WARMUP_UPDATES = 50      # no aplicar self-critical hasta este update
@@ -74,17 +69,14 @@ SELF_CRITICAL_WARMUP_UPDATES = 50      # no aplicar self-critical hasta este upd
 
 # ── Cardinalidad de ruta (K) ───────────────────────────────────
 # K_MAX es el único techo restringido que se entrena — la restricción real de
-# la operación (no un rango arbitrario: antes había K_MIN=4..K_MAX=8, un rango
-# sin justificación de negocio para el extremo superior). Formulación ≤K: con
-# un solo nivel, el caso libre (K_TRAINING_LEVELS incluye None) sigue siendo
-# necesario — no es redundante con K_MAX, representa la generalidad del método
-# (aporte científico: el modelo resuelve la familia general del problema, sin
-# presupuesto de cardinalidad), mientras que K_MAX=5 es la instancia puntual
+# la operación. Formulación ≤K: con un solo nivel, el caso libre
+# (K_TRAINING_LEVELS incluye None) sigue siendo necesario — representa la
+# generalidad del método (el modelo resuelve la familia general del problema,
+# sin presupuesto de cardinalidad), mientras que K_MAX es la instancia puntual
 # que sirve a la operación real.
 K_MAX  = 5    # techo de cardinalidad real de negocio (nº de cargas por tour)
-K_NORM = K_MAX  # normalizador GLOBAL de k_remaining_norm: con K_NORM=5,
-                # k_remaining_norm va de 1.0 (presupuesto completo) a 0.2
-                # (último arco antes del retorno forzado).
+K_NORM = K_MAX  # normalizador GLOBAL de k_remaining_norm: va de 1.0 (presupuesto
+                # completo) a 1/K_NORM (último arco antes del retorno forzado).
 K_LEVELS          = [K_MAX]              # un solo nivel restringido — la constraint real
 K_TRAINING_LEVELS = K_LEVELS + [None]    # + caso libre (None) — 2 niveles en total
 
@@ -107,8 +99,8 @@ def get_episodes_per_node(num_nodes: int) -> int:
     """Episodes per start-node for the full training run."""
     if num_nodes <= 10:  return 20000  # subido de 5000: a 5000 (71 updates) reward/entropy
                                         # no se aplanaban; 20000 da ~285 updates de margen
-    if num_nodes <= 20:  return 15000
-    if num_nodes <= 35:  return 10000   # bajado de 25000: la política saturaba ~update 400;
+    if num_nodes <= 20:  return 25000
+    if num_nodes <= 35:  return 30000   # bajado de 25000: la política saturaba ~update 400;
                                         # con ~700 ep/update da ~500-600 updates, holgura sobre
                                         # el punto de saturación observado
     if num_nodes <= 50:  return 32000

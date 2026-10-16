@@ -1,8 +1,7 @@
 """
-test_beam_and_sampling_k_conformity.py
-========================================
-Fase 4 — criterio de aceptación (§8 paso 4): beam_search_dynamic y
-generate_route_sampling honran el presupuesto de cardinalidad K (≤ K arcos,
+test_beam_k_conformity.py
+=========================
+beam_search_dynamic honra el presupuesto de cardinalidad K (≤ K arcos,
 incluido el retorno), tanto en el caso restringido como en el caso libre y
 en la ablación k_condition_neutral.
 
@@ -86,40 +85,6 @@ def test_beam_search_dynamic_k_condition_neutral_ablation(agent, synthetic_data)
     for k in K_LEVELS:
         route, reward, t = agent.beam_search_dynamic(
             0, 0, beam_width=N, k_max=k, k_condition_neutral=True, **synthetic_data,
-        )
-        n = _route_len(route)
-        if n is not None:
-            assert n <= k
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# generate_route_sampling
-# ─────────────────────────────────────────────────────────────────────────────
-
-def test_generate_route_sampling_respects_k(agent, synthetic_data):
-    for k in K_LEVELS:
-        lens = []
-        for trial in range(30):
-            route, reward, t = agent.generate_route_sampling(
-                trial % N, 0, n_samples=1, temperature=5.0, k_max=k, **synthetic_data,
-            )
-            n = _route_len(route)
-            if n is not None:
-                lens.append(n)
-                assert n <= k, f"K={k} trial={trial}: ruta con {n} arcos > K"
-        assert max(lens) == k, f"K={k}: ninguna muestra alcanzó el presupuesto (max={max(lens)})"
-
-
-def test_generate_route_sampling_free_case_unaffected(agent, synthetic_data):
-    route, reward, t = agent.generate_route_sampling(0, 0, n_samples=4, **synthetic_data)
-    assert route is not None
-
-
-def test_generate_route_sampling_k_condition_neutral_ablation(agent, synthetic_data):
-    for k in K_LEVELS:
-        route, reward, t = agent.generate_route_sampling(
-            0, 0, n_samples=4, temperature=5.0, k_max=k, k_condition_neutral=True,
-            **synthetic_data,
         )
         n = _route_len(route)
         if n is not None:

@@ -24,7 +24,7 @@ Compatibilidad
 --------------
 · La máscara de acción es la misma que produce RoutingEnv._get_action_mask():
   np.int8 array con 1 = válido, 0 = inválido.
-· Sin dependencias de agent.py, training.py ni routing_env.py.
+· Sin dependencias de am_agent.py, am_training.py ni routing_env.py.
 """
 
 import torch

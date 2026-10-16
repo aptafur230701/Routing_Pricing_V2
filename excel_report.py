@@ -97,7 +97,6 @@ def build_formatted_excel(
     results_df: pd.DataFrame,
     summary_rows: list,
     output_path: str,
-    node_size: int,
 ) -> None:
     wb = Workbook()
     _build_summary(wb, results_df, summary_rows)

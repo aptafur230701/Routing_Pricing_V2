@@ -33,13 +33,13 @@ from config import (
     AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, AM_PRE_NORM, AM_DROPOUT,
     PPO_N_EPISODES_PER_UPDATE, PPO_N_EPOCHS, PPO_BATCH_SIZE,
     PPO_LR, PPO_GAMMA, PPO_GAE_LAMBDA, PPO_CLIP_EPS,
-    PPO_ENTROPY_COEF, PPO_ENTROPY_COEF_START, PPO_ENTROPY_COEF_END, PPO_GRAD_CLIP,
+    PPO_ENTROPY_COEF_START, PPO_ENTROPY_COEF_END, PPO_GRAD_CLIP,
     PPO_WEIGHT_DECAY,
     USE_SELF_CRITICAL, SELF_CRITICAL_COEF, SELF_CRITICAL_WARMUP_UPDATES,
     K_TRAINING_LEVELS,
 )
-from routing_env import RoutingEnv, VectorRoutingEnv
-from problem_data import build_day_matrices, build_rm_pen_stack
+from routing_env import VectorRoutingEnv
+from problem_data import build_rm_pen_stack
 from attention_encoder import (
     build_node_features_batch,
     build_temporal_features_batch,
@@ -107,12 +107,12 @@ class RolloutBuffer:
         self.old_log_probs = []   # list of float
         self.old_values    = []   # list of float
         self.dones         = []   # list of bool
-        # (start_idx, end_idx, last_value, ep_truncated) por episodio
+        # (start_idx, end_idx) por episodio
         self.episode_boundaries = []
         # Calculados por compute_gae_per_episode()
         self.returns       = None
         self.advantages    = None
-        # Self-critical (Camino B) — poblados solo si USE_SELF_CRITICAL
+        # Self-critical — poblados solo si USE_SELF_CRITICAL
         self.sc_advantage  = None   # (n_episodes,) ventaja normalizada por episodio
         self.episode_idx   = None   # (n_transitions,) índice de episodio por transición
 
@@ -147,46 +147,18 @@ class RolloutBuffer:
     def __len__(self):
         return len(self.actions)
 
-    def compute_gae(
-        self,
-        last_value: float,
-        gamma:      float = 0.99,
-        gae_lambda: float = 0.95,
-    ):
-        """
-        Calcula retornos y ventajas con GAE.
-
-        last_value : V(s_T) del último estado — 0.0 si el episodio terminó,
-                     V(s_T) del critic si fue truncado.
-        """
-        n = len(self.rewards)
-        returns    = np.zeros(n, dtype=np.float32)
-        advantages = np.zeros(n, dtype=np.float32)
-
-        values = np.array(self.old_values + [last_value], dtype=np.float32)
-        dones  = np.array(self.dones, dtype=np.float32)
-
-        gae = 0.0
-        for t in reversed(range(n)):
-            delta = self.rewards[t] + gamma * values[t + 1] * (1 - dones[t]) - values[t]
-            gae   = delta + gamma * gae_lambda * (1 - dones[t]) * gae
-            advantages[t] = gae
-            returns[t]    = gae + values[t]
-
-        self.returns    = returns
-        self.advantages = advantages
-
     def compute_gae_per_episode(
         self,
         gamma:      float = 0.99,
         gae_lambda: float = 0.95,
     ):
         """
-        Calcula retornos y ventajas con GAE usando el last_value correcto de
-        cada episodio registrado en episode_boundaries.
+        Calcula retornos y ventajas con GAE sobre cada episodio registrado en
+        episode_boundaries.
 
-        Cada episodio se procesa en forma independiente: el bootstrap del
-        último paso usa last_value si fue truncado, 0 si terminó naturalmente.
+        Cada episodio se procesa en forma independiente. Todos terminan
+        naturalmente (retorno al depot, violación de tiempo o máscara vacía),
+        así que el valor de bootstrap tras el último paso es 0.
         No se usa la máscara dones dentro del segmento porque el loop de
         recolección rompe en done=True, garantizando que ningún paso
         intermedio tenga done=True.
@@ -195,12 +167,10 @@ class RolloutBuffer:
         returns    = np.zeros(n, dtype=np.float32)
         advantages = np.zeros(n, dtype=np.float32)
 
-        for start_idx, end_idx, last_value, ep_truncated in self.episode_boundaries:
+        for start_idx, end_idx in self.episode_boundaries:
             seg_len   = end_idx - start_idx
-            bootstrap = last_value if ep_truncated else 0.0
-
             seg_values = np.array(
-                self.old_values[start_idx:end_idx] + [bootstrap],
+                self.old_values[start_idx:end_idx] + [0.0],
                 dtype=np.float32,
             )
 
@@ -364,7 +334,7 @@ def _evaluate_greedy(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rollout greedy vectorizado para el baseline self-critical (Camino B)
+# Rollout greedy vectorizado para el baseline self-critical
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _collect_greedy_rollout(
@@ -558,8 +528,6 @@ def run_am_training(
         time_matrix=time_matrix,
         rate_stack=rate_stack,
         loads_stack=loads_stack,
-        distance_arr=distance_arr,
-        diesel_arr=diesel_arr,
         rm_pen_stack=rm_pen_stack,
         num_nodes=num_nodes,
         max_duration=MAX_DURATION,
@@ -597,7 +565,7 @@ def run_am_training(
         agent.eval()
         critic.eval()
 
-        B = n_episodes_per_update   # 360
+        B = n_episodes_per_update
 
         # Balanced start-node sampling: each node appears exactly floor(B/N) times,
         # with remainder filled by random choice — same balance as the sequential
@@ -611,8 +579,8 @@ def run_am_training(
         start_nodes_arr = np.random.permutation(start_nodes_arr).astype(np.int64)
         start_day_idxs  = np.random.randint(0, num_train_days, size=B).astype(np.int64)
 
-        # Balanced K-level sampling: los 6 niveles (5 restringidos + libre) se
-        # reparten balanceados sobre los B episodios, con su propia permutación
+        # Balanced K-level sampling: los niveles de K_TRAINING_LEVELS (restringido
+        # + libre) se reparten balanceados sobre los B episodios, con su propia permutación
         # (np.random.permutation independiente de la de start_nodes_arr —
         # cruce aproximadamente balanceado).
         k_max_arr = _balanced_k_assignment(B, np.random)
@@ -621,8 +589,6 @@ def run_am_training(
         # Accumulated separately to keep episodes contiguous in the flat buffer,
         # since episodes of different lengths interleave in the step loop.
         ep_bufs        = [[] for _ in range(B)]
-        last_values    = np.zeros(B, dtype=np.float32)
-        truncated_flags = np.zeros(B, dtype=bool)
 
         masks  = vec_env.reset(start_nodes_arr, start_day_idxs, k_max_arr=k_max_arr)   # (B, N)
         active = np.ones(B, dtype=bool)
@@ -669,7 +635,7 @@ def run_am_training(
 
                 # Vectorized environment step
                 rewards, terminated, next_masks = vec_env.step(actions)
-                time_violation = vec_env.last_time_violation   # (B,) bool — instrumentación §7
+                time_violation = vec_env.last_time_violation   # (B,) bool — instrumentación de diagnósticos de K
 
                 # Write transitions — only for rows active BEFORE this step
                 for b in np.where(active)[0]:
@@ -687,60 +653,21 @@ def run_am_training(
                         "done":         bool(terminated[b]),
                         "time_violation": bool(time_violation[b]),
                     })
-                    if terminated[b]:
-                        last_values[b] = 0.0   # MDP termination: no bootstrap
 
                 active = active & ~terminated
                 masks  = next_masks
 
-        # Episodes still active after the step loop were truncated by the step ceiling
+        # num_nodes pasos bastan para cerrar cualquier ciclo (cada paso visita un
+        # nodo nuevo o regresa al depot): un episodio activo aquí sería un bug.
         if active.any():
-            trunc_idx = np.where(active)[0]
-
-            # Bootstrap value from a fresh critic forward pass over post-step state
-            # (NOT recycling values[] from the last loop iteration — that was pre-step)
-            cur_nodes_post = vec_env.current_node[trunc_idx]
-            time_el_post   = vec_env.time_elapsed[trunc_idx]
-            step_cnt_post  = vec_env.step_count[trunc_idx]
-            day_idx_post   = vec_env.current_day_idx[trunc_idx]
-
-            nf_trunc = build_node_features_batch(
-                cur_nodes_post, start_nodes_arr[trunc_idx],
-                vec_env.visited_mask[trunc_idx],
-                rm_pen_stack, time_matrix_arr, distance_arr,
-                day_idx_post, num_nodes, MAX_DURATION,
-                trucks_stack_raw=trucks_stack,
-                reward_global_p95=reward_global_p95,
-                avail_expected_arr=avail_expected_arr,
-            )
-            tf_trunc = build_temporal_features_batch(time_el_post, step_cnt_post, MAX_DURATION, num_nodes)
-            mf_trunc = build_market_features_batch(cur_nodes_post, day_idx_post, ltr_stack) if ltr_stack is not None \
-                       else np.zeros((len(trunc_idx), 1), dtype=np.float32)
-            bf_trunc = build_budget_features_batch(
-                vec_env.k_remaining[trunc_idx], vec_env.k_restricted[trunc_idx]
+            raise RuntimeError(
+                f"{int(active.sum())} episodios no terminaron dentro de num_nodes={num_nodes} pasos"
             )
 
-            with torch.no_grad():
-                _, _, _, boot_values_t = _forward(
-                    agent, critic,
-                    torch.from_numpy(nf_trunc).to(DEVICE),
-                    torch.from_numpy(tf_trunc).to(DEVICE),
-                    torch.tensor(cur_nodes_post, dtype=torch.long, device=DEVICE),
-                    torch.from_numpy(masks[trunc_idx]).to(DEVICE),
-                    market_feats_t=torch.from_numpy(mf_trunc).to(DEVICE),
-                    budget_feats_t=torch.from_numpy(bf_trunc).to(DEVICE),
-                )
-            boot_values = boot_values_t.cpu().numpy()
-
-            for i, b in enumerate(trunc_idx):
-                truncated_flags[b] = True
-                last_values[b]     = float(boot_values[i])
-
-        # ── Self-critical baseline (Camino B): rollout greedy vectorizado ──────
+        # ── Self-critical baseline: rollout greedy vectorizado ──────
         # Sobre los MISMOS start_nodes_arr/start_day_idxs del rollout muestreado,
         # para comparar en las mismas unidades y la misma realización del mundo.
-        # Resetea vec_env (su estado post-rollout muestreado ya no se necesita:
-        # el bootstrap de episodios truncados se calculó arriba).
+        # Resetea vec_env (su estado post-rollout muestreado ya no se necesita).
         if USE_SELF_CRITICAL:
             greedy_ep_rewards = _collect_greedy_rollout(
                 agent, vec_env, start_nodes_arr, start_day_idxs,
@@ -757,7 +684,7 @@ def run_am_training(
         # Episodes are written sequentially so compute_gae_per_episode sees
         # contiguous segments — its logic is unchanged.
         update_r_greedy = []
-        # Diagnósticos de K (§7): longitud realizada y violación temporal en
+        # Diagnósticos de K: longitud realizada y violación temporal en
         # retorno forzado, agrupadas por nivel de K asignado al episodio.
         k_diag = {lvl: {"lengths": [], "time_violations": 0} for lvl in K_TRAINING_LEVELS}
         for b in range(B):
@@ -780,7 +707,7 @@ def run_am_training(
                 )
             ep_end = len(buffer)
             buffer.episode_boundaries.append(
-                (ep_start, ep_end, float(last_values[b]), bool(truncated_flags[b]))
+                (ep_start, ep_end)
             )
             ep_reward = sum(t["reward"] for t in ep_bufs[b])
             update_ep_rewards.append(ep_reward)
@@ -795,7 +722,7 @@ def run_am_training(
 
         buffer.compute_gae_per_episode(gamma=gamma, gae_lambda=gae_lambda)
 
-        # ── Ventaja self-critical por episodio (Camino B) ──────────────────────
+        # ── Ventaja self-critical por episodio ──────────────────────
         sc_adv_raw_mean = 0.0
         r_greedy_avg    = 0.0
         if USE_SELF_CRITICAL:
@@ -810,7 +737,7 @@ def run_am_training(
             )
 
             episode_idx_arr = np.zeros(len(buffer), dtype=np.int64)
-            for k, (s, e, _, _) in enumerate(buffer.episode_boundaries):
+            for k, (s, e) in enumerate(buffer.episode_boundaries):
                 episode_idx_arr[s:e] = k
 
             buffer.sc_advantage = sc_advantage_norm
@@ -917,7 +844,7 @@ def run_am_training(
 
                     actor_loss_total = actor_loss + entropy_coef * entropy_loss
 
-                    # ── Self-critical (Camino B): término REINFORCE adicional ──
+                    # ── Self-critical: término REINFORCE adicional ──
                     # No toca el critic — sc_loss depende solo de new_lp (actor).
                     if apply_self_critical:
                         sc_loss = -(SELF_CRITICAL_COEF * sc_adv_b * new_lp).mean()
@@ -1011,7 +938,7 @@ def run_am_training(
 
         episode_losses.append(avg_loss)
 
-        # ── Diagnósticos de K (§7): resumen por nivel — tasa de conformidad
+        # ── Diagnósticos de K: resumen por nivel — tasa de conformidad
         # (debe ser 100% en niveles restringidos, garantizado por máscara),
         # distribución de longitud realizada y frecuencia de violación
         # temporal en el retorno forzado. Se calcula cada update (barato,

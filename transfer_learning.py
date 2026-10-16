@@ -21,10 +21,10 @@ número de nodos en runtime, no los pesos del modelo.
 
 Uso desde main.py
 -----------------
-  from transfer_learning import transfer_checkpoint, NODE_SEQUENCE
+  from transfer_learning import get_source_checkpoint, transfer_checkpoint
 
   # Obtener checkpoint del tamaño anterior automáticamente
-  source = get_source_checkpoint(cwd, num_nodes=20)
+  source = get_source_checkpoint(cwd, target_num_nodes=20)
   agent, critic = transfer_checkpoint(source, target_num_nodes=20)
 
 Uso standalone

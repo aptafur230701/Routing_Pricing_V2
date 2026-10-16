@@ -3,6 +3,4 @@ __pycache__/
 .pytest_cache/
 logs/
 runs/
-checkpoints/
-*.pt
 .ipynb_checkpoints/

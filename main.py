@@ -10,13 +10,7 @@ Entry point for the AM-PPO pipeline.
 
 Uso
 ---
-  Cambia NUM_NODES abajo según la rama en la que estés:
-    train-10nodes  →  NUM_NODES = 10
-    train-20nodes  →  NUM_NODES = 20
-    train-35nodes  →  NUM_NODES = 35
-    train-50nodes  →  NUM_NODES = 50
-    train-75nodes  →  NUM_NODES = 75
-    train-100nodes  →  NUM_NODES = 100
+  Cambia NUM_NODES en main() (opciones: 10 · 20 · 35 · 50 · 75 · 100).
 
   Luego ejecuta simplemente:
     python main.py
@@ -101,8 +95,7 @@ def _load_agent(checkpoint_dir: str, num_nodes: int) -> tuple:
 
     Usa load_checkpoint_compatible (transfer_learning.py) en vez de un
     load_state_dict estricto: tolera checkpoints guardados antes del
-    condicionamiento en K (expansión en cero de context_net.proj — ver §4
-    del plan de cardinalidad de ruta), y es idéntico a un load estricto para
+    condicionamiento en K (expansión en cero de context_net.proj), y es idéntico a un load estricto para
     checkpoints ya compatibles con la arquitectura actual.
     """
     path = os.path.join(checkpoint_dir, f"am_checkpoint_{num_nodes}nodes.pt")
@@ -256,7 +249,7 @@ def _evaluate_and_report(
 
 def main():
     # ── Cambia estos valores según lo que quieras hacer ───────────────────────
-    NUM_NODES       = 10     # opciones: 10 · 20 · 35 · 50 · 75 · 100
+    NUM_NODES       = 20     # opciones: 10 · 20 · 35 · 50 · 75 · 100
     EVAL_ONLY       = False   # True: carga checkpoint y salta entrenamiento
     USE_TRANSFER    = True   # True: warm-start desde el checkpoint del tamaño anterior en
                               # NODE_SEQUENCE (requiere mismo AM_D_H/AM_N_LAYERS que la fuente).

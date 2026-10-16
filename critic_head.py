@@ -11,7 +11,7 @@ Salida  : V(s) (batch,)      — escalar por elemento del batch.
 
 Compatibilidad
 --------------
-· Sin dependencias de agent.py, training.py ni routing_env.py.
+· Sin dependencias de am_agent.py, am_training.py ni routing_env.py.
 · d_h debe coincidir con el d_h de AttentionEncoder y ContextNetwork.
 """
 

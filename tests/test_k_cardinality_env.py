@@ -1,8 +1,7 @@
 """
 test_k_cardinality_env.py
 ==========================
-Fase 1 — criterio de aceptación obligatorio (ver plan "Condicionamiento de la
-política en cardinalidad de ruta (K)"):
+Criterio de aceptación obligatorio del condicionamiento en cardinalidad de ruta (K):
 
     Con una política ALEATORIA, el 100% de los episodios en todos los niveles
     de K cumplen longitud (nº de arcos) <= K. Debe ser cierto por construcción
@@ -113,8 +112,6 @@ def test_vector_env_random_policy_respects_k(data):
         time_matrix=data["time_matrix"],
         rate_stack=data["rate_stack"],
         loads_stack=data["loads_stack"],
-        distance_arr=data["distance_arr"],
-        diesel_arr=data["diesel_arr"],
         rm_pen_stack=rm_pen_stack,
         num_nodes=NUM_NODES,
         max_duration=MAX_DURATION,

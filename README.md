@@ -73,7 +73,7 @@ nodos, ver `NODE_SEQUENCE`).
 | [attention_encoder.py](attention_encoder.py) | `AttentionEncoder` (Transformer) + `ContextNetwork`. |
 | [attention_decoder.py](attention_decoder.py) | `AttentionDecoder` (pointer network) con glimpse + pointer attention. |
 | [critic_head.py](critic_head.py) | `CriticHead`: estima V(s_t) para la ventaja PPO. |
-| [am_agent.py](am_agent.py) | `AMRoutingAgent`: combina encoder + contexto + decoder; expone `generate_route`, `act`, `act_with_value`. |
+| [am_agent.py](am_agent.py) | `AMRoutingAgent`: combina encoder + contexto + decoder; expone `generate_route` y `beam_search_dynamic`. |
 | [am_training.py](am_training.py) | Loop de entrenamiento PPO-Clip + GAE. |
 | [debug_utils.py](debug_utils.py) | `check_tensor`: verificación de NaN/Inf en el forward pass (falla rápido en vez de silenciar con `nan_to_num`). Usado en producción por el encoder/decoder/training, no es un script de debug puntual. |
 | [transfer_learning.py](transfer_learning.py) | Warm-start de pesos entre tamaños de grafo (`NODE_SEQUENCE`). |
@@ -96,9 +96,7 @@ nodos, ver `NODE_SEQUENCE`).
 | `datos/` | Matrices fuente (`.csv`/`.npy`): distancia, duración, tarifa, diesel, disponibilidad de carga, LTR, camiones. |
 | `checkpoints/` | Pesos entrenados (`am_checkpoint_<N>nodes.pt`), compartidos entre tamaños para transfer learning. Ignorado por git (`.gitignore`). |
 | `results/<N>nodes/` | Salida de cada run: `DRL_Routing_Summary_AM.xlsx`, diagnósticos PPO/training (`.png`), `training_log_<N>nodes.pkl`/`.xlsx`. |
-| `results/10nodes/best/` | Snapshot curado manualmente del mejor run de 10 nodos (no se sobreescribe con cada entrenamiento). |
 | `docs/architecture.html` / `.png` | Diagrama explicativo del pipeline AM-PPO. |
-| `runs/` | Logs de TensorBoard (si se generan). Ignorado por git. |
 
 ## Flujo de trabajo típico
 
@@ -115,4 +113,4 @@ nodos, ver `NODE_SEQUENCE`).
 ## Requisitos
 
 Ver [requirements.txt](requirements.txt). Entorno principal: PyTorch,
-Gymnasium, NumPy/Pandas, Optuna, PuLP (solvers exactos).
+Gymnasium, NumPy/Pandas/SciPy, Optuna, Matplotlib, openpyxl.

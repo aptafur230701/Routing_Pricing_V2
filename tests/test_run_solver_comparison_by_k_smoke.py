@@ -11,7 +11,6 @@ suficiente para smoke-testing estructural (columnas, conformidad de K), no
 evalúa calidad de las rutas.
 """
 
-import numpy as np
 import pytest
 import torch
 

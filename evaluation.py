@@ -9,19 +9,16 @@ Post-training evaluation:
   · plot_diagnostics        — 2×2 training diagnostics figure
 """
 
-import os
 import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from config import (
     MAX_DURATION,
-    REWARD_SCALE_FACTOR,
-    N_EVAL_EPISODES, SEED, TRAIN_DAYS,
+    SEED, TRAIN_DAYS,
     get_beam_width_real,
     K_LEVELS,
 )
-from problem_data import build_day_matrices
 from Solvers import (
     solve_HGA_LNS_metaheuristic,
     solve_label_setting_exact,
@@ -61,8 +58,7 @@ def rollout_drl_env(
     usan la matriz del día corriente según el time_elapsed de cada beam.
 
     k_max : int | None — presupuesto de cardinalidad (nº de arcos, incluido
-        el retorno). None (default) = caso libre, comportamiento idéntico al
-        de antes de introducir el condicionamiento en K.
+        el retorno). None (default) = caso libre (sin presupuesto K).
 
     avail_expected_arr se pasa SIEMPRE (Real y Det por igual) — es solo la
     feature de entrada al agente (avail_prior), no interviene en el filtrado
@@ -115,8 +111,7 @@ def _run_comparison_cell(
     'Rep', días) — esas las añade el llamador.
 
     k_max : int | None — presupuesto de cardinalidad (nº de arcos, incluido
-        el retorno). None (default) = caso libre, comportamiento idéntico al
-        de antes de introducir el condicionamiento en K.
+        el retorno). None (default) = caso libre (sin presupuesto K).
 
     Retorna (row: dict, times: dict[str, float]) — times usa las claves de
     _TIMING_KEYS.
@@ -526,8 +521,7 @@ def run_solver_comparison_by_k(agent, time_matrix,
 # ── Output ────────────────────────────────────────────────────
 def save_results(results_df, summary_rows, output_path):
     from excel_report import build_formatted_excel
-    node_size = summary_rows[0]["Node Size"] if summary_rows else None
-    build_formatted_excel(results_df, summary_rows, output_path, node_size)
+    build_formatted_excel(results_df, summary_rows, output_path)
     print(f"Results saved → {output_path}")
 
 

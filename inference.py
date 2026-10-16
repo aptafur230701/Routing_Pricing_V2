@@ -3,7 +3,7 @@ inference.py
 ============
 Inferencia en tiempo real con el modelo AM entrenado.
 
-Carga el checkpoint am_checkpoint_10nodes.pt (hasta ahora es el unico modelo que tengo) y genera una ruta óptima
+Carga el checkpoint am_checkpoint_<NUM_NODES>nodes.pt y genera una ruta óptima
 desde el nodo que el usuario ingrese, usando los datos del día más reciente.
 
 Uso
@@ -12,7 +12,6 @@ Uso
 """
 
 import os
-import numpy as np
 
 from config import DEVICE, MAX_DURATION, get_beam_width
 from am_agent import AMRoutingAgent

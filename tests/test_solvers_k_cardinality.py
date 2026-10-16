@@ -10,7 +10,7 @@ Rolling-Horizon / MC-Rollout, cap en max_route_len en la familia HGA-LNS.
 Usa un escenario sintético (no datos reales de 10 nodos) con tiempos de viaje
 pequeños y max_duration holgado, para que K sea la restricción BINDING — con
 los datos reales, MAX_DURATION ya limita las rutas a pocos arcos
-independientemente de K (ver tests/test_beam_and_sampling_k_conformity.py,
+independientemente de K (ver tests/test_beam_k_conformity.py,
 mismo hallazgo del lado DRL).
 """
 

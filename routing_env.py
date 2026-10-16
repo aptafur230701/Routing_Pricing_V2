@@ -25,7 +25,7 @@ attention_encoder.py y consume solo info["action_mask"] / info["k_remaining"].
 Condiciones de terminación (exclusivamente):
   A) El camión regresa al start_node       → terminated=True
   B) No existe ninguna acción factible     → terminated=True (red de seguridad)
-  truncated siempre es False — ya no hay límite de pasos.
+  truncated siempre es False (no hay límite de pasos).
 
 La máscara de acciones (info["action_mask"]) excluye:
   · self-loops
@@ -72,7 +72,7 @@ class RoutingEnv(gym.Env):
     El agente selecciona el nodo destino en cada paso. El episodio termina
     cuando el camión cierra el ciclo regresando al nodo de inicio (condición A)
     o cuando no existe ninguna acción factible (condición B — red de seguridad).
-    Ya no existe truncación por número de pasos.
+    No hay truncación por número de pasos.
 
     Parámetros
     ----------
@@ -325,14 +325,6 @@ class RoutingEnv(gym.Env):
         return mask
 
     # ─────────────────────────────────────────────────────────────────────────
-    # API pública auxiliar
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def get_valid_actions(self) -> list:
-        """Índices de nodos con acción válida en el estado actual."""
-        return [i for i, m in enumerate(self._get_action_mask()) if m == 1]
-
-    # ─────────────────────────────────────────────────────────────────────────
     # Propiedades de solo lectura
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -385,8 +377,6 @@ class VectorRoutingEnv:
         time_matrix,
         rate_stack:      np.ndarray,
         loads_stack:     np.ndarray,
-        distance_arr:    np.ndarray,
-        diesel_arr:      np.ndarray,
         rm_pen_stack:    np.ndarray,
         num_nodes:       int,
         max_duration:    float = MAX_DURATION,
@@ -478,7 +468,6 @@ class VectorRoutingEnv:
 
         Returns terminated = True only for rows that terminate in THIS step
         (condition A: depot return or time violation; condition B: empty mask).
-        Truncation (step ceiling exceeded) is detected outside, in the training loop.
         """
         B   = self._B
         N   = self.num_nodes

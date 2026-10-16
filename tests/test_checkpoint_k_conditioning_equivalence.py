@@ -1,40 +1,39 @@
 """
 test_checkpoint_k_conditioning_equivalence.py
 ==============================================
-Fase 2 — criterio de aceptación obligatorio: cargar un checkpoint existente y
-verificar que un rollout greedy con k_restricted=0 (caso libre) produce
-EXACTAMENTE la misma ruta y reward que antes del condicionamiento en K.
+Red de seguridad sobre el checkpoint entrenado de 10 nodos
+(checkpoints/am_checkpoint_10nodes.pt).
 
-Los valores esperados se capturaron ejecutando beam_search_dynamic(beam_width=1)
-sobre checkpoints/am_checkpoint_10nodes.pt con el código previo al cambio
-(vía `git stash` al HEAD limpio, antes de tocar attention_encoder.py /
-am_agent.py / transfer_learning.py) y se hardcodean aquí como regresión
-permanente.
+Historia: este archivo pinneaba rutas concretas de un rollout greedy
+(beam_width=1) capturadas con un checkpoint anterior. Como checkpoints/ está en
+.gitignore y se reentrena, esos valores caducaban en cada reentrenamiento y el
+test dejaba de decir algo útil. Además el docstring afirmaba que las rutas
+pinneadas coincidían con el óptimo exacto, lo cual no era cierto en todos los
+casos (p. ej. start_node=3, day=0: 690 pinneado vs 851 óptimo).
 
-NOTA: checkpoints/ está en .gitignore, así que este archivo no es estable
-frente a un reentrenamiento — si se reentrena am_checkpoint_10nodes.pt (como
-ya ocurrió una vez), este test pasa a verificar "el checkpoint actual sigue
-encontrando estas rutas" en vez de "equivalencia arquitectónica estricta".
-En este caso concreto ambas rutas coinciden con el óptimo exacto (LS-Exact/
-LS-Oracle), así que el test se mantiene en verde por esa razón, no porque
-demuestre que las columnas de presupuesto siguen en cero (dejó de ser cierto
-tras el reentrenamiento — se quitó la aserción correspondiente).
+Ahora el test mide lo que realmente importa y no caduca con un reentrenamiento:
 
-ACTUALIZACIÓN: los valores se re-capturaron después de corregir
-problem_data.py (umbral de existencia loads_day<=1 → <=0). Ese cambio modifica
-la matriz de reward y la disponibilidad de lanes que ve este MISMO checkpoint
-ya entrenado, así que algunas rutas cambiaron sin que se haya reentrenado nada
-— es el comportamiento esperado del cambio, no una regresión. Ver auditoría:
-el checkpoint de 10 nodos, evaluado con el pipeline de datos corregido, deja
-de tomar el arco (6→1) en dos de los seis casos.
+1. El checkpoint carga con load_checkpoint_compatible (compatibilidad de
+   arquitectura/state_dict, incluidas las columnas de presupuesto K).
+2. En el caso libre (k_max=None), con el beam de producción
+   (get_beam_width_det), el DRL se compara contra el óptimo exacto
+   (label-setting) en los días de evaluación: nunca lo supera (validez del
+   evaluador) y lo alcanza con una frecuencia y un reward medio mínimos.
+
+La equivalencia arquitectónica estricta del caso libre (columnas de presupuesto
+neutras) se verifica con un agente sintético y semilla fija en
+test_beam_k_conformity.py, que no depende de ningún checkpoint.
+
+Se omite (skip) si el checkpoint no existe.
 """
 
 import os
 import pytest
 
-from config import DEVICE
+from config import MAX_DURATION, TRAIN_DAYS, get_beam_width_det
 from transfer_learning import load_checkpoint_compatible
 from problem_data import load_matrices
+from Solvers import solve_label_setting_exact
 
 NUM_NODES = 10
 CHECKPOINT_PATH = os.path.join(
@@ -42,16 +41,12 @@ CHECKPOINT_PATH = os.path.join(
     "checkpoints", f"am_checkpoint_{NUM_NODES}nodes.pt",
 )
 
-# Re-capturado tras hacer que draw_lane_availability lea loads_day>0 del
-# registro histórico (ver NOTA arriba).
-EXPECTED = {
-    (0, 0):  {"route": [0, 6, 1, 0],    "reward": 1490.0},
-    (0, 10): {"route": [0, 6, 0],       "reward": 971.0},
-    (3, 0):  {"route": [3, 5, 3],       "reward": 690.0},
-    (3, 10): {"route": [3, 5, 3],       "reward": 710.0},
-    (7, 0):  {"route": [7, 6, 7],       "reward": 1281.0},
-    (7, 10): {"route": [7, 6, 8, 7],    "reward": 484.0},
-}
+# Umbrales con margen sobre lo medido el 2026-10-15 con el checkpoint del
+# 2 de octubre (beam=5, 300 casos de evaluación): 96.0% óptimos, reward medio
+# 98.4% del óptimo. Si un reentrenamiento cae por debajo, es una señal real.
+MIN_OPTIMAL_HIT_RATE = 0.90
+MIN_MEAN_REWARD_RATIO = 0.95
+EPS = 1e-6
 
 
 @pytest.fixture(scope="module")
@@ -67,24 +62,48 @@ def loaded():
     return agent, data
 
 
-def test_free_case_rollout_matches_pre_k_conditioning_baseline(loaded):
+def test_free_case_rollout_quality_vs_exact_optimum(loaded):
     agent, data = loaded
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
      ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95) = data
+    beam_width = get_beam_width_det(NUM_NODES)
+    num_days = loads_stack.shape[0]
 
-    for (start_node, start_day), expected in EXPECTED.items():
-        route, reward, _ = agent.beam_search_dynamic(
-            start_node, start_day, time_matrix, rate_stack, loads_stack,
-            distance_arr, diesel_arr, beam_width=1,
-            ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-            lane_filter=True, reward_global_p95=reward_global_p95,
-            k_max=None,   # caso libre — k_restricted=0
-        )
-        assert route == expected["route"], (
-            f"start_node={start_node} start_day={start_day}: "
-            f"ruta {route} != esperada {expected['route']}"
-        )
-        assert reward == pytest.approx(expected["reward"]), (
-            f"start_node={start_node} start_day={start_day}: "
-            f"reward {reward} != esperado {expected['reward']}"
-        )
+    drl_rewards, opt_rewards = [], []
+    for day in range(TRAIN_DAYS, num_days):
+        for start_node in range(NUM_NODES):
+            route, reward, _ = agent.beam_search_dynamic(
+                start_node, day, time_matrix, rate_stack, loads_stack,
+                distance_arr, diesel_arr, beam_width=beam_width,
+                ltr_stack=ltr_stack, trucks_stack=trucks_stack,
+                lane_filter=True, reward_global_p95=reward_global_p95,
+                k_max=None,   # caso libre — k_restricted=0
+            )
+            assert route[0] == start_node and route[-1] == start_node, (
+                f"start_node={start_node} day={day}: ruta {route} no cierra el ciclo"
+            )
+            _, _, opt_reward, _ = solve_label_setting_exact(
+                start_node, time_matrix, rate_stack, loads_stack,
+                distance_arr, diesel_arr, MAX_DURATION, NUM_NODES,
+                start_day_idx=day,
+            )
+            # El óptimo exacto es una cota superior: si el DRL la supera, el
+            # evaluador del agente y el del solver están desalineados.
+            assert reward <= opt_reward + EPS, (
+                f"start_node={start_node} day={day}: DRL {reward} > óptimo {opt_reward} "
+                f"(ruta {route}) — evaluador desalineado con LS-Exact"
+            )
+            drl_rewards.append(reward)
+            opt_rewards.append(opt_reward)
+
+    n = len(opt_rewards)
+    hit_rate = sum(abs(o - d) < EPS for d, o in zip(drl_rewards, opt_rewards)) / n
+    ratio = sum(drl_rewards) / sum(opt_rewards)
+
+    assert hit_rate >= MIN_OPTIMAL_HIT_RATE, (
+        f"Solo {hit_rate:.1%} de {n} casos alcanzan el óptimo "
+        f"(mínimo {MIN_OPTIMAL_HIT_RATE:.0%}) — ¿checkpoint degradado o reentrenamiento fallido?"
+    )
+    assert ratio >= MIN_MEAN_REWARD_RATIO, (
+        f"Reward medio DRL = {ratio:.1%} del óptimo (mínimo {MIN_MEAN_REWARD_RATIO:.0%})"
+    )
