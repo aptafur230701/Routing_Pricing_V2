@@ -78,6 +78,7 @@ from config import (
     BIG_M_PENALTY,
     MARKET_SEED_TRAIN,
 )
+from fit_market_process import dia_de_semana
 from problem_data import build_day_matrices, draw_lane_availability, lane_reward
 
 
@@ -452,6 +453,9 @@ class VectorRoutingEnv:
                    distance_arr y diesel_arr para la recompensa.
     market_seed    : semilla del generador que reparte las semillas de mundo
                    cuando reset() no recibe `world_seeds`.
+    day_offset     : índice absoluto (en el histórico completo) del día 0 de los stacks de este
+                   entorno. Solo sirve para `current_dow`: 0 cuando los stacks arrancan en el día 0
+                   (entrenamiento, mundos simulados); TRAIN_DAYS para el replay de los días de eval.
     """
 
     def __init__(
@@ -466,6 +470,7 @@ class VectorRoutingEnv:
         distance_arr:    np.ndarray = None,
         diesel_arr:      np.ndarray = None,
         market_seed:     int = MARKET_SEED_TRAIN,
+        day_offset:      int = 0,
     ):
         if market_process is None and rm_pen_stack is None:
             raise ValueError("rm_pen_stack es obligatorio sin market_process")
@@ -482,6 +487,7 @@ class VectorRoutingEnv:
         self.num_nodes       = num_nodes
         self.max_duration    = max_duration
         self._market         = market_process
+        self._day_offset     = int(day_offset)
         self._distance_arr   = distance_arr
         self._diesel_arr     = diesel_arr
         self._seed_rng       = np.random.default_rng(market_seed)   # reparte semillas de mundo
@@ -505,6 +511,7 @@ class VectorRoutingEnv:
         self._k_max:               np.ndarray = None   # (B,) int64 — indefinido donde no restringido
         self._k_remaining:         np.ndarray = None   # (B,) int64 — indefinido donde no restringido
         self._last_time_violation: np.ndarray = None   # (B,) bool — poblado por step()
+        self._last_raw_reward:     np.ndarray = None   # (B,) float32 — recompensa cruda de la lane del último step()
         # Modo market_process
         self._world_seed:          np.ndarray = None   # (B,) int64 — semilla del mundo de cada episodio
         self._reward_row:          np.ndarray = None   # (B, N) float32 — recompensa penalizada de las lanes salientes
@@ -549,6 +556,7 @@ class VectorRoutingEnv:
             )
             self._k_remaining = self._k_max.copy()
         self._last_time_violation = np.zeros(B, dtype=bool)
+        self._last_raw_reward     = np.zeros(B, dtype=np.float32)
 
         if self._market is not None:
             # Cada episodio es un mundo con semilla propia. Pasar las MISMAS
@@ -612,6 +620,8 @@ class VectorRoutingEnv:
             )   # (B,)
             raw_reward = self._rm_pen_stack[day_idx, self._current_node, actions]
         step_reward = raw_reward.astype(np.float32) / REWARD_SCALE_FACTOR
+        # Recompensa de la lane en unidades originales (sin escala ni bonos), 0 en filas inactivas.
+        self._last_raw_reward = np.where(self._active, raw_reward, 0.0).astype(np.float32)
 
         # Terminal reward components (using visited_mask BEFORE the state update)
         n_intermediate = self._visited_mask.sum(axis=1).astype(np.float32) - 1   # (B,)
@@ -784,6 +794,15 @@ class VectorRoutingEnv:
         )
 
     @property
+    def current_dow(self) -> np.ndarray:
+        """(B,) día de la semana (lunes = 0) del día en que está cada episodio.
+
+        Día absoluto = day_offset + start_day_idx + int(time_elapsed // 14), sin recortar al
+        último día con datos (con market_process el mundo es ilimitado)."""
+        dias = self._day_offset + self._start_day_idx + (self._time_elapsed // 14).astype(np.int64)
+        return dia_de_semana(dias)
+
+    @property
     def reward_rows(self) -> np.ndarray:
         """(B, N) float32 — recompensa penalizada de las lanes salientes del nodo
         actual (f0 de las features del agente). Con market_process sale de las
@@ -814,6 +833,13 @@ class VectorRoutingEnv:
     @property
     def k_restricted(self) -> np.ndarray:
         return self._k_restricted
+
+    @property
+    def last_raw_reward(self) -> np.ndarray:
+        """(B,) float32 — recompensa de la lane recorrida en el último step(), sin
+        REWARD_SCALE_FACTOR ni bonos/penalizaciones terminales (0 en filas ya inactivas).
+        Es la unidad en que los solvers reportan el reward de una ruta."""
+        return self._last_raw_reward
 
     @property
     def last_time_violation(self) -> np.ndarray:

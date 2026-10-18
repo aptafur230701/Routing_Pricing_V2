@@ -1,121 +1,174 @@
 """
 stats_analysis.py
-==================
-Análisis de robustez estadística sobre el panel de evaluación estocástica
-(mundo real con filtrado de lanes). Compara DRL Real contra cada baseline estocástico
-(RH-Greedy Real, RH-Lookahead Real, MC-Rollout) usando:
-  · Descriptivos: media, std, percentiles P25/P50/P75, min, max — sobre
-    instancias donde el método es válido.
-  · Test de Wilcoxon pareado (signed-rank) sobre instancias donde AMBOS
-    métodos de la comparación son válidos simultáneamente.
+=================
+Comparación estadística pareada del DRL contra los baselines B1, B2 y B3, mundo a mundo
+(baselines_drl_ruteo_estocastico.md, sección Pruebas estadísticas).
 
-Fundamento metodológico: Demšar (2006, JMLR) y García et al. (2010) recomiendan
-tests no paramétricos pareados para comparar heurísticas/políticas sobre el
-mismo conjunto de instancias, evitando la asunción de normalidad que requiere
-un t-test pareado — relevante aquí porque N es modesto y los rewards pueden
-tener outliers (instancias infactibles, nodos con reward muy negativo).
+Unidad de análisis: la diferencia de margen (USD) DRL − baseline en un mismo mundo.
+  · Diferencia media pareada con intervalo del 95 % por bootstrap sobre mundos
+    (BOOTSTRAP_B remuestreos, semilla fija; Agarwal et al., 2021).
+  · Wilcoxon de rangos con signo, pareado y de una cola (H1: DRL > baseline), con
+    corrección de Holm por las comparaciones de cada (modo, K) (Accorsi, Lodi y Vigo).
+  · B2 solo existe con K finito, así que se compara solo en esos mundos.
+  · Gap de cada método contra UB-DP y contra UB-PI: (UB − método) / |UB| · 100 sobre los
+    promedios de los mismos mundos, con intervalo bootstrap.
+
+El replay se calcula igual pero va etiquetado: "replay, no independiente del simulador".
 """
 
 import numpy as np
 import pandas as pd
 from scipy.stats import wilcoxon
 
-STOCHASTIC_METHODS = {
-    'DRL Real':          ('DRL Real Reward',          'DRL Real Valid'),
-    'RH-Greedy Real':    ('RH-Greedy Real Reward',    'RH-Greedy Real Valid'),
-    'RH-Lookahead Real': ('RH-Lookahead Real Reward', 'RH-Lookahead Real Valid'),
-    'MC-Rollout':        ('MC-Rollout Reward',        'MC-Rollout Valid'),
-}
+from config import BOOTSTRAP_B, BOOTSTRAP_SEED
 
-BASELINE_REFERENCE = 'DRL Real'
+REFERENCIA = "DRL"
+BASELINES = ("B1", "B2", "B3")
+NOTA_REPLAY = "replay, no independiente del simulador"
 
 
-def _check_columns(results_df: pd.DataFrame, methods: dict) -> None:
-    """Raise KeyError with a clear message if any required column is missing."""
-    missing = []
-    for name, (rcol, vcol) in methods.items():
-        for col in (rcol, vcol):
-            if col not in results_df.columns:
-                missing.append(f"'{col}' (needed for method '{name}')")
-    if missing:
-        raise KeyError(
-            f"stats_analysis: columnas faltantes en results_df:\n  " +
-            "\n  ".join(missing)
-        )
+def etiqueta_modo(modo: str) -> str:
+    return NOTA_REPLAY if modo == "replay" else modo
 
 
-def compute_descriptive_stats(results_df: pd.DataFrame,
-                               methods: dict = STOCHASTIC_METHODS) -> pd.DataFrame:
-    """Media, std, percentiles por método, sobre instancias válidas."""
-    _check_columns(results_df, methods)
-    rows = []
-    for name, (rcol, vcol) in methods.items():
-        vals = results_df.loc[results_df[vcol], rcol]
-        rows.append({
-            'Method':       name,
-            'N Valid':      len(vals),
-            'N Total':      len(results_df),
-            'Mean':         vals.mean(),
-            'Std':          vals.std(ddof=1) if len(vals) > 1 else np.nan,
-            'P25':          vals.quantile(0.25) if len(vals) > 0 else np.nan,
-            'Median (P50)': vals.quantile(0.50) if len(vals) > 0 else np.nan,
-            'P75':          vals.quantile(0.75) if len(vals) > 0 else np.nan,
-            'Min':          vals.min() if len(vals) > 0 else np.nan,
-            'Max':          vals.max() if len(vals) > 0 else np.nan,
-        })
-    return pd.DataFrame(rows)
+NOTA_UB_DP_FLOJA = "UB-DP floja (> UB-PI)"
+NOTA_UB_DP_FLOJA_LARGA = (
+    "En este K la media de UB-DP supera a la de UB-PI: al permitir revisitar nodos la DP se aflojó "
+    "(p. ej. ping-pong entre nodos cercanos). UB-DP y UB-PI son cotas independientes (relajan "
+    "factibilidad e información, respectivamente); la cota DP no debe leerse como referencia "
+    "principal en este K."
+)
 
 
-def compute_wilcoxon_paired(results_df: pd.DataFrame,
-                             methods: dict = STOCHASTIC_METHODS,
-                             reference: str = BASELINE_REFERENCE,
-                             alpha: float = 0.05) -> pd.DataFrame:
-    """Wilcoxon pareado: reference vs cada otro método, sobre instancias
-    donde ambos son válidos simultáneamente."""
-    _check_columns(results_df, methods)
-    ref_rcol, ref_vcol = methods[reference]
-    rows = []
-    for name, (rcol, vcol) in methods.items():
-        if name == reference:
+def ub_dp_floja(ub_dp, ub_pi) -> bool:
+    """True si la media de UB-DP supera a la de UB-PI (sobre los mundos con ambas cotas)."""
+    ub_dp, ub_pi = np.asarray(ub_dp, dtype=float), np.asarray(ub_pi, dtype=float)
+    ok = ~np.isnan(ub_dp) & ~np.isnan(ub_pi)
+    return bool(ok.any() and ub_dp[ok].mean() > ub_pi[ok].mean())
+
+
+def gap_pct(ub, x) -> float:
+    """(media UB − media método) / |media UB| · 100 sobre los mundos con cota disponible."""
+    ub, x = np.asarray(ub, dtype=float), np.asarray(x, dtype=float)
+    ok = ~np.isnan(ub)
+    if not ok.any() or ub[ok].mean() == 0:
+        return float("nan")
+    return float((ub[ok].mean() - x[ok].mean()) / abs(ub[ok].mean()) * 100.0)
+
+
+def _indices_bootstrap(n: int, B: int, rng) -> np.ndarray:
+    return rng.integers(0, n, size=(B, n))
+
+
+def ic_bootstrap_media(valores, B: int = BOOTSTRAP_B, rng=None, semilla: int = BOOTSTRAP_SEED) -> tuple:
+    """IC del 95 % (percentiles 2,5 y 97,5) de la media por bootstrap sobre mundos.
+
+    Remuestrea con reemplazo B veces; con `rng` None usa un Generator nuevo de semilla fija.
+    Devuelve (bajo, alto); (nan, nan) si no hay valores.
+    """
+    v = np.asarray(valores, dtype=float)
+    v = v[~np.isnan(v)]
+    if len(v) == 0:
+        return float("nan"), float("nan")
+    rng = rng if rng is not None else np.random.Generator(np.random.PCG64(semilla))
+    medias = v[_indices_bootstrap(len(v), B, rng)].mean(axis=1)
+    return float(np.percentile(medias, 2.5)), float(np.percentile(medias, 97.5))
+
+
+def holm(p: np.ndarray) -> np.ndarray:
+    """p-valores ajustados por Holm-Bonferroni (mismo orden que la entrada)."""
+    p = np.asarray(p, dtype=float)
+    m = len(p)
+    orden = np.argsort(p)
+    ajustado = np.empty(m)
+    maximo = 0.0
+    for rango, i in enumerate(orden):
+        maximo = max(maximo, min(1.0, (m - rango) * p[i]))
+        ajustado[i] = maximo
+    return ajustado
+
+
+def _wilcoxon_mayor(dif: np.ndarray) -> tuple:
+    """Wilcoxon pareado de una cola (H1: la diferencia es positiva). (estadístico, p)."""
+    if len(dif) < 1 or np.allclose(dif, 0):
+        return float("nan"), 1.0 if len(dif) else float("nan")
+    try:
+        r = wilcoxon(dif, alternative="greater")
+        return float(r.statistic), float(r.pvalue)
+    except ValueError:
+        return float("nan"), float("nan")
+
+
+def comparar_con_baselines(df: pd.DataFrame, referencia: str = REFERENCIA, baselines=BASELINES,
+                           B: int = BOOTSTRAP_B, semilla: int = BOOTSTRAP_SEED,
+                           alpha: float = 0.05) -> pd.DataFrame:
+    """Diferencia media pareada (referencia − baseline) con IC bootstrap y Wilcoxon + Holm.
+
+    df : DataFrame largo de evaluation (columnas modo, K, mundo, metodo, margen).
+    """
+    rng = np.random.Generator(np.random.PCG64(semilla))
+    filas = []
+    for (modo, K), g in df.groupby(["modo", "K"], sort=False):
+        ancho = g.pivot(index="mundo", columns="metodo", values="margen")
+        if referencia not in ancho:
             continue
-        mask = results_df[ref_vcol] & results_df[vcol]
-        n_pairs = int(mask.sum())
-        ref_vals   = results_df.loc[mask, ref_rcol].to_numpy()
-        other_vals = results_df.loc[mask, rcol].to_numpy()
-        diff = ref_vals - other_vals
+        bloque = []
+        for b in baselines:
+            if b not in ancho:
+                continue
+            par = ancho[[referencia, b]].dropna()
+            dif = (par[referencia] - par[b]).to_numpy()
+            n = len(dif)
+            if n == 0:
+                continue
+            medias = dif[_indices_bootstrap(n, B, rng)].mean(axis=1)
+            stat, p = _wilcoxon_mayor(dif)
+            bloque.append({
+                "modo": etiqueta_modo(modo), "K": K, "comparacion": f"{referencia} − {b}", "n_mundos": n,
+                "dif_media_usd": float(dif.mean()),
+                "ic95_inf": float(np.percentile(medias, 2.5)),
+                "ic95_sup": float(np.percentile(medias, 97.5)),
+                "wilcoxon_stat": stat, "p_una_cola": p,
+            })
+        if bloque:
+            p_holm = holm(np.array([f["p_una_cola"] for f in bloque]))
+            for f, ph in zip(bloque, p_holm):
+                f["p_holm"] = float(ph)
+                f[f"significativo (Holm, α={alpha})"] = bool(ph < alpha)
+            filas.extend(bloque)
+    return pd.DataFrame(filas)
 
-        if n_pairs < 1 or np.allclose(diff, 0):
-            stat, p = np.nan, np.nan
-        else:
-            try:
-                stat, p = wilcoxon(ref_vals, other_vals)
-            except ValueError:
-                stat, p = np.nan, np.nan
 
-        rows.append({
-            'Comparison':              f'{reference} vs {name}',
-            'N Pairs':                 n_pairs,
-            'Mean Diff (Ref - Other)': diff.mean() if n_pairs > 0 else np.nan,
-            'Median Diff':             np.median(diff) if n_pairs > 0 else np.nan,
-            'Std Diff':                diff.std(ddof=1) if n_pairs > 1 else np.nan,
-            'Wilcoxon Statistic':      stat,
-            'p-value':                 p,
-            f'Significant (p<{alpha})': bool(p < alpha) if not np.isnan(p) else None,
-        })
-    return pd.DataFrame(rows)
+def gaps_contra_cotas(df: pd.DataFrame, B: int = BOOTSTRAP_B, semilla: int = BOOTSTRAP_SEED) -> pd.DataFrame:
+    """Gap (%) de cada método contra UB-DP y UB-PI, con intervalo bootstrap del 95 % sobre mundos."""
+    rng = np.random.Generator(np.random.PCG64(semilla))
+    filas = []
+    for (modo, K), g in df.groupby(["modo", "K"], sort=False):
+        floja = ub_dp_floja(g["ub_dp"], g["ub_pi"])
+        for metodo, gm in g.groupby("metodo", sort=False):
+            fila = {"modo": etiqueta_modo(modo), "K": K, "metodo": metodo, "n_mundos": len(gm),
+                    "ub_dp_floja": floja}
+            for col, nombre in (("ub_dp", "ub_dp"), ("ub_pi", "ub_pi")):
+                ub, x = gm[col].to_numpy(float), gm["margen"].to_numpy(float)
+                ok = ~np.isnan(ub)
+                fila[f"gap_{nombre}_pct"] = gap_pct(ub, x)
+                if ok.sum() > 1:
+                    idx = _indices_bootstrap(int(ok.sum()), B, rng)
+                    u, v = ub[ok][idx].mean(axis=1), x[ok][idx].mean(axis=1)
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        gaps = (u - v) / np.abs(u) * 100.0
+                    fila[f"gap_{nombre}_ic95_inf"] = float(np.nanpercentile(gaps, 2.5))
+                    fila[f"gap_{nombre}_ic95_sup"] = float(np.nanpercentile(gaps, 97.5))
+            filas.append(fila)
+    return pd.DataFrame(filas)
 
 
-def append_stats_sheets_to_excel(excel_path: str, results_df: pd.DataFrame,
-                                  methods: dict = STOCHASTIC_METHODS,
-                                  reference: str = BASELINE_REFERENCE) -> None:
-    """Agrega 'Stochastic Descriptive Stats' y 'Wilcoxon Significance' al
-    Excel existente sin tocar las hojas previas."""
-    desc_df = compute_descriptive_stats(results_df, methods)
-    wil_df  = compute_wilcoxon_paired(results_df, methods, reference)
-
-    with pd.ExcelWriter(excel_path, engine='openpyxl', mode='a',
-                        if_sheet_exists='replace') as writer:
-        desc_df.to_excel(writer, sheet_name='Stochastic Descriptive Stats', index=False)
-        wil_df.to_excel(writer, sheet_name='Wilcoxon Significance', index=False)
-
+def append_stats_sheets_to_excel(excel_path: str, sim_df: pd.DataFrame, replay_df: pd.DataFrame = None) -> None:
+    """Agrega 'Comparación pareada' y 'Gaps vs cotas' al Excel existente sin tocar las hojas previas."""
+    df = sim_df if replay_df is None or replay_df.empty else pd.concat([sim_df, replay_df], ignore_index=True)
+    pareada = comparar_con_baselines(df)
+    gaps = gaps_contra_cotas(df)
+    with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+        pareada.to_excel(writer, sheet_name="Comparación pareada", index=False)
+        gaps.to_excel(writer, sheet_name="Gaps vs cotas", index=False)
     print(f"Hojas estadísticas agregadas → {excel_path}")

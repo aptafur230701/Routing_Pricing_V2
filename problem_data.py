@@ -202,10 +202,15 @@ def load_matrices(num_nodes: int) -> tuple:
     # magnitud real (loads va de 0 a >1900) en vez de colapsarla a P(loads>0).
     avail_expected_arr = loads_stack[:train_days].mean(axis=0).astype(np.float32)
 
-    # P95 de los valores positivos del rate_stack de entrenamiento.
+    # P95 de los rewards positivos de las lanes en los días de entrenamiento.
     # Usado como normalizador global de rewards en la feature [7] del encoder.
-    rate_train_slice = rate_stack[:train_days]
-    _pos_vals = rate_train_slice[rate_train_slice > 0].ravel()
+    # Debe estar en las MISMAS unidades que el reward del paso (dólares por lane,
+    # vía lane_reward), no en tarifa por milla: feature [7] = reward / P95.
+    reward_train = lane_reward(
+        rate_stack[:train_days], loads_stack[:train_days],
+        distance_arr[None], diesel_arr[None],
+    )
+    _pos_vals = reward_train[reward_train > 0].ravel()
     reward_global_p95 = float(np.percentile(_pos_vals, 95)) if len(_pos_vals) > 0 else 1.0
     print(f"REWARD_GLOBAL_P95: {reward_global_p95:.4f}")
 

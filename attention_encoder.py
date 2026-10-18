@@ -55,6 +55,12 @@ N_NODE_FEATURES = 8
 # build_budget_features() / build_budget_features_batch().
 N_BUDGET_FEATURES = 2
 
+# Día de la semana (one-hot, lunes = 0) del día en que está el camión: el proceso de cargas
+# depende de él (factor s_d de 0,58 a 1,43), así que el agente lo necesita para estimar el
+# valor de los nodos siguientes. Va como ÚLTIMO bloque de la entrada de ContextNetwork para que
+# los checkpoints anteriores se carguen con esas columnas en cero (transfer_learning).
+N_DOW_FEATURES = 7
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilidad: construcción de la matriz de features de nodos
@@ -317,6 +323,7 @@ class ContextNetwork(nn.Module):
                                         progreso_norm
       · market_features   (n_market)  — MTI, dispersión, forecast (opcional,
                                         por defecto 0 = no se usa)
+      · dow_features      (n_dow)     — día de la semana actual (one-hot), último bloque
       · budget_features   (n_budget)  — presupuesto de cardinalidad K:
                                         k_remaining_norm, k_restricted.
                                         Bloque SEPARADO de temporal_features
@@ -324,7 +331,7 @@ class ContextNetwork(nn.Module):
                                         número de arcos, no el tiempo) — no se
                                         amplía n_temporal para incorporarlo.
 
-    Entrada total: 2·d_h + 3 + n_market + n_budget  →  MLP  →  d_h
+    Entrada total: 2·d_h + 3 + n_market + n_budget + n_dow  →  MLP  →  d_h
 
     Parámetros
     ----------
@@ -332,12 +339,14 @@ class ContextNetwork(nn.Module):
     n_market : int — número de features de mercado adicionales (default 1).
     n_budget : int — número de features de presupuesto K (default 2, ver
                build_budget_features()).
+    n_dow    : int — one-hot del día de la semana (default N_DOW_FEATURES = 7).
     """
 
-    def __init__(self, d_h: int, n_market: int = 1, n_budget: int = 2):
+    def __init__(self, d_h: int, n_market: int = 1, n_budget: int = 2, n_dow: int = N_DOW_FEATURES):
         super().__init__()
+        self.n_dow = n_dow
         n_temporal = 3          # time_norm, remaining_steps_norm, progress_norm
-        d_in = 2 * d_h + n_temporal + n_market + n_budget
+        d_in = 2 * d_h + n_temporal + n_market + n_budget + n_dow
         self.proj = nn.Sequential(
             nn.Linear(d_in, d_h),
             nn.ReLU(),
@@ -352,6 +361,7 @@ class ContextNetwork(nn.Module):
         temporal_feats:   torch.Tensor,   # (batch, 3)
         market_feats:     torch.Tensor = None,  # (batch, n_market) | None
         budget_feats:     torch.Tensor = None,  # (batch, n_budget) | None
+        dow_feats:        torch.Tensor = None,  # (batch, n_dow) | None (None ⇒ ceros)
     ) -> torch.Tensor:
         """
         Retorna el vector de contexto h_t de forma (batch, d_h).
@@ -361,6 +371,9 @@ class ContextNetwork(nn.Module):
             parts.append(market_feats)
         if budget_feats is not None:
             parts.append(budget_feats)
+        if self.n_dow:
+            parts.append(dow_feats if dow_feats is not None
+                         else torch.zeros(graph_emb.shape[0], self.n_dow, device=graph_emb.device))
         h = torch.cat(parts, dim=-1)
         return self.proj(h)
 
@@ -529,6 +542,14 @@ def build_node_features_batch(
     feats[:, :, 7] = feat7
 
     return feats
+
+
+def build_dow_features_batch(dow: np.ndarray) -> np.ndarray:   # (B,) int → (B, 7) float32
+    """One-hot del día de la semana (lunes = 0) de cada episodio."""
+    dow = np.asarray(dow, dtype=np.int64)
+    out = np.zeros((len(dow), N_DOW_FEATURES), dtype=np.float32)
+    out[np.arange(len(dow)), dow % N_DOW_FEATURES] = 1.0
+    return out
 
 
 def build_temporal_features_batch(

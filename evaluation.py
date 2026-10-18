@@ -1,527 +1,499 @@
 """
 evaluation.py
 =============
-Post-training evaluation:
-  · generate_optimal_route  — deterministic greedy rollout with trained agent
-  · evaluate_stochastic     — N-episode stochastic reward distribution
-  · run_solver_comparison   — DRL vs Greedy, HGA-LNS, rolling-horizon, MC-Rollout y label-setting
-  · save_results            — Excel output
-  · plot_diagnostics        — 2×2 training diagnostics figure
+Evaluación posterior al entrenamiento (baselines_drl_ruteo_estocastico.md):
+  · rollout_drl_env              — rollout greedy (argmax por nodo) del agente en el entorno
+  · evaluar_mundos_simulados     — DRL, B1, B2, B3 sobre los mismos mundos simulados + UB-PI y UB-DP
+  · evaluar_replay               — el mismo arnés sobre los días reales de evaluación (market_process=None)
+  · resumen_metodos              — márgenes, gaps y métricas operativas por método
+  · save_results, plot_*         — Excel y figuras
+
+Arnés único: todas las políticas se ejecutan paso a paso en `VectorRoutingEnv` (B = 1) con
+la misma interfaz. Una política solo lee la máscara, la fila observada de cargas y tarifas,
+el nodo actual, la hora, k restante y los visitados (`baselines.Observacion`); el mismo
+`world_seed` da números aleatorios comunes y la no anticipatividad queda garantizada por
+construcción. `sample_world` se usa solo para UB-PI.
+
+El margen de una ruta es la suma de `lane_reward` de cada arco, calculada con la fila
+observada en el nodo de salida (no la recompensa del entorno, que trae bono, penalidad y
+escala).
 """
 
+import copy
 import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import torch
 from config import (
-    MAX_DURATION,
-    SEED, TRAIN_DAYS,
-    get_beam_width_real,
-    K_LEVELS,
+    MAX_DURATION, K_MAX, TRAIN_DAYS,
+    MARKET_SEED_EVAL, MARKET_M_EVAL_WORLDS, REPLAY_MAX_CASOS,
 )
-from Solvers import (
-    solve_HGA_LNS_metaheuristic,
-    solve_label_setting_exact,
-    solve_label_setting_oracle,
-    solve_heuristic_rolling_horizon,
-    solve_heuristic_rolling_horizon_lookahead,
-    solve_heuristic_rolling_horizon_lookahead_stochastic,
-    solve_heuristic_rolling_horizon_stochastic,
-    solve_mc_rollout_stochastic,
-    simulate_route_reward,
-)
+from baselines import Observacion, PoliticaB1, PoliticaB2
+from dp_relajada import PoliticaB3
+from greedy_rollout import greedy_rollout
+from problem_data import build_rm_pen_stack, lane_reward
+from routing_env import VectorRoutingEnv
+from Solvers import solve_label_setting_oracle
+from stats_analysis import gap_pct, ic_bootstrap_media, ub_dp_floja, NOTA_UB_DP_FLOJA
+
+_DIAS_SIMULADOS_UB_PI = 6   # 77 h = 5,5 días de mercado: 6 días cubren cualquier ruta
+_METODOS = ("DRL", "B1", "B2", "B3")
 
 
 # ── DRL env-based rollout ─────────────────────────────────────
+def make_replay_env(time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
+                    day_offset=0):
+    """Entorno de replay de los días reales (market_process=None) sobre el stack dado.
+
+    day_offset : índice absoluto del día 0 del stack (TRAIN_DAYS para los días de evaluación);
+        solo define el día de la semana que ve el agente.
+    """
+    return VectorRoutingEnv(
+        time_matrix=time_matrix,
+        rate_stack=rate_stack,
+        loads_stack=loads_stack,
+        rm_pen_stack=build_rm_pen_stack(rate_stack, loads_stack, distance_arr, diesel_arr),
+        num_nodes=num_nodes,
+        max_duration=MAX_DURATION,
+        day_offset=day_offset,
+    )
+
+
+def make_sim_env(time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes, market):
+    """Entorno de mundos simulados (cargas y tarifas sorteadas al llegar a cada nodo).
+
+    rate_stack / loads_stack solo fijan el último día con datos para las features
+    históricas (LTR, camiones); como en el entrenamiento, los días de entrenamiento.
+    """
+    return VectorRoutingEnv(
+        time_matrix=time_matrix,
+        rate_stack=rate_stack,
+        loads_stack=loads_stack,
+        rm_pen_stack=None,
+        num_nodes=num_nodes,
+        max_duration=MAX_DURATION,
+        market_process=market,
+        distance_arr=distance_arr,
+        diesel_arr=diesel_arr,
+    )
+
+
 def rollout_drl_env(
     agent,
+    env:            VectorRoutingEnv,
     start_node:     int,
     start_day_idx:  int,
-    time_matrix,
-    rate_stack:     np.ndarray,
-    loads_stack:    np.ndarray,
+    time_matrix_arr: np.ndarray,
     distance_arr:   np.ndarray,
-    diesel_arr:     np.ndarray,
-    max_duration:   float      = MAX_DURATION,
-    ltr_stack:      np.ndarray = None,
-    trucks_stack:   np.ndarray = None,
-    lane_filter:    bool       = False,
-    beam_width:     int        = None,
-    critic                     = None,
-    value_coef:     float      = 1.0,
+    ltr_stack:      np.ndarray,
+    trucks_stack:   np.ndarray,
+    num_nodes:      int,
+    reward_global_p95: float      = 1.0,
     k_max:          int        = None,
     avail_expected_arr: np.ndarray = None,
+    world_seed:     int        = None,
+    device:         torch.device = None,
 ) -> tuple:
-    """Beam search con días de mercado dinámicos.
+    """Una ruta del agente: paso a paso en el entorno, argmax en cada nodo.
 
-    Delega en agent.beam_search_dynamic(): las decisiones y la recompensa acumulada
-    usan la matriz del día corriente según el time_elapsed de cada beam.
+    El entorno fija el mundo: replay del día `start_day_idx` (env sin
+    market_process, ver make_replay_env) o un mundo simulado (env con
+    market_process, `world_seed`). Máscara, disponibilidad de lanes y recompensa
+    son las del entorno de entrenamiento; no hay búsqueda ni ranking por crítico.
 
     k_max : int | None — presupuesto de cardinalidad (nº de arcos, incluido
         el retorno). None (default) = caso libre (sin presupuesto K).
 
-    avail_expected_arr se pasa SIEMPRE (Real y Det por igual) — es solo la
-    feature de entrada al agente (avail_prior), no interviene en el filtrado
-    de lanes (que sí se desactiva en modo Det vía lane_filter=False).
+    Retorna (route, reward, duration) con el reward en unidades originales (suma
+    de lanes); (None, -inf, inf) si no cierra el ciclo en el depot dentro de max_duration.
     """
-    agent.eval()
-    try:
-        return agent.beam_search_dynamic(
-            start_node, start_day_idx,
-            time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-            max_duration,
-            ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-            lane_filter=lane_filter,
-            beam_width=beam_width,
-            critic=critic, value_coef=value_coef,
-            k_max=k_max,
-            avail_expected_arr=avail_expected_arr,
-        )
-    finally:
-        agent.train()
+    res = greedy_rollout(
+        agent, env,
+        np.array([start_node], dtype=np.int64), np.array([start_day_idx], dtype=np.int64),
+        time_matrix_arr, distance_arr, trucks_stack, ltr_stack,
+        reward_global_p95, num_nodes,
+        k_max_arr=[k_max],
+        avail_expected_arr=avail_expected_arr,
+        world_seeds=None if world_seed is None else np.array([world_seed], dtype=np.int64),
+        device=device,
+    )
+    if not res.valid[0]:
+        return None, -np.inf, np.inf
+    return res.routes[0], float(res.raw_reward[0]), float(res.duration[0])
 
 
-# ── Solver comparison ─────────────────────────────────────────
+# ── Arnés: una política, un mundo ─────────────────────────────
 
-# Claves internas de timing compartidas por _run_comparison_cell / ambas
-# funciones públicas — deben coincidir con las claves de dict que devuelve
-# _run_comparison_cell() y con el mapeo a nombres de columna de `timing`.
-_TIMING_KEYS = (
-    'drl_real', 'drl_det', 'rh_greedy', 'rh_lookahead',
-    'rh_stoch', 'rh_lookahead_stoch', 'mc_rollout', 'hga_lns',
-    'ls_exact', 'ls_oracle',
-)
+class _EnvCronometrado:
+    """Envuelve un VectorRoutingEnv y acumula el tiempo gastado en reset/step.
 
-
-def _run_comparison_cell(
-    agent, s, day_idx, rep,
-    time_matrix, time_matrix_np,
-    rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
-    ltr_stack, trucks_stack, critic,
-    k_max=None, verbose=True,
-    avail_expected_arr=None,
-) -> tuple:
-    """Ejecuta DRL Real + DRL Det + los 8 solvers baseline para un
-    (start_node=s, day_idx, k_max) y construye las columnas de resultado.
-
-    Extraído del cuerpo de run_solver_comparison() para poder reusarlo tanto
-    en el caso libre (run_solver_comparison, k_max=None) como en el sweep por
-    K (run_solver_comparison_by_k, un k_max por llamada) sin duplicar las ~10
-    llamadas a solvers. No añade las columnas de contexto ('Start Node',
-    'Rep', días) — esas las añade el llamador.
-
-    k_max : int | None — presupuesto de cardinalidad (nº de arcos, incluido
-        el retorno). None (default) = caso libre (sin presupuesto K).
-
-    Retorna (row: dict, times: dict[str, float]) — times usa las claves de
-    _TIMING_KEYS.
+    Sirve para separar el tiempo de decisión del DRL (features + red) del tiempo del
+    entorno, que dentro de greedy_rollout va mezclado.
     """
-    row = {}
-    times = {}
 
-    # ── DRL Real — rollout único bajo revelación post-decisión (mundo fijo por seed) ──
-    t0 = time.time()
-    drl_real_route, drl_real_reward, drl_real_duration = rollout_drl_env(
-        agent, s, day_idx,
-        time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-        ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-        lane_filter=True,
-        beam_width=get_beam_width_real(num_nodes),
-        critic=critic,
-        k_max=k_max,
-        avail_expected_arr=avail_expected_arr,
-    )
-    times['drl_real'] = time.time() - t0
-    drl_real_valid = drl_real_route is not None
-    row.update({
-        'DRL Real Route':    drl_real_route,
-        'DRL Real Reward':   drl_real_reward   if drl_real_valid else -np.inf,
-        'DRL Real Duration': drl_real_duration if drl_real_valid else np.inf,
-        'DRL Real Valid':    drl_real_valid,
-    })
-    _p_drl_real = f"  DRL Real:       {drl_real_route} | reward {drl_real_reward:.1f}"
+    def __init__(self, env):
+        self._env = env
+        self.t_env = 0.0
 
-    # ── DRL Det — ruta construida y evaluada sin filtrado de lanes ───────
-    # lane_filter=False (default) desactiva el filtrado de lanes en beam_search_dynamic.
-    # El reward se recomputa explícitamente con simulate_route_reward para
-    # garantizar paridad bit-a-bit con el mundo determinista.
-    t0 = time.time()
-    drl_det_route, _, drl_det_duration_raw = rollout_drl_env(
-        agent, s, day_idx,
-        time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-        ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-        critic=critic,
-        k_max=k_max,
-        avail_expected_arr=avail_expected_arr,
+    def reset(self, *args, **kwargs):
+        t0 = time.perf_counter()
+        out = self._env.reset(*args, **kwargs)
+        self.t_env += time.perf_counter() - t0
+        return out
+
+    def step(self, *args, **kwargs):
+        t0 = time.perf_counter()
+        out = self._env.step(*args, **kwargs)
+        self.t_env += time.perf_counter() - t0
+        return out
+
+    def __getattr__(self, name):
+        return getattr(self._env, name)
+
+
+class _PoliticaRuta:
+    """Repite una ruta ya decidida (para medir sus métricas con el mismo arnés)."""
+
+    def __init__(self, ruta):
+        self._ruta, self._pos = ruta, 0
+
+    def actuar(self, obs) -> int:
+        self._pos += 1
+        return int(self._ruta[self._pos])
+
+
+def ejecutar_politica(politica, env, start_node, start_day_idx, k_max, world_seed,
+                      distance_arr, diesel_arr, dow0, loads_stack=None, rate_stack=None) -> dict:
+    """Corre `politica` paso a paso en `env` (B = 1) y devuelve las métricas de la ruta.
+
+    Sin market_process (replay) las filas observadas salen de loads_stack / rate_stack en el
+    día actual del entorno; con él, de las filas sorteadas al llegar al nodo.
+    Métricas: margen (suma de lane_reward con la fila de salida), violacion (no cerró el
+    ciclo en casa dentro de max_duration), frac_millas_cargadas, n_cargas, duracion,
+    ms_decision (tiempo medio de `politica.actuar`) y ruta.
+    """
+    N = env.num_nodes
+    seeds = None if world_seed is None else np.array([world_seed], dtype=np.int64)
+    masks = env.reset(
+        np.array([start_node], dtype=np.int64), np.array([start_day_idx], dtype=np.int64),
+        k_max_arr=[k_max], world_seeds=seeds,
     )
-    drl_det_valid = drl_det_route is not None
-    if drl_det_valid:
-        drl_det_reward, drl_det_duration = simulate_route_reward(
-            drl_det_route, s, day_idx,
-            time_matrix_np, rate_stack, loads_stack, distance_arr, diesel_arr,
+    ruta = [int(start_node)]
+    margen = millas_carg = millas_tot = 0.0
+    n_cargas = n_dec = 0
+    t_dec = 0.0
+    cerro = False
+    for _ in range(N + 1):
+        mascara = masks[0]
+        if not mascara.any():
+            break                                         # sin acción factible (no cierra el ciclo)
+        i = int(env.current_node[0])
+        if env.current_loads_row is not None:
+            loads_row, rate_row = env.current_loads_row[0], env.current_rate_row[0]
+        else:
+            d = int(env.current_day_idx[0])
+            loads_row, rate_row = loads_stack[d, i], rate_stack[d, i]
+        obs = Observacion(
+            nodo=i, casa=int(start_node), tiempo=float(env.time_elapsed[0]),
+            k_restante=int(env.k_remaining[0]) if env.k_restricted[0] else None,
+            visitados=env.visited_mask[0].copy(), mascara=mascara.copy(),
+            loads_row=loads_row, rate_row=rate_row, dia_semana_salida=int(dow0),
         )
+        t0 = time.perf_counter()
+        a = int(politica.actuar(obs))
+        t_dec += time.perf_counter() - t0
+        n_dec += 1
+        if not mascara[a]:
+            raise RuntimeError(f"{getattr(politica, 'nombre', politica)} eligió la acción {a}, fuera de la máscara")
+        r = float(lane_reward(rate_row[a], loads_row[a], distance_arr[i, a], diesel_arr[i, a]))
+        margen += r
+        millas_tot += float(distance_arr[i, a])
+        if loads_row[a] > 0:
+            millas_carg += float(distance_arr[i, a])
+            n_cargas += 1
+        ruta.append(a)
+        _, terminated, masks = env.step(np.array([a], dtype=np.int64))
+        if terminated[0]:
+            cerro = (a == start_node) and not bool(env.last_time_violation[0])
+            break
+    return dict(
+        margen=margen,
+        violacion=not cerro,
+        frac_millas_cargadas=millas_carg / millas_tot if millas_tot > 0 else float("nan"),
+        n_cargas=n_cargas,
+        duracion=float(env.time_elapsed[0]),
+        ms_decision=1000.0 * t_dec / n_dec if n_dec else float("nan"),
+        ruta=ruta,
+    )
+
+
+class _UnHilo:
+    """Contexto: fija torch en un solo hilo (tiempos en CPU comparables) y lo restaura."""
+
+    def __enter__(self):
+        self._prev = torch.get_num_threads()
+        torch.set_num_threads(1)
+
+    def __exit__(self, *exc):
+        torch.set_num_threads(self._prev)
+
+
+class ContextoEval:
+    """Datos y políticas comunes de una evaluación (simulada o replay)."""
+
+    def __init__(self, agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
+                 ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95):
+        self.agent_cpu = copy.deepcopy(agent).to("cpu").eval()   # DRL en CPU, un hilo
+        self.market, self.tabla = market, tabla
+        self.T = np.asarray(time_matrix, dtype=float)
+        self.dist, self.diesel, self.N = distance_arr, diesel_arr, num_nodes
+        self.ltr, self.trucks = ltr_stack, trucks_stack
+        self.avail, self.p95 = avail_expected_arr, reward_global_p95
+        self.politicas = {
+            "B1": PoliticaB1(distance_arr, diesel_arr),
+            "B2": PoliticaB2(market, self.T, distance_arr, diesel_arr),
+            "B3": PoliticaB3(tabla, distance_arr, diesel_arr),
+        }
+
+
+def _ejecutar_drl(ctx, env, nodo, dia, K, world_seed, dow0, loads_stack=None, rate_stack=None) -> dict:
+    """Rollout greedy del DRL (greedy_rollout, sin cambios) + métricas con el arnés común.
+
+    El tiempo por decisión es el del rollout menos el del entorno (reset/step).
+    """
+    seeds = None if world_seed is None else np.array([world_seed], dtype=np.int64)
+    if not env.reset(np.array([nodo]), np.array([dia]), k_max_arr=[K], world_seeds=seeds)[0].any():
+        ruta, ms = [int(nodo)], float("nan")        # sin ninguna acción factible
     else:
-        drl_det_reward, drl_det_duration = -np.inf, np.inf
-    times['drl_det'] = time.time() - t0
-    row.update({
-        'DRL Det Route':    drl_det_route,
-        'DRL Det Reward':   drl_det_reward   if drl_det_valid else -np.inf,
-        'DRL Det Duration': drl_det_duration if drl_det_valid else np.inf,
-        'DRL Det Valid':    drl_det_valid,
-    })
-    _p_drl_det = f"  DRL Det:        {drl_det_route} | reward {drl_det_reward:.1f}"
-
-    # ── RH-Greedy — greedy miope con día dinámico ────────────────────────
-    t0 = time.time()
-    rh_status, rh_route, rh_reward, rh_duration, rh_valid = \
-        solve_heuristic_rolling_horizon(
-            s, time_matrix, rate_stack, loads_stack,
-            distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-            start_day_idx=day_idx, k_max=k_max,
+        envc = _EnvCronometrado(env)
+        t0 = time.perf_counter()
+        res = greedy_rollout(
+            ctx.agent_cpu, envc, np.array([nodo], dtype=np.int64), np.array([dia], dtype=np.int64),
+            ctx.T, ctx.dist, ctx.trucks, ctx.ltr, ctx.p95, ctx.N,
+            k_max_arr=[K], avail_expected_arr=ctx.avail, world_seeds=seeds, device=torch.device("cpu"),
         )
-    times['rh_greedy'] = time.time() - t0
-    row.update({
-        'RH-Greedy Route':    rh_route,
-        'RH-Greedy Reward':   rh_reward if rh_valid else -np.inf,
-        'RH-Greedy Duration': rh_duration if rh_route else np.inf,
-        'RH-Greedy Valid':    rh_valid,
-    })
-    _p_rh_greedy = f"  RH-Greedy:      {rh_route} | reward {rh_reward:.1f}"
-
-    # ── RH-Lookahead — rolling horizon con lookahead determinista ─────────
-    t0 = time.time()
-    rhl_status, rhl_route, rhl_reward, rhl_duration, rhl_valid = \
-        solve_heuristic_rolling_horizon_lookahead(
-            s, time_matrix, rate_stack, loads_stack,
-            distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-            start_day_idx=day_idx, lookahead=3, k_max=k_max,
-        )
-    times['rh_lookahead'] = time.time() - t0
-    row.update({
-        'RH-Lookahead Route':    rhl_route,
-        'RH-Lookahead Reward':   rhl_reward if rhl_valid else -np.inf,
-        'RH-Lookahead Duration': rhl_duration if rhl_route else np.inf,
-        'RH-Lookahead Valid':    rhl_valid,
-    })
-    _p_rh_lookahead = f"  RH-Lookahead:   {rhl_route} | reward {rhl_reward:.1f}"
-
-    # ── RH-Greedy Real — greedy miope en mundo estocástico ───────────────
-    t0 = time.time()
-    rh_stoch_status, rh_stoch_route, rh_stoch_reward, rh_stoch_duration, rh_stoch_valid = \
-        solve_heuristic_rolling_horizon_stochastic(
-            s, time_matrix, rate_stack, loads_stack,
-            distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-            start_day_idx=day_idx, k_max=k_max,
-        )
-    times['rh_stoch'] = time.time() - t0
-    row.update({
-        'RH-Greedy Real Route':    rh_stoch_route,
-        'RH-Greedy Real Reward':   rh_stoch_reward if rh_stoch_valid else -np.inf,
-        'RH-Greedy Real Duration': rh_stoch_duration if rh_stoch_route else np.inf,
-        'RH-Greedy Real Valid':    rh_stoch_valid,
-    })
-    _p_rh_greedy_real = f"  RH-Greedy Real: {rh_stoch_route} | reward {rh_stoch_reward:.1f}"
-
-    # ── RH-Lookahead Real — lookahead en mundo estocástico ────────────────
-    t0 = time.time()
-    rhlr_status, rhlr_route, rhlr_reward, rhlr_duration, rhlr_valid = \
-        solve_heuristic_rolling_horizon_lookahead_stochastic(
-            s, time_matrix, rate_stack, loads_stack,
-            distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-            start_day_idx=day_idx, lookahead=3, k_max=k_max,
-        )
-    times['rh_lookahead_stoch'] = time.time() - t0
-    row.update({
-        'RH-Lookahead Real Route':    rhlr_route,
-        'RH-Lookahead Real Reward':   rhlr_reward if rhlr_valid else -np.inf,
-        'RH-Lookahead Real Duration': rhlr_duration if rhlr_route else np.inf,
-        'RH-Lookahead Real Valid':    rhlr_valid,
-    })
-    _p_rh_lookahead_real = f"  RH-Lookahead Real: {rhlr_route} | reward {rhlr_reward:.1f}"
-
-    # ── MC-Rollout estocástico ────────────────────────────────────────────
-    t0 = time.time()
-    mc_status, mc_route, mc_reward, mc_duration, mc_valid = \
-        solve_mc_rollout_stochastic(
-            s, time_matrix, rate_stack, loads_stack,
-            distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-            start_day_idx=day_idx, k_max=k_max,
-        )
-    times['mc_rollout'] = time.time() - t0
-    row.update({
-        'MC-Rollout Route':    mc_route,
-        'MC-Rollout Reward':   mc_reward if mc_valid else -np.inf,
-        'MC-Rollout Duration': mc_duration if mc_route else np.inf,
-        'MC-Rollout Valid':    mc_valid,
-    })
-    _p_mc_rollout = f"  MC-Rollout:     {mc_route} | reward {mc_reward:.1f}"
-
-    # ── HGA-LNS ──────────────────────────────────────────────────────────
-    if verbose:
-        print(f"  [HGA-LNS]...", end=" ", flush=True)
-    t0 = time.time()
-    hga_status, hga_route, hga_reward, hga_duration = solve_HGA_LNS_metaheuristic(
-        s, time_matrix, MAX_DURATION, num_nodes,
-        rate_stack=rate_stack, loads_stack=loads_stack,
-        distance_arr=distance_arr, diesel_arr=diesel_arr,
-        start_day_idx=day_idx,
-        seed=SEED + s * 1000 + rep,
-        k_max=k_max,
-    )
-    times['hga_lns'] = time.time() - t0
-    if verbose:
-        print(f"{times['hga_lns']:.1f}s", flush=True)
-    row.update({
-        'HGA-LNS Status':   hga_status,
-        'HGA-LNS Route':    hga_route,
-        'HGA-LNS Reward':   hga_reward   if hga_status == 'Optimal' else -np.inf,
-        'HGA-LNS Duration': hga_duration if hga_status == 'Optimal' else np.inf,
-        'HGA-LNS Valid':    hga_status == 'Optimal' and hga_route is not None,
-    })
-    _p_hga_lns = f"  HGA-LNS:        {hga_route} | reward {hga_reward:.1f}"
-
-    # ── Label-Setting Exact ───────────────────────────────────────────────
-    if verbose:
-        print(f"  [LS-Exact]...", end=" ", flush=True)
-    t0 = time.time()
-    ls_status, ls_route, ls_reward, ls_duration = solve_label_setting_exact(
-        s, time_matrix_np, rate_stack, loads_stack,
-        distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-        start_day_idx=day_idx,
-        time_limit_seconds=300,
-        k_max=k_max,
-    )
-    times['ls_exact'] = time.time() - t0
-    if verbose:
-        print(f"{times['ls_exact']:.1f}s", flush=True)
-    ls_valid = ls_status in ("Optimal", "Time-Limited") and ls_route is not None
-    row.update({
-        'LS-Exact Status':   ls_status,
-        'LS-Exact Route':    ls_route,
-        'LS-Exact Reward':   ls_reward   if ls_valid else -np.inf,
-        'LS-Exact Duration': ls_duration if ls_valid else np.inf,
-        'LS-Exact Valid':    ls_valid,
-    })
-    _p_ls_exact = f"  LS-Exact:       {ls_route} | reward {ls_reward:.1f} [{ls_status}]"
-
-    # ── Label Setting Oracle (cota clarividente, mundo estocástico) ───────────
-    if verbose:
-        print(f"  [LS-Oracle]...", end=" ", flush=True)
-    t0 = time.time()
-    lso_status, lso_route, lso_reward, lso_duration = solve_label_setting_oracle(
-        s, time_matrix_np, rate_stack, loads_stack,
-        distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-        start_day_idx=day_idx,
-        time_limit_seconds=300,
-        k_max=k_max,
-    )
-    times['ls_oracle'] = time.time() - t0
-    if verbose:
-        print(f"{times['ls_oracle']:.1f}s", flush=True)
-    lso_valid = lso_status in ("Optimal", "Time-Limited") and lso_route is not None
-    row.update({
-        'LS-Oracle Status':   lso_status,
-        'LS-Oracle Route':    lso_route,
-        'LS-Oracle Reward':   lso_reward   if lso_valid else -np.inf,
-        'LS-Oracle Duration': lso_duration if lso_valid else np.inf,
-        'LS-Oracle Valid':    lso_valid,
-    })
-    assert lso_reward >= row.get('DRL Real Reward', -np.inf) - 1e-3, (
-        f"LS-Oracle ({lso_reward:.1f}) no debería ser superado por DRL Real "
-        f"({row.get('DRL Real Reward', float('nan')):.1f}) en start={s} day={day_idx} "
-        f"k_max={k_max} — revisar alineación del filtrado de lanes."
-    )
-    _p_ls_oracle = f"  LS-Oracle:      {lso_route} | reward {lso_reward:.1f} [{lso_status}]"
-
-    if verbose:
-        print("  -- Determinísticos --")
-        print(_p_drl_det)
-        print(_p_rh_greedy)
-        print(_p_rh_lookahead)
-        print(_p_hga_lns)
-        print(_p_ls_exact)
-        print("  -- Estocásticos --")
-        print(_p_drl_real)
-        print(_p_rh_greedy_real)
-        print(_p_rh_lookahead_real)
-        print(_p_mc_rollout)
-        print(_p_ls_oracle)
-
-    return row, times
+        total = time.perf_counter() - t0
+        ruta = res.routes[0]
+        ms = 1000.0 * (total - envc.t_env) / (len(ruta) - 1)
+    m = ejecutar_politica(_PoliticaRuta(ruta), env, nodo, dia, K, world_seed,
+                          ctx.dist, ctx.diesel, dow0, loads_stack, rate_stack)
+    m["ms_decision"] = ms
+    return m
 
 
-def run_solver_comparison(agent, time_matrix,
-                           rate_stack, loads_stack, distance_arr, diesel_arr,
-                           num_nodes,
-                           ltr_stack=None, trucks_stack=None,
-                           n_days_per_node=3, critic=None,
-                           avail_expected_arr=None):
-    """Run DRL Real + DRL Det + HGA-LNS + RH-Greedy for every start node.
+def ub_pi(market, time_matrix, distance_arr, diesel_arr, num_nodes, start_node, K,
+          mundo, start_day_idx=0) -> tuple:
+    """UB-PI: mejor ruta con el mundo completo conocido, vía label-setting oráculo.
 
-    Para cada nodo de inicio se usan n_days_per_node días del set de evaluación
-    (días TRAIN_DAYS … total-1), sin repetición dentro del mismo nodo. Los índices
-    se pre-generan con un RNG dedicado antes del loop para que no dependan del
-    estado random del agente.
+    Se resuelve sin poda por dominancia (dominancia=False): con recompensas que dependen del
+    día de llegada la poda de (tiempo, reward) puede descartar el óptimo y la cota dejaría
+    de serlo.
 
-    Caso libre (sin K) — delega en _run_comparison_cell(k_max=None). Para la
-    comparación por nivel de K, ver run_solver_comparison_by_k().
+    mundo = (loads [D, N, N], rate [D, N, N]) con el día 0 = día de salida (sample_world) o
+    el stack histórico completo con start_day_idx. Devuelve (margen, ruta); (nan, None) si
+    no hay ruta factible.
     """
-    results   = []
-    times_acc = {k: [] for k in _TIMING_KEYS}
-    num_days  = rate_stack.shape[0]
-
-    rng = np.random.default_rng(SEED)
-    if n_days_per_node > num_days:
-        raise ValueError(
-            f"n_days_per_node={n_days_per_node} excede num_days={num_days} disponibles"
-        )
-    day_indices = np.array([
-        rng.choice(num_days, size=n_days_per_node, replace=False)
-        for _ in range(num_nodes)
-    ])
-
-    time_matrix_np = np.array(time_matrix, dtype=float)
-
-    print("\n--- Solver Comparison (eval set) ---")
-    print(f"Eval days: {num_days} | absolute range: [{TRAIN_DAYS}, {TRAIN_DAYS + num_days - 1}]")
-    print(f"Day assignments per node: {day_indices.tolist()}\n")
-
-    for s in range(num_nodes):
-        for rep in range(n_days_per_node):
-            day_idx     = int(day_indices[s, rep])
-            abs_day_idx = TRAIN_DAYS + day_idx
-            print(f"\nStart node {s}/{num_nodes-1} | rep {rep}/{n_days_per_node-1} | eval day {day_idx} (abs day {abs_day_idx})", flush=True)
-            row = {'Start Node': s, 'Rep': rep, 'Eval Day Index': day_idx, 'Abs Day Index': abs_day_idx}
-
-            cell_row, cell_times = _run_comparison_cell(
-                agent, s, day_idx, rep,
-                time_matrix, time_matrix_np,
-                rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
-                ltr_stack, trucks_stack, critic,
-                k_max=None, verbose=True,
-                avail_expected_arr=avail_expected_arr,
-            )
-            row.update(cell_row)
-            for key, val in cell_times.items():
-                times_acc[key].append(val)
-
-            results.append(row)
-
-    df = pd.DataFrame(results)
-
-    timing = {
-        'drl_real_times':           times_acc['drl_real'],
-        'drl_det_times':            times_acc['drl_det'],
-        'hga_lns_times':            times_acc['hga_lns'],
-        'ls_exact_times':           times_acc['ls_exact'],
-        'rh_greedy_times':          times_acc['rh_greedy'],
-        'rh_lookahead_times':       times_acc['rh_lookahead'],
-        'rh_stoch_times':           times_acc['rh_stoch'],
-        'rh_lookahead_stoch_times': times_acc['rh_lookahead_stoch'],
-        'mc_rollout_times':         times_acc['mc_rollout'],
-        'ls_oracle_times':          times_acc['ls_oracle'],
-    }
-    return df, timing
+    loads, rates = mundo
+    _, ruta, reward, _ = solve_label_setting_oracle(
+        start_node, np.asarray(time_matrix, dtype=float), rates, loads,
+        distance_arr, diesel_arr, MAX_DURATION, num_nodes,
+        start_day_idx=start_day_idx, k_max=K, dominancia=False,
+    )
+    return (float(reward), ruta) if ruta is not None else (float("nan"), None)
 
 
-def run_solver_comparison_by_k(agent, time_matrix,
-                                rate_stack, loads_stack, distance_arr, diesel_arr,
-                                num_nodes,
-                                k_levels=None,
-                                ltr_stack=None, trucks_stack=None,
-                                n_days_per_node=1, critic=None,
-                                avail_expected_arr=None):
-    """Como run_solver_comparison, pero repite la comparación completa (DRL +
-    los 8 solvers baseline) para cada nivel de K en k_levels, añadiendo una
-    columna 'K' a cada fila resultante — permite comparar el gap DRL-vs-
-    oráculo (y vs. el resto de baselines) bajo presupuesto de cardinalidad
-    restringido, no solo en el caso libre.
+def _etiqueta_k(K) -> str:
+    return "libre" if K is None else str(int(K))
 
-    k_levels por defecto es K_LEVELS (config.py: [K_MAX], un solo nivel — la
-    restricción real de negocio) — el caso libre ya lo cubre
-    run_solver_comparison, así que no se repite aquí.
 
-    n_days_per_node por defecto es 1 (no 3 como en run_solver_comparison):
-    el costo ya se multiplica por len(k_levels) sobre solvers que incluyen
-    HGA-LNS y LS-Exact/LS-Oracle (estos dos con time_limit_seconds=300 cada
-    uno), así que se mantiene bajo por defecto para que el sweep sea tratable.
+def _asignacion_balanceada(n_valores: int, M: int, rng) -> np.ndarray:
+    """M valores en [0, n_valores) donde cada uno aparece ⌊M/n⌋ o ⌈M/n⌉ veces, en orden aleatorio."""
+    base = np.tile(np.arange(n_valores), -(-M // n_valores))[:M]
+    return rng.permutation(base)
 
-    Función opt-in: NO se llama automáticamente desde main.py. Se invoca
-    aparte cuando se quiera la comparación por K.
+
+def disenar_mundos(num_nodes: int, M: int, market, num_dias: int = TRAIN_DAYS,
+                   semilla: int = MARKET_SEED_EVAL) -> dict:
+    """Diseño de M mundos de evaluación a partir de MARKET_SEED_EVAL.
+
+    Cada nodo aparece ⌊M/N⌋ o ⌈M/N⌉ veces y cada día de la semana ⌊M/7⌋ o ⌈M/7⌉ veces; los
+    dos se barajan por separado, así que el día no queda atado al nodo. start_day_idx es un
+    día del histórico (de los `num_dias` primeros) con ese día de la semana.
     """
-    if k_levels is None:
-        k_levels = K_LEVELS
+    rng = np.random.default_rng(semilla)
+    nodos = _asignacion_balanceada(num_nodes, M, rng)
+    dows = _asignacion_balanceada(7, M, rng)
+    dias = np.arange(num_dias)
+    dow_dia = market.dia_semana(dias)
+    inicio = np.array([rng.choice(dias[dow_dia == d]) for d in dows], dtype=np.int64)
+    semillas = rng.integers(0, 2**31 - 1, size=M, dtype=np.int64)
+    return dict(nodo=nodos.astype(np.int64), dow=dows.astype(np.int64),
+                start_day=inicio, world_seed=semillas)
 
-    results   = []
-    times_acc = {k: [] for k in _TIMING_KEYS}
-    num_days  = rate_stack.shape[0]
 
-    rng = np.random.default_rng(SEED)
-    if n_days_per_node > num_days:
-        raise ValueError(
-            f"n_days_per_node={n_days_per_node} excede num_days={num_days} disponibles"
-        )
-    day_indices = np.array([
-        rng.choice(num_days, size=n_days_per_node, replace=False)
-        for _ in range(num_nodes)
-    ])
-
-    time_matrix_np = np.array(time_matrix, dtype=float)
-
-    print("\n--- Solver Comparison by K (eval set) ---")
-    print(f"K levels: {list(k_levels)}")
-    print(f"Eval days: {num_days} | absolute range: [{TRAIN_DAYS}, {TRAIN_DAYS + num_days - 1}]")
-    print(f"Day assignments per node: {day_indices.tolist()}\n")
-
-    for k_max in k_levels:
-        for s in range(num_nodes):
-            for rep in range(n_days_per_node):
-                day_idx     = int(day_indices[s, rep])
-                abs_day_idx = TRAIN_DAYS + day_idx
-                print(
-                    f"\nK={k_max} | Start node {s}/{num_nodes-1} | rep {rep}/{n_days_per_node-1} "
-                    f"| eval day {day_idx} (abs day {abs_day_idx})", flush=True,
-                )
-                row = {
-                    'K': k_max, 'Start Node': s, 'Rep': rep,
-                    'Eval Day Index': day_idx, 'Abs Day Index': abs_day_idx,
-                }
-
-                cell_row, cell_times = _run_comparison_cell(
-                    agent, s, day_idx, rep,
-                    time_matrix, time_matrix_np,
-                    rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
-                    ltr_stack, trucks_stack, critic,
-                    k_max=k_max, verbose=True,
-                    avail_expected_arr=avail_expected_arr,
-                )
-                row.update(cell_row)
-                for key, val in cell_times.items():
-                    times_acc[key].append(val)
-
-                results.append(row)
-
-    df = pd.DataFrame(results)
-
-    timing = {
-        'drl_real_times':           times_acc['drl_real'],
-        'drl_det_times':            times_acc['drl_det'],
-        'hga_lns_times':            times_acc['hga_lns'],
-        'ls_exact_times':           times_acc['ls_exact'],
-        'rh_greedy_times':          times_acc['rh_greedy'],
-        'rh_lookahead_times':       times_acc['rh_lookahead'],
-        'rh_stoch_times':           times_acc['rh_stoch'],
-        'rh_lookahead_stoch_times': times_acc['rh_lookahead_stoch'],
-        'mc_rollout_times':         times_acc['mc_rollout'],
-        'ls_oracle_times':          times_acc['ls_oracle'],
+def _fila(modo, K, mundo, nodo, dia_abs, start_day, world_seed, dow, metodo, m, ub_dp, ub_pi_val) -> dict:
+    return {
+        "modo": modo, "K": _etiqueta_k(K), "mundo": mundo, "nodo_inicio": int(nodo),
+        "dia_abs": int(dia_abs), "start_day_idx": int(start_day),
+        "dia_semana": int(dow), "world_seed": -1 if world_seed is None else int(world_seed),
+        "metodo": metodo, "margen": m["margen"], "violacion": m["violacion"],
+        "frac_millas_cargadas": m["frac_millas_cargadas"], "n_cargas": m["n_cargas"],
+        "duracion": m["duracion"], "ms_decision": m["ms_decision"], "ruta": m["ruta"],
+        "ub_dp": ub_dp, "ub_pi": ub_pi_val,
     }
-    return df, timing
+
+
+def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, loads_train,
+                             distance_arr, diesel_arr, num_nodes, ltr_stack, trucks_stack,
+                             avail_expected_arr, reward_global_p95,
+                             M=MARKET_M_EVAL_WORLDS, k_levels=(K_MAX, None), verbose=True) -> pd.DataFrame:
+    """DRL, B1, B2 (solo K finito) y B3 sobre los mismos M mundos simulados, por nivel de K.
+
+    Los mismos mundos (nodo, día, world_seed) se usan en todos los niveles de K. Devuelve un
+    DataFrame largo: una fila por (K, mundo, método) con el margen en USD, la factibilidad,
+    las métricas operativas y las cotas ub_dp / ub_pi del mundo.
+    """
+    ctx = ContextoEval(agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
+                       ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95)
+    env = make_sim_env(time_matrix, rate_train, loads_train, distance_arr, diesel_arr, num_nodes, market)
+    dis = disenar_mundos(num_nodes, M, market, num_dias=rate_train.shape[0])
+    filas = []
+    with _UnHilo():
+        # Calentamiento de torch (primera llamada) fuera de la medición.
+        _ejecutar_drl(ctx, env, int(dis["nodo"][0]), int(dis["start_day"][0]), k_levels[0],
+                      int(dis["world_seed"][0]), int(dis["dow"][0]))
+        for m in range(M):
+            nodo, dow = int(dis["nodo"][m]), int(dis["dow"][m])
+            dia, ws = int(dis["start_day"][m]), int(dis["world_seed"][m])
+            mundo_pi = market.sample_world(ws, _DIAS_SIMULADOS_UB_PI, dia)    # solo para UB-PI
+            for K in k_levels:
+                pi, _ = ub_pi(market, time_matrix, distance_arr, diesel_arr, num_nodes, nodo, K, mundo_pi)
+                dp = tabla.ub_dp(nodo, dow, K) if (K is None or 2 <= K <= tabla.K) else float("nan")
+                for nombre in _METODOS:
+                    if nombre == "B2" and K is None:
+                        continue                                       # B2 solo con K finito
+                    if nombre == "DRL":
+                        res = _ejecutar_drl(ctx, env, nodo, dia, K, ws, dow)
+                    else:
+                        res = ejecutar_politica(ctx.politicas[nombre], env, nodo, dia, K, ws,
+                                                distance_arr, diesel_arr, dow)
+                    filas.append(_fila("simulado", K, m, nodo, dia, dia, ws, dow, nombre, res, dp, pi))
+            if verbose and (m + 1) % 10 == 0:
+                print(f"  mundos simulados: {m + 1}/{M}", flush=True)
+    df = pd.DataFrame(filas)
+    _avisar_si_supera_cota(df)
+    return df
+
+
+def casos_replay(num_nodes: int, num_dias: int, max_casos: int = REPLAY_MAX_CASOS,
+                 semilla: int = MARKET_SEED_EVAL + 1) -> tuple:
+    """Pares (nodo, día de evaluación): todos si caben en `max_casos`; si no, un subconjunto
+    balanceado (cada nodo y cada día aparecen ⌊·⌋ o ⌈·⌉ veces, barajados por separado)."""
+    if num_nodes * num_dias <= max_casos:
+        nodos, dias = np.meshgrid(np.arange(num_nodes), np.arange(num_dias), indexing="ij")
+        return nodos.ravel(), dias.ravel()
+    rng = np.random.default_rng(semilla)
+    return (_asignacion_balanceada(num_nodes, max_casos, rng),
+            _asignacion_balanceada(num_dias, max_casos, rng))
+
+
+def evaluar_replay(agent, market, tabla, time_matrix, rate_eval, loads_eval,
+                   distance_arr, diesel_arr, num_nodes, ltr_eval, trucks_eval,
+                   avail_expected_arr, reward_global_p95,
+                   k_levels=(K_MAX, None), max_casos=REPLAY_MAX_CASOS, verbose=True) -> pd.DataFrame:
+    """El mismo arnés con market_process=None sobre los días reales de evaluación (días 90-119).
+
+    Descriptivo: replay, no independiente del simulador (el proceso se ajustó con los 120
+    días). ltr_eval / trucks_eval deben estar recortados a los mismos días que rate_eval.
+    UB-PI se resuelve sobre el histórico; UB-DP no aplica (es una cota del proceso).
+    """
+    ctx = ContextoEval(agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
+                       ltr_eval, trucks_eval, avail_expected_arr, reward_global_p95)
+    env = make_replay_env(time_matrix, rate_eval, loads_eval, distance_arr, diesel_arr, num_nodes,
+                          day_offset=TRAIN_DAYS)
+    nodos, dias = casos_replay(num_nodes, rate_eval.shape[0], max_casos)
+    filas = []
+    with _UnHilo():
+        for c, (nodo, dia) in enumerate(zip(nodos, dias)):
+            nodo, dia = int(nodo), int(dia)
+            dow = int(market.dia_semana(TRAIN_DAYS + dia))
+            for K in k_levels:
+                pi, _ = ub_pi(market, time_matrix, distance_arr, diesel_arr, num_nodes, nodo, K,
+                              (loads_eval, rate_eval), start_day_idx=dia)
+                for nombre in _METODOS:
+                    if nombre == "B2" and K is None:
+                        continue
+                    if nombre == "DRL":
+                        res = _ejecutar_drl(ctx, env, nodo, dia, K, None, dow, loads_eval, rate_eval)
+                    else:
+                        res = ejecutar_politica(ctx.politicas[nombre], env, nodo, dia, K, None,
+                                                distance_arr, diesel_arr, dow, loads_eval, rate_eval)
+                    filas.append(_fila("replay", K, c, nodo, TRAIN_DAYS + dia, dia, None, dow,
+                                       nombre, res, float("nan"), pi))
+            if verbose and (c + 1) % 50 == 0:
+                print(f"  replay: {c + 1}/{len(nodos)}", flush=True)
+    df = pd.DataFrame(filas)
+    _avisar_si_supera_cota(df)
+    return df
+
+
+def _avisar_si_supera_cota(df: pd.DataFrame, tol: float = 1e-6) -> None:
+    """UB-PI debe ser ≥ el margen de toda política con ruta factible, mundo a mundo."""
+    ok = ~df["violacion"] & df["ub_pi"].notna()
+    malos = df[ok & (df["margen"] > df["ub_pi"] + tol)]
+    if len(malos):
+        print(f"  ⚠ {len(malos)} filas con margen > UB-PI (p. ej. {malos.iloc[0]['metodo']} "
+              f"mundo {malos.iloc[0]['mundo']} K={malos.iloc[0]['K']}): revisar alineación del oráculo.")
+
+
+# ── Resumen ───────────────────────────────────────────────────
+
+def resumen_metodos(df: pd.DataFrame) -> pd.DataFrame:
+    """Margen medio, gaps contra UB-DP y UB-PI y métricas operativas, por (modo, K, método).
+
+    Los gaps comparan promedios sobre los mismos mundos: (UB − método) / |UB| · 100.
+    margen_medio va con su IC del 95 % por bootstrap sobre mundos (BOOTSTRAP_B remuestreos,
+    semilla fija): margen_ic95_low / margen_ic95_high. Cada grupo (modo, K, método) usa su
+    propio Generator con la semilla fija, así que el IC no depende del orden de las filas.
+    Se añaden las filas de las cotas (UB-PI, UB-DP) con su valor medio, siempre separadas:
+    nunca se combinan ni se promedian. La columna `nota` marca los K donde UB-DP > UB-PI
+    (cota DP floja: no es la referencia principal ahí).
+    """
+    filas = []
+    for (modo, K), g in df.groupby(["modo", "K"], sort=False):
+        mundos = g.drop_duplicates("mundo")
+        nota = NOTA_UB_DP_FLOJA if ub_dp_floja(mundos["ub_dp"], mundos["ub_pi"]) else None
+        for metodo in [m for m in _METODOS if m in set(g["metodo"])]:
+            gm = g[g["metodo"] == metodo]
+            ic = ic_bootstrap_media(gm["margen"])
+            filas.append({
+                "modo": modo, "K": K, "metodo": metodo, "n_mundos": len(gm),
+                "margen_medio": gm["margen"].mean(),
+                "margen_ic95_low": ic[0], "margen_ic95_high": ic[1],
+                "gap_ub_dp_pct": gap_pct(gm["ub_dp"], gm["margen"]),
+                "gap_ub_pi_pct": gap_pct(gm["ub_pi"], gm["margen"]),
+                "violacion_pct": 100.0 * gm["violacion"].mean(),
+                "millas_cargadas_pct": 100.0 * gm["frac_millas_cargadas"].mean(),
+                "cargas_medias": gm["n_cargas"].mean(),
+                "duracion_media_h": gm["duracion"].mean(),
+                "ms_por_decision": gm["ms_decision"].mean(),
+                "nota": nota,
+            })
+        for nombre, col in (("UB-PI", "ub_pi"), ("UB-DP", "ub_dp")):
+            if mundos[col].notna().any():
+                ic = ic_bootstrap_media(mundos[col])
+                filas.append({"modo": modo, "K": K, "metodo": nombre, "n_mundos": int(mundos[col].notna().sum()),
+                              "margen_medio": mundos[col].mean(),
+                              "margen_ic95_low": ic[0], "margen_ic95_high": ic[1],
+                              "nota": nota if col == "ub_dp" else None})
+    return pd.DataFrame(filas)
 
 
 # ── Output ────────────────────────────────────────────────────
-def save_results(results_df, summary_rows, output_path):
+def save_results(sim_df, replay_df, resumen_rows, output_path):
     from excel_report import build_formatted_excel
-    build_formatted_excel(results_df, summary_rows, output_path)
+    build_formatted_excel(sim_df, replay_df, resumen_rows, output_path)
     print(f"Results saved → {output_path}")
 
 
@@ -599,7 +571,7 @@ def plot_ppo_diagnostics(training_log: list, num_nodes: int, output_path: str):
         print(f"Warning: could not generate PPO diagnostics plot: {e}")
 
 
-def plot_diagnostics(episode_rewards, episode_losses, results_df,
+def plot_diagnostics(episode_rewards, episode_losses, sim_df,
                      num_nodes, output_path):
     try:
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -622,41 +594,27 @@ def plot_diagnostics(episode_rewards, episode_losses, results_df,
         ax2.set_xlabel('Episode'); ax2.set_ylabel('Loss')
         ax2.grid(True, alpha=0.3)
 
-        ax3 = axes[1, 0]
-        nodes = list(range(num_nodes))
-        drl_det_r = [
-            results_df.loc[(results_df['Start Node'] == n) & results_df['DRL Det Valid'], 'DRL Det Reward'].mean()
-            if 'DRL Det Valid' in results_df.columns
-            and results_df.loc[results_df['Start Node'] == n, 'DRL Det Valid'].any()
-            else 0
-            for n in nodes
-        ]
-        hga_r = [
-            results_df.loc[(results_df['Start Node'] == n) & results_df['HGA-LNS Valid'], 'HGA-LNS Reward'].mean()
-            if results_df.loc[results_df['Start Node'] == n, 'HGA-LNS Valid'].any()
-            else 0
-            for n in nodes
-        ]
-        x     = np.arange(num_nodes); w = 0.35
-        ax3.bar(x - w/2, hga_r,     w, label='HGA-LNS', color='forestgreen', alpha=0.8)
-        ax3.bar(x + w/2, drl_det_r, w, label='DRL Det',  color='steelblue',   alpha=0.8)
-        ax3.set_title('DRL Det vs HGA-LNS per start node')
-        ax3.set_xlabel('Start node'); ax3.set_ylabel('Reward')
-        ax3.set_xticks(x); ax3.legend(); ax3.grid(True, alpha=0.3)
+        # Margen medio por nodo de inicio (primer nivel de K de los mundos simulados).
+        k0 = sim_df['K'].iloc[0]
+        g = sim_df[sim_df['K'] == k0]
+        x = np.arange(num_nodes); w = 0.35
 
-        ax4 = axes[1, 1]
-        drl_real_r = [
-            results_df.loc[(results_df['Start Node'] == n) & results_df['DRL Real Valid'], 'DRL Real Reward'].mean()
-            if 'DRL Real Valid' in results_df.columns
-            and results_df.loc[results_df['Start Node'] == n, 'DRL Real Valid'].any()
-            else 0
-            for n in nodes
-        ]
-        ax4.bar(x - w/2, drl_real_r, w, label='DRL Real', color='coral',     alpha=0.8)
-        ax4.bar(x + w/2, drl_det_r,  w, label='DRL Det',  color='steelblue', alpha=0.8)
-        ax4.set_title('DRL Real vs DRL Det per start node')
-        ax4.set_xlabel('Start node'); ax4.set_ylabel('Reward')
-        ax4.set_xticks(x); ax4.legend(); ax4.grid(True, alpha=0.3)
+        def _por_nodo(col, metodo=None):
+            d = g if metodo is None else g[g['metodo'] == metodo]
+            if metodo is None:
+                d = d.drop_duplicates('mundo')
+            return d.groupby('nodo_inicio')[col].mean().reindex(range(num_nodes)).fillna(0).to_numpy()
+
+        drl = _por_nodo('margen', 'DRL')
+        for ax, (label, vals, color) in zip(
+            (axes[1, 0], axes[1, 1]),
+            (('UB-PI', _por_nodo('ub_pi'), 'forestgreen'), ('B3', _por_nodo('margen', 'B3'), 'steelblue')),
+        ):
+            ax.bar(x - w/2, vals, w, label=label, color=color, alpha=0.8)
+            ax.bar(x + w/2, drl,  w, label='DRL',  color='coral', alpha=0.8)
+            ax.set_title(f'DRL vs {label} por nodo de inicio (K={k0}, mundos simulados)')
+            ax.set_xlabel('Start node'); ax.set_ylabel('Margen (USD)')
+            ax.set_xticks(x); ax.legend(); ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
         plt.savefig(output_path, dpi=150)

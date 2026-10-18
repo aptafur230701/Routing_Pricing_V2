@@ -5,8 +5,8 @@ Entry point for the AM-PPO pipeline.
 
   1. Load data          (problem_data.py)
   2. Training           (am_training.py)
-  3. Evaluation         (evaluation.py)
-  4. Save results       (evaluation.py)
+  3. Evaluation         (evaluation.py: mundos simulados + replay; baselines B1-B3, UB-PI, UB-DP)
+  4. Save results       (evaluation.py, excel_report.py, stats_analysis.py)
 
 Uso
 ---
@@ -38,10 +38,13 @@ from config import (
     AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF,
 )
 from problem_data import load_matrices
+from dp_relajada import cargar_o_calcular_tabla
 from evaluation import (
-    run_solver_comparison, save_results, plot_diagnostics, plot_ppo_diagnostics,
+    evaluar_mundos_simulados, evaluar_replay, resumen_metodos,
+    save_results, plot_diagnostics, plot_ppo_diagnostics,
 )
-from stats_analysis import append_stats_sheets_to_excel
+from market_process import MarketProcess, asegurar_parametros
+from stats_analysis import append_stats_sheets_to_excel, NOTA_REPLAY
 from transfer_learning import build_agent_for_training, load_checkpoint_compatible
 
 
@@ -59,7 +62,7 @@ def _run_am(
     pretrained_agent=None, pretrained_critic=None,
     ltr_stack=None, trucks_stack=None,
     reward_global_p95=1.0, avail_expected_arr=None,
-    market_process=None,
+    market_process=None, best_checkpoint_path=None,
 ):
     """Pipeline AM: entrenamiento PPO → checkpoint.
 
@@ -85,6 +88,7 @@ def _run_am(
         reward_global_p95=reward_global_p95,
         avail_expected_arr=avail_expected_arr,
         market_process=market_process,
+        best_checkpoint_path=best_checkpoint_path,
     )
     train_time = time.time() - t0
     print(f"Training time: {train_time:.1f} s")
@@ -96,7 +100,13 @@ def _run_am(
     return agent_am, critic, ep_rewards, ep_losses, train_time, training_log
 
 
-def _load_agent(checkpoint_dir: str, num_nodes: int) -> tuple:
+def _checkpoint_path(checkpoint_dir: str, num_nodes: int, best: bool = False) -> str:
+    """Último update (am_checkpoint_<N>nodes.pt) o mejor update de validación (..._best.pt)."""
+    sufijo = "_best" if best else ""
+    return os.path.join(checkpoint_dir, f"am_checkpoint_{num_nodes}nodes{sufijo}.pt")
+
+
+def _load_agent(checkpoint_dir: str, num_nodes: int, best: bool = False) -> tuple:
     """Carga agente + critic entrenados desde checkpoint sin reentrenar.
 
     Usa load_checkpoint_compatible (transfer_learning.py) en vez de un
@@ -104,7 +114,7 @@ def _load_agent(checkpoint_dir: str, num_nodes: int) -> tuple:
     condicionamiento en K (expansión en cero de context_net.proj), y es idéntico a un load estricto para
     checkpoints ya compatibles con la arquitectura actual.
     """
-    path = os.path.join(checkpoint_dir, f"am_checkpoint_{num_nodes}nodes.pt")
+    path = _checkpoint_path(checkpoint_dir, num_nodes, best)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint no encontrado: {path}")
     agent, critic = load_checkpoint_compatible(
@@ -121,152 +131,75 @@ def _evaluate_and_report(
     distance_arr, diesel_arr, ep_rewards, ep_losses,
     train_time, summary_rows, cwd, label,
     ltr_stack=None, trucks_stack=None,
-    n_days_per_node=1, critic=None, avail_expected_arr=None,
+    avail_expected_arr=None, reward_global_p95=1.0, market_process=None,
 ):
-    """Comparación de solvers + resumen + guardado de archivos."""
-    results_df, timing = run_solver_comparison(
-        agent, time_matrix,
-        rate_stack, loads_stack, distance_arr, diesel_arr,
-        NUM_NODES,
-        ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-        n_days_per_node=n_days_per_node,
-        critic=critic,
-        avail_expected_arr=avail_expected_arr,
+    """Evaluación en mundos simulados y replay + resumen + guardado de archivos.
+
+    Mundos simulados: DRL, B1, B2 (K finito) y B3 sobre M mundos por nivel de K, con UB-PI y
+    UB-DP. Replay: el mismo arnés sobre los días reales de evaluación (TRAIN_DAYS en adelante),
+    descriptivo y no independiente del simulador.
+    """
+    tabla = cargar_o_calcular_tabla(market_process, time_matrix, distance_arr, diesel_arr)
+
+    print("\n--- Evaluación en mundos simulados ---")
+    sim_df = evaluar_mundos_simulados(
+        agent, market_process, tabla, time_matrix,
+        rate_stack[:TRAIN_DAYS], loads_stack[:TRAIN_DAYS], distance_arr, diesel_arr, NUM_NODES,
+        ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95,
     )
-
-    def avg_valid(col, valid_col):
-        mask = results_df[valid_col]
-        return results_df.loc[mask, col].mean() if mask.any() else float("nan")
-
-    def _gap_stats(series):
-        if len(series) > 0:
-            return series.mean(), series.max()
-        return float("nan"), float("nan")
-
-    both_valid = results_df["DRL Det Valid"] & results_df["DRL Real Valid"]
-    real_vs_det_series = results_df.loc[both_valid].apply(
-        lambda r: (r["DRL Det Reward"] - r["DRL Real Reward"]) / abs(r["DRL Det Reward"]) * 100
-        if r["DRL Det Reward"] != 0 else float("nan"), axis=1
-    ).dropna()
-    real_vs_det_avg, _ = _gap_stats(real_vs_det_series)
-
-    drl_vs_rh_stoch_valid = results_df["DRL Real Valid"] & results_df["RH-Greedy Real Valid"]
-    _m_drl_rh  = results_df.loc[drl_vs_rh_stoch_valid, "DRL Real Reward"].mean()
-    _m_rh      = results_df.loc[drl_vs_rh_stoch_valid, "RH-Greedy Real Reward"].mean()
-    drl_vs_rh_stoch_avg = (_m_drl_rh - _m_rh) / abs(_m_rh) * 100 if _m_rh != 0 else float("nan")
-
-    drl_vs_rhlr_valid = results_df["DRL Real Valid"] & results_df["RH-Lookahead Real Valid"]
-    _m_drl_rhlr = results_df.loc[drl_vs_rhlr_valid, "DRL Real Reward"].mean()
-    _m_rhlr     = results_df.loc[drl_vs_rhlr_valid, "RH-Lookahead Real Reward"].mean()
-    drl_vs_rhlr_avg = (_m_drl_rhlr - _m_rhlr) / abs(_m_rhlr) * 100 if _m_rhlr != 0 else float("nan")
-
-    drl_vs_mc_valid = results_df["DRL Real Valid"] & results_df["MC-Rollout Valid"]
-    _m_drl_mc = results_df.loc[drl_vs_mc_valid, "DRL Real Reward"].mean()
-    _m_mc     = results_df.loc[drl_vs_mc_valid, "MC-Rollout Reward"].mean()
-    drl_vs_mc_avg = (_m_drl_mc - _m_mc) / abs(_m_mc) * 100 if _m_mc != 0 else float("nan")
-
-    drl_both_ms = np.mean(timing["drl_det_times"] + timing["drl_real_times"]) * 1000
-
-    ls_drl_det_valid = results_df["LS-Exact Valid"] & results_df["DRL Det Valid"]
-    drl_det_gap_series = results_df.loc[ls_drl_det_valid].apply(
-        lambda r: (r["LS-Exact Reward"] - r["DRL Det Reward"]) / abs(r["LS-Exact Reward"]) * 100
-        if r["LS-Exact Reward"] != 0 else float("nan"), axis=1
-    ).dropna()
-    drl_det_avg_gap, _ = _gap_stats(drl_det_gap_series)
-
-    ls_oracle_drl_real_valid = results_df["LS-Oracle Valid"] & results_df["DRL Real Valid"]
-    drl_real_gap_series = results_df.loc[ls_oracle_drl_real_valid].apply(
-        lambda r: (r["LS-Oracle Reward"] - r["DRL Real Reward"]) / abs(r["LS-Oracle Reward"]) * 100
-        if r["LS-Oracle Reward"] != 0 else float("nan"), axis=1
-    ).dropna()
-    drl_real_avg_gap, _ = _gap_stats(drl_real_gap_series)
+    print("\n--- Replay de los días reales de evaluación ---")
+    replay_df = evaluar_replay(
+        agent, market_process, tabla, time_matrix,
+        rate_stack[TRAIN_DAYS:], loads_stack[TRAIN_DAYS:], distance_arr, diesel_arr, NUM_NODES,
+        ltr_stack[:, TRAIN_DAYS:], trucks_stack[:, TRAIN_DAYS:], avail_expected_arr, reward_global_p95,
+    )
 
     print(f"\n{'='*60}")
     print(f"  SUMMARY — {NUM_NODES} nodes  [{label}]")
     print(f"{'='*60}")
-    print(f"\n  Bloque 1 — Mundo determinista (comparación principal)")
-    print(f"  LS-Exact avg reward    : {avg_valid('LS-Exact Reward', 'LS-Exact Valid'):>10.1f}")
-    print(f"  DRL Det avg reward     : {avg_valid('DRL Det Reward', 'DRL Det Valid'):>10.1f}  | gap vs LS-Exact: avg ~{drl_det_avg_gap:.1f}%")
-    print(f"  HGA-LNS avg reward     : {avg_valid('HGA-LNS Reward', 'HGA-LNS Valid'):>10.1f}")
-    print(f"  RH-Greedy avg reward   : {avg_valid('RH-Greedy Reward', 'RH-Greedy Valid'):>10.1f}")
-    print(f"  RH-Lookahead avg reward: {avg_valid('RH-Lookahead Reward', 'RH-Lookahead Valid'):>10.1f}")
-    print(f"\n  Bloque 2 — Costo de ejecución estocástica")
-    print(f"  LS-Oracle avg reward (cota clarividente): {avg_valid('LS-Oracle Reward', 'LS-Oracle Valid'):>10.1f}")
-    print(f"  DRL Real avg reward      : {avg_valid('DRL Real Reward', 'DRL Real Valid'):>10.1f}  | gap vs DRL Det: avg ~{real_vs_det_avg:.1f}%  | gap vs LS-Oracle: avg ~{drl_real_avg_gap:.1f}%")
-    print(f"  RH-Greedy Real avg reward     : {avg_valid('RH-Greedy Real Reward', 'RH-Greedy Real Valid'):>10.1f}")
-    print(f"  RH-Lookahead Real avg reward  : {avg_valid('RH-Lookahead Real Reward', 'RH-Lookahead Real Valid'):>10.1f}")
-    print(f"  MC-Rollout avg reward        : {avg_valid('MC-Rollout Reward', 'MC-Rollout Valid'):>10.1f}")
-    print(f"  DRL Real advantage vs RH-Greedy Real:   avg ~{drl_vs_rh_stoch_avg:.1f}%")
-    print(f"  DRL Real advantage vs RH-Lookahead Real: avg ~{drl_vs_rhlr_avg:.1f}%")
-    print(f"  DRL Real advantage vs MC-Rollout:        avg ~{drl_vs_mc_avg:.1f}%")
-    print(f"\n  Bloque 3 — Tiempo de inferencia")
-    print(f"  DRL (Det+Real) : {drl_both_ms:>6.0f} ms")
-    print(f"  HGA-LNS        : {np.mean(timing['hga_lns_times'])*1000:>6.0f} ms")
-    print(f"  LS-Exact       : {np.mean(timing['ls_exact_times'])*1000:>6.0f} ms")
-    print(f"  RH-Greedy      : {np.mean(timing['rh_greedy_times'])*1000:>6.0f} ms")
-    print(f"  RH-Lookahead   : {np.mean(timing['rh_lookahead_times'])*1000:>6.0f} ms")
-    print(f"  RH-Greedy Real : {np.mean(timing['rh_stoch_times'])*1000:>6.0f} ms")
-    print(f"  RH-Lookahead Real: {np.mean(timing['rh_lookahead_stoch_times'])*1000:>6.0f} ms")
-    print(f"  MC-Rollout       : {np.mean(timing['mc_rollout_times'])*1000:>6.0f} ms")
-    print(f"  LS-Oracle      : {np.mean(timing['ls_oracle_times'])*1000:>6.0f} ms")
-    print(f"  Training time  : {train_time:.1f} s")
+    for titulo, df in (("Mundos simulados", sim_df), (f"Replay ({NOTA_REPLAY})", replay_df)):
+        print(f"\n  {titulo}")
+        with pd.option_context("display.width", 220, "display.max_columns", None):
+            print(resumen_metodos(df).to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+    print(f"\n  Entrenamiento del DRL        : {train_time:.1f} s")
+    print(f"  Tabla V de UB-DP             : {tabla.tiempo_calculo:.1f} s")
     print(f"{'='*60}")
 
-
     summary_rows.append({
-        "Model":                           label,
-        "Node Size":                       NUM_NODES,
-        "LS-Exact Avg Reward":             avg_valid("LS-Exact Reward", "LS-Exact Valid"),
-        "DRL Det Avg Reward":              avg_valid("DRL Det Reward", "DRL Det Valid"),
-        "DRL Det Gap vs LS-Exact (%)":     drl_det_avg_gap,
-        "DRL Real Avg Reward":             avg_valid("DRL Real Reward",  "DRL Real Valid"),
-        "LS-Oracle Avg Reward":            avg_valid("LS-Oracle Reward", "LS-Oracle Valid"),
-        "DRL Real Gap vs LS-Oracle (%)":   drl_real_avg_gap,
-        "LS-Oracle Avg Inference (ms)":    np.mean(timing["ls_oracle_times"]) * 1000,
-        "HGA-LNS Avg Reward":              avg_valid("HGA-LNS Reward",   "HGA-LNS Valid"),
-        "RH-Greedy Avg Reward":            avg_valid("RH-Greedy Reward",    "RH-Greedy Valid"),
-        "RH-Lookahead Avg Reward":         avg_valid("RH-Lookahead Reward", "RH-Lookahead Valid"),
-        "RH-Greedy Real Avg Reward":                    avg_valid("RH-Greedy Real Reward",    "RH-Greedy Real Valid"),
-        "RH-Lookahead Real Avg Reward":                 avg_valid("RH-Lookahead Real Reward", "RH-Lookahead Real Valid"),
-        "DRL Real Advantage vs RH-Greedy Real (%)":     drl_vs_rh_stoch_avg,
-        "DRL Real Advantage vs RH-Lookahead Real (%)":  drl_vs_rhlr_avg,
-        "DRL Training Time (s)":           train_time,
-        "DRL Real Avg Inference (ms)":     np.mean(timing["drl_real_times"]) * 1000,
-        "HGA-LNS Avg Inference (ms)":      np.mean(timing["hga_lns_times"])  * 1000,
-        "LS-Exact Avg Inference (ms)":     np.mean(timing["ls_exact_times"]) * 1000,
-        "RH-Greedy Avg Inference (ms)":    np.mean(timing["rh_greedy_times"]) * 1000,
-        "RH-Lookahead Avg Inference (ms)":              np.mean(timing["rh_lookahead_times"]) * 1000,
-        "RH-Lookahead Real Avg Inference (ms)":         np.mean(timing["rh_lookahead_stoch_times"]) * 1000,
-        "MC-Rollout Avg Reward":                         avg_valid("MC-Rollout Reward", "MC-Rollout Valid"),
-        "MC-Rollout Avg Inference (ms)":                 np.mean(timing["mc_rollout_times"]) * 1000,
-        "DRL Real Advantage vs MC-Rollout (%)":          drl_vs_mc_avg,
+        "Model":                  label,
+        "Node Size":              NUM_NODES,
+        "DRL Training Time (s)":  train_time,
+        "UB-DP Table Time (s)":   tabla.tiempo_calculo,
     })
 
     excel_path = os.path.join(cwd, f"DRL_Routing_Summary_{label}.xlsx")
     plot_path  = os.path.join(cwd, f"DRL_Training_Diagnostics_{label}.png")
 
-    save_results(results_df, summary_rows, excel_path)
-    append_stats_sheets_to_excel(excel_path, results_df)
+    save_results(sim_df, replay_df, summary_rows, excel_path)
+    append_stats_sheets_to_excel(excel_path, sim_df, replay_df)
     if ep_rewards:
-        plot_diagnostics(ep_rewards, ep_losses, results_df, NUM_NODES, plot_path)
+        plot_diagnostics(ep_rewards, ep_losses, sim_df, NUM_NODES, plot_path)
 
-    return results_df
+    return sim_df, replay_df
 
 
 def main():
     # ── Cambia estos valores según lo que quieras hacer ───────────────────────
-    NUM_NODES       = 10     # opciones: 10 · 20 · 35 · 50 · 75 · 100
+    NUM_NODES       = 35     # opciones: 10 · 20 · 35 · 50 · 75 · 100
     EVAL_ONLY       = False   # True: carga checkpoint y salta entrenamiento
     USE_TRANSFER    = True   # True: warm-start desde el checkpoint del tamaño anterior en
                               # NODE_SEQUENCE (requiere mismo AM_D_H/AM_N_LAYERS que la fuente).
                               # False: entrena desde pesos aleatorios con la arquitectura de config.py.
-    N_DAYS_PER_NODE = 3      # días de evaluación por nodo (1 = comportamiento original)
+    EVAL_BEST_CHECKPOINT = True  # True: evalúa el update con mejor margen en los mundos de validación
+                                 # (checkpoints/am_checkpoint_<N>nodes_best.pt, solo si se entrenó con el
+                                 # proceso exógeno); False: evalúa el último update. El checkpoint
+                                 # am_checkpoint_<N>nodes.pt (último) se guarda siempre, y es el que usa
+                                 # el transfer learning.
     USE_MARKET_PROCESS = True  # True: el entrenamiento sortea cargas y tarifas del proceso exógeno
                                 # (proceso_exogeno_cargas_tarifas.md) en vez de reproducir días del
-                                # histórico. Si datos/market_params.npz no existe, corre el ajuste.
-                                # False: comportamiento de siempre. La evaluación sigue siendo por
-                                # replay de los días de eval (la evaluación con mundos simulados
-                                # está aplazada hasta reformular los baselines).
+                                # histórico. False: entrena con días reales. La evaluación siempre
+                                # usa el proceso (mundos simulados) y además el replay de los días
+                                # de eval. Si datos/market_params.npz no existe, corre el ajuste.
     # ──────────────────────────────────────────────────────────────────────────
 
     cwd          = os.path.dirname(os.path.abspath(__file__))
@@ -288,22 +221,20 @@ def main():
     time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
         ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
 
-    # ── Proceso exógeno de cargas y tarifas (opcional) ───────────────────────
-    market_process = None
-    if USE_MARKET_PROCESS:
-        from market_process import MarketProcess, asegurar_parametros
-        asegurar_parametros()
-        market_process = MarketProcess(NUM_NODES)
+    # ── Proceso exógeno de cargas y tarifas ──────────────────────────────────
+    # La evaluación (UB-PI, UB-DP, B2, B3 y los mundos simulados) lo necesita siempre;
+    # el entrenamiento lo usa solo si USE_MARKET_PROCESS.
+    asegurar_parametros()
+    market_process = MarketProcess(NUM_NODES)
 
     # ── Train / eval split (temporal — el modelo no ve los días de eval) ──────
     rate_train  = rate_stack[:TRAIN_DAYS]
     loads_train = loads_stack[:TRAIN_DAYS]
-    rate_eval   = rate_stack[TRAIN_DAYS:]
-    loads_eval  = loads_stack[TRAIN_DAYS:]
 
 
     if EVAL_ONLY:
-        agent_am, critic  = _load_agent(checkpoint_dir, NUM_NODES)
+        usar_best = EVAL_BEST_CHECKPOINT and os.path.exists(_checkpoint_path(checkpoint_dir, NUM_NODES, True))
+        agent_am, critic  = _load_agent(checkpoint_dir, NUM_NODES, best=usar_best)
         ep_r, ep_l, t, training_log = [], [], 0.0, []
     else:
         agent_pretrained, critic_pretrained = build_agent_for_training(
@@ -317,8 +248,15 @@ def main():
             ltr_stack=ltr_stack, trucks_stack=trucks_stack,
             reward_global_p95=reward_global_p95,
             avail_expected_arr=avail_expected_arr,
-            market_process=market_process,
+            market_process=market_process if USE_MARKET_PROCESS else None,
+            best_checkpoint_path=_checkpoint_path(checkpoint_dir, NUM_NODES, True),
         )
+        best_path = _checkpoint_path(checkpoint_dir, NUM_NODES, True)
+        if EVAL_BEST_CHECKPOINT and USE_MARKET_PROCESS and os.path.exists(best_path):
+            print("Se evalúa el mejor update de validación (EVAL_BEST_CHECKPOINT).")
+            agent_am, critic = _load_agent(checkpoint_dir, NUM_NODES, best=True)
+        else:
+            print("Se evalúa el último update.")
         ppo_plot_path = os.path.join(output_dir, "PPO_Diagnostics_AM.png")
         plot_ppo_diagnostics(training_log, NUM_NODES, ppo_plot_path)
 
@@ -333,13 +271,13 @@ def main():
         print(f"training_log (Excel) guardado en: {tlog_xlsx_path}")
 
     _evaluate_and_report(
-        agent_am, NUM_NODES, time_matrix, rate_eval, loads_eval,
+        agent_am, NUM_NODES, time_matrix, rate_stack, loads_stack,
         distance_arr, diesel_arr, ep_r, ep_l, t,
         summary_rows, output_dir, label="AM",
         ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-        n_days_per_node=N_DAYS_PER_NODE,
-        critic=critic,
         avail_expected_arr=avail_expected_arr,
+        reward_global_p95=reward_global_p95,
+        market_process=market_process,
     )
 
     print(f"\nDone! Checkpoint guardado en: checkpoints/am_checkpoint_{NUM_NODES}nodes.pt")

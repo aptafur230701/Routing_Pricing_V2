@@ -103,7 +103,31 @@ MARKET_N_GRUPOS      = 4              # grupos de volumen h (cuartiles de mu_ij)
 MARKET_PARAMS_PATH   = "datos/market_params.npz"   # relativo a la raíz del proyecto
 MARKET_SEED_TRAIN    = 20260   # semilla de los mundos de entrenamiento
 MARKET_SEED_EVAL     = 777001  # semilla base de los mundos de evaluación (distinta de la de entrenamiento)
-MARKET_M_EVAL_WORLDS = 100     # M: nº de mundos de evaluación (Paso 6, aplazado; lo usa sample_world)
+MARKET_M_EVAL_WORLDS = 100     # M: nº de mundos de evaluación simulados por nivel de K
+
+# ── Validación durante el entrenamiento (mundos simulados) ───
+# Mundos fijos con semilla propia (distinta de entrenamiento y de MARKET_SEED_EVAL, para que el
+# reporte final no use mundos con los que se eligió el checkpoint). Se evalúa el greedy del
+# agente en ellos y se compara con B3 / UB-DP; el mejor update por margen se guarda aparte.
+MARKET_SEED_VAL = 777002
+VAL_CHECKS      = 60      # nº aproximado de chequeos de validación por entrenamiento
+
+
+def get_val_worlds(num_nodes: int) -> int:
+    """Mundos de validación: 200 hasta 35 nodos, 300 desde 50 (≥ 3 mundos por nodo de inicio)."""
+    return 200 if num_nodes < 50 else 300
+
+
+# ── Baselines (baselines_drl_ruteo_estocastico.md) ───────────
+# UB-DP / B3: programación dinámica sobre (hogar, día de salida, nodo, franja, k) sin la regla
+# de no revisitar. La tabla V se guarda en disco y se recarga si ya existe y coincide.
+UBDP_DT_HORAS   = 0.25    # paso de tiempo de la DP (franjas de 15 min; tiempos de viaje redondeados hacia abajo)
+UBDP_S          = 500     # sorteos de filas por par (nodo, día de la semana)
+UBDP_SEED       = 20261018   # semilla del Generator propio de la DP
+UBDP_TABLA_PATH = "datos/ubdp_tabla_{n}nodos.npz"   # relativo a la raíz del proyecto; {n} = nº de nodos
+REPLAY_MAX_CASOS = 300   # tope de casos (nodo, día) del replay por nivel de K; si hay más, se toma un subconjunto balanceado
+BOOTSTRAP_B     = 10000   # remuestreos del intervalo bootstrap de la diferencia pareada
+BOOTSTRAP_SEED  = 20261019
 
 # ── Device ───────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -120,33 +144,4 @@ def get_episodes_per_node(num_nodes: int) -> int:
     if num_nodes <= 50:  return 32000
     if num_nodes <= 75:  return 38000
     return 43000          # 100 nodos
-
-
-def get_beam_width_det(num_nodes: int) -> int:
-    """Beam width for inference, scaled by problem size.
-    Modelos pequeños necesitan más exploración en inferencia.
-    Modelos grandes tienen políticas más robustas y beam=1 es suficiente."""
-    if num_nodes <= 10: return 5    # modelo pequeño, necesita más exploración
-    if num_nodes <= 20: return 7   # validado empíricamente: gap bajó de ~20-29% a ~14-16% vs beam=5
-    if num_nodes <= 35: return 7   # balance costo/calidad
-    if num_nodes <= 50: return 8
-    if num_nodes <= 75: return 4
-    return 3                       # modelo grande, confiar en la política
-
-
-def get_beam_width_real(num_nodes: int) -> int:
-    """Beam width para evaluación estocástica (DRL Real).
-    Validado empíricamente sobre nodos con gap >20%: beam=20 satura
-    la mejora (beam=30 no produce cambios adicionales); beam=10-14
-    deja gap residual de exploración sin explotar."""
-    if num_nodes <= 10: return 10
-    if num_nodes <= 20: return 7
-    if num_nodes <= 35: return 7
-    if num_nodes <= 50: return 10
-    if num_nodes <= 75: return 6
-    return 5
-
-
-def get_beam_width(num_nodes: int) -> int:
-    return get_beam_width_det(num_nodes)
 

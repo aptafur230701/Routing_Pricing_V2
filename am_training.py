@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 
 from config import (
+    MARKET_SEED_VAL, VAL_CHECKS, get_val_worlds,
     MAX_DURATION,
     DEVICE,
     SEED,
@@ -40,16 +41,21 @@ from config import (
     MARKET_SEED_TRAIN,
 )
 from routing_env import VectorRoutingEnv
+from greedy_rollout import greedy_rollout
 from problem_data import build_rm_pen_stack
 from attention_encoder import (
     build_node_features_batch,
     build_temporal_features_batch,
     build_market_features_batch,
     build_budget_features_batch,
+    build_dow_features_batch,
+    N_DOW_FEATURES,
 )
 from am_agent import AMRoutingAgent
 from critic_head import CriticHead
 from debug_utils import check_tensor
+from dp_relajada import cargar_o_calcular_tabla, PoliticaB3
+from evaluation import disenar_mundos, ejecutar_politica
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,6 +107,7 @@ class RolloutBuffer:
         self.temporal_feats = []  # list of np.ndarray (3,)
         self.market_feats  = []   # list of np.ndarray (1,)
         self.budget_feats  = []   # list of np.ndarray (2,)
+        self.dow_feats     = []   # list of np.ndarray (7,)
         self.current_nodes = []   # list of int
         self.masks         = []   # list of np.ndarray (N,) int8
         self.actions       = []   # list of int
@@ -130,6 +137,7 @@ class RolloutBuffer:
         done:          bool,
         market_feats:  np.ndarray = None,   # (1,)
         budget_feats:  np.ndarray = None,   # (2,)
+        dow_feats:     np.ndarray = None,   # (7,)
     ):
         self.node_feats.append(node_feats)
         self.temporal_feats.append(temporal)
@@ -137,6 +145,8 @@ class RolloutBuffer:
                                  else np.zeros(1, dtype=np.float32))
         self.budget_feats.append(budget_feats if budget_feats is not None
                                  else np.array([1.0, 0.0], dtype=np.float32))
+        self.dow_feats.append(dow_feats if dow_feats is not None
+                              else np.zeros(N_DOW_FEATURES, dtype=np.float32))
         self.current_nodes.append(current_node)
         self.masks.append(mask)
         self.actions.append(action)
@@ -214,6 +224,7 @@ def _forward(
     actions_t:      torch.Tensor = None,   # (B,) int64 — None en recolección
     market_feats_t: torch.Tensor = None,   # (B, 1)
     budget_feats_t: torch.Tensor = None,   # (B, 2)
+    dow_feats_t:    torch.Tensor = None,   # (B, 7)
 ):
     """
     Ejecuta encoder → context → decoder → critic para un batch.
@@ -241,7 +252,7 @@ def _forward(
     current_emb = embeddings[torch.arange(B), current_nodes, :]   # (B, d_h)
     check_tensor("current_emb", current_emb)
 
-    h_t = agent.context_net(graph_emb, current_emb, temporal_t, market_feats_t, budget_feats_t)   # (B, d_h)
+    h_t = agent.context_net(graph_emb, current_emb, temporal_t, market_feats_t, budget_feats_t, dow_feats_t)   # (B, d_h)
     check_tensor("context h_t", h_t)
 
     values = critic(h_t)                                           # (B,)
@@ -274,30 +285,32 @@ def _forward(
 
 def _evaluate_greedy(
     agent,
+    eval_env:         VectorRoutingEnv,
     eval_start_nodes: np.ndarray,
     eval_start_days:  np.ndarray,
-    time_matrix,
-    rate_stack:       np.ndarray,
-    loads_stack:      np.ndarray,
+    time_matrix_arr:  np.ndarray,
     distance_arr:     np.ndarray,
-    diesel_arr:       np.ndarray,
     ltr_stack:        np.ndarray,
     trucks_stack:     np.ndarray,
     reward_global_p95: float,
+    num_nodes:        int,
     eval_k_levels:    list = None,   # niveles de K por episodio (None ⇒ todos libres)
     avail_expected_arr: np.ndarray = None,
 ) -> tuple:
     """
-    Recompensa promedio en modo greedy (beam_width=1) sobre un set fijo de
-    episodios (mismos nodos de inicio, días y niveles de K entre llamadas),
-    para monitorear el desempeño en el modo que de verdad se usa en
-    producción — distinto del avg_reward de los rollouts de entrenamiento,
-    que samplean de la política.
+    Recompensa promedio en modo greedy (argmax en cada nodo, sin búsqueda) sobre
+    un set fijo de episodios (mismos nodos de inicio, días y niveles de K entre
+    llamadas), para monitorear el desempeño en el modo que de verdad se usa en
+    producción — distinto del avg_reward de los rollouts de entrenamiento, que
+    samplean de la política.
 
-    beam_search_dynamic devuelve route=None, reward=-np.inf cuando ningún beam
-    logra cerrar el ciclo de regreso al depot dentro de max_duration. Esos
-    episodios se excluyen del promedio de reward (para no contaminarlo con
-    -inf) y se cuentan aparte en valid_rate.
+    eval_env es un VectorRoutingEnv de replay (market_process=None) sobre los días
+    de entrenamiento: el mismo entorno y la misma recompensa que el rollout
+    muestreado, sin ruido de mundo simulado.
+
+    Los episodios que no cierran el ciclo en el depot dentro de max_duration se
+    excluyen del promedio de reward (para no contaminarlo) y se cuentan aparte
+    en valid_rate. El reward está en unidades originales (suma de lanes).
 
     Retorna
     -------
@@ -305,130 +318,84 @@ def _evaluate_greedy(
                  (0.0 si ninguno fue válido).
     valid_rate : float — fracción de episodios con ruta válida.
     """
-    agent.eval()
-    rewards = []
-    n_valid = 0
-    if eval_k_levels is None:
-        eval_k_levels = [None] * len(eval_start_nodes)
-    try:
-        with torch.no_grad():
-            for start_node, start_day, k_max in zip(eval_start_nodes, eval_start_days, eval_k_levels):
-                route, reward, _ = agent.beam_search_dynamic(
-                    int(start_node), int(start_day),
-                    time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-                    MAX_DURATION, beam_width=1,
-                    ltr_stack=ltr_stack, trucks_stack=trucks_stack,
-                    lane_filter=True,
-                    reward_global_p95=reward_global_p95,
-                    k_max=k_max,
-                    avail_expected_arr=avail_expected_arr,
-                )
-                if route is not None:
-                    n_valid += 1
-                    rewards.append(reward)
-    finally:
-        agent.train()
-    n_total    = len(eval_start_nodes)
-    avg_reward = float(np.mean(rewards)) if rewards else 0.0
-    valid_rate = n_valid / n_total
+    res = greedy_rollout(
+        agent, eval_env,
+        np.asarray(eval_start_nodes, dtype=np.int64),
+        np.asarray(eval_start_days,  dtype=np.int64),
+        time_matrix_arr, distance_arr, trucks_stack, ltr_stack,
+        reward_global_p95, num_nodes,
+        k_max_arr=eval_k_levels,
+        avail_expected_arr=avail_expected_arr,
+    )
+    avg_reward = float(res.raw_reward[res.valid].mean()) if res.valid.any() else 0.0
+    valid_rate = float(res.valid.mean())
     return avg_reward, valid_rate
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Rollout greedy vectorizado para el baseline self-critical
-# ─────────────────────────────────────────────────────────────────────────────
+class ValidacionSimulada:
+    """Validación del greedy en mundos simulados fijos, contra B3 y UB-DP.
 
-def _collect_greedy_rollout(
-    agent:          AMRoutingAgent,
-    vec_env:        VectorRoutingEnv,
-    start_nodes_arr: np.ndarray,
-    start_day_idxs:  np.ndarray,
-    rm_pen_stack:    np.ndarray,
-    time_matrix_arr: np.ndarray,
-    distance_arr:    np.ndarray,
-    trucks_stack:    np.ndarray,
-    reward_global_p95: float,
-    ltr_stack:       np.ndarray,
-    num_nodes:       int,
-    k_max_arr:       list = None,   # MISMOS niveles de K que el rollout muestreado del update
-    avail_expected_arr: np.ndarray = None,
-    world_seeds:     np.ndarray = None,   # MISMAS semillas de mundo que el rollout muestreado (market_process)
-) -> np.ndarray:
+    Un conjunto fijo de mundos (nodo, día de la semana y semilla balanceados, con la semilla
+    propia MARKET_SEED_VAL) se evalúa por cada nivel de K de K_TRAINING_LEVELS en una sola
+    llamada batcheada de greedy_rollout. Reporta el margen en USD (suma de lane_reward, la
+    métrica de la evaluación final) y su gap contra UB-DP; B3 y UB-DP se calculan una sola vez.
+    Es observacional: no afecta los gradientes ni el RNG global.
     """
-    Rollout greedy (argmax, beam=1) vectorizado sobre los MISMOS
-    (start_node, start_day_idx, k_max) del update actual.
 
-    Reutiliza VectorRoutingEnv (el mismo step() que la recolección muestreada)
-    en vez de beam_search_dynamic, para que la fórmula de recompensa
-    (REWARD_SCALE_FACTOR, bono de éxito, penalización por tiempo, warning
-    temporal) y la disponibilidad de lanes (draw_lane_availability,
-    determinista en node/arrival_day) sean IDÉNTICAS a las del
-    rollout muestreado — condición necesaria para que la ventaja self-critical
-    (R_sample - R_greedy) compare en las mismas unidades. k_max_arr DEBE ser
-    el mismo del rollout muestreado: si el baseline se calcula con un K
-    distinto, la ventaja queda contaminada.
+    def __init__(self, market_process, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
+                 num_nodes, time_matrix_arr, ltr_stack, trucks_stack, reward_global_p95, avail_expected_arr):
+        M = get_val_worlds(num_nodes)
+        dis = disenar_mundos(num_nodes, M, market_process, num_dias=rate_stack.shape[0],
+                             semilla=MARKET_SEED_VAL)
+        self.niveles = list(K_TRAINING_LEVELS)
+        self.M = M
+        self.nodos = np.tile(dis["nodo"], len(self.niveles))
+        self.dias = np.tile(dis["start_day"], len(self.niveles))
+        self.semillas = np.tile(dis["world_seed"], len(self.niveles))
+        self.k_arr = [K for K in self.niveles for _ in range(M)]
+        self.args = (time_matrix_arr, distance_arr, trucks_stack, ltr_stack, reward_global_p95, num_nodes)
+        self.avail = avail_expected_arr
+        self.env = VectorRoutingEnv(
+            time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack, rm_pen_stack=None,
+            num_nodes=num_nodes, max_duration=MAX_DURATION, market_process=market_process,
+            distance_arr=distance_arr, diesel_arr=diesel_arr,
+        )
+        # Referencias: B3 (política de la tabla V) y UB-DP, promedio sobre los mismos mundos.
+        tabla = cargar_o_calcular_tabla(market_process, time_matrix, distance_arr, diesel_arr, verbose=False)
+        b3 = PoliticaB3(tabla, distance_arr, diesel_arr)
+        self.ref = {}
+        for K in self.niveles:
+            margenes, ubs = [], []
+            for m in range(M):
+                h, dow = int(dis["nodo"][m]), int(dis["dow"][m])
+                r = ejecutar_politica(b3, self.env, h, int(dis["start_day"][m]), K, int(dis["world_seed"][m]),
+                                      distance_arr, diesel_arr, dow)
+                margenes.append(r["margen"])
+                ubs.append(tabla.ub_dp(h, dow, K))
+            self.ref[K] = {"b3": float(np.mean(margenes)), "ub_dp": float(np.mean(ubs))}
 
-    Con market_process, `world_seeds` DEBE ser el mismo del rollout muestreado:
-    cada sorteo es función de (semilla de mundo, nodo, día), así que ambos
-    rollouts ven las mismas cargas y tarifas cuando llegan al mismo nodo el
-    mismo día y la ventaja R_sample − R_greedy no mezcla ruido del mundo.
-
-    Asume que agent/critic ya están en eval() (llamado entre la fase de
-    recolección y la fase de update del loop principal). No samplea ni usa
-    RNG global: greedy_action es argmax puro, así que no perturba la
-    secuencia de np.random/torch usada por el resto del loop.
-    """
-    B = len(start_nodes_arr)
-    ep_rewards = np.zeros(B, dtype=np.float32)
-
-    masks  = vec_env.reset(start_nodes_arr, start_day_idxs, k_max_arr=k_max_arr,
-                           world_seeds=world_seeds)
-    active = np.ones(B, dtype=bool)
-
-    with torch.no_grad():
-        for _ in range(num_nodes):   # defensive ceiling, igual que la recolección
-            if not active.any():
-                break
-
-            cur_nodes = vec_env.current_node
-            time_el   = vec_env.time_elapsed
-            step_cnt  = vec_env.step_count
-            day_idx   = vec_env.current_day_idx
-
-            node_feats = build_node_features_batch(
-                cur_nodes, start_nodes_arr, vec_env.visited_mask,
-                rm_pen_stack, time_matrix_arr, distance_arr,
-                day_idx, num_nodes, MAX_DURATION,
-                trucks_stack_raw=trucks_stack,
-                reward_global_p95=reward_global_p95,
-                avail_expected_arr=avail_expected_arr,
-                reward_rows=vec_env.reward_rows,
-            )
-            temporal = build_temporal_features_batch(time_el, step_cnt, MAX_DURATION, num_nodes)
-            market   = build_market_features_batch(cur_nodes, day_idx, ltr_stack) if ltr_stack is not None \
-                       else np.zeros((B, 1), dtype=np.float32)
-            budget   = build_budget_features_batch(vec_env.k_remaining, vec_env.k_restricted)
-
-            node_feats_t = torch.from_numpy(node_feats).to(DEVICE)
-            temporal_t   = torch.from_numpy(temporal).to(DEVICE)
-            market_t     = torch.from_numpy(market).to(DEVICE)
-            budget_t     = torch.from_numpy(budget).to(DEVICE)
-            cur_nodes_t  = torch.tensor(cur_nodes, dtype=torch.long, device=DEVICE)
-            mask_t       = torch.from_numpy(masks).to(DEVICE)
-
-            embeddings, graph_emb = agent.encoder(node_feats_t)
-            current_emb = embeddings[torch.arange(B), cur_nodes_t, :]
-            h_t = agent.context_net(graph_emb, current_emb, temporal_t, market_t, budget_t)
-            actions_t = agent.decoder.greedy_action(h_t, embeddings, mask_t)
-            actions = actions_t.cpu().numpy()
-
-            rewards, terminated, next_masks = vec_env.step(actions)
-            ep_rewards += np.where(active, rewards, 0.0)
-
-            active = active & ~terminated
-            masks  = next_masks
-
-    return ep_rewards
+    def evaluar(self, agent) -> dict:
+        """Margen medio del greedy por nivel de K y global, validez y gap contra UB-DP."""
+        res = greedy_rollout(
+            agent, self.env, self.nodos, self.dias, *self.args,
+            k_max_arr=self.k_arr, avail_expected_arr=self.avail, world_seeds=self.semillas,
+        )
+        margen = np.where(res.valid, res.raw_reward, 0.0)
+        out = {"por_k": {}}
+        for i, K in enumerate(self.niveles):
+            sl = slice(i * self.M, (i + 1) * self.M)
+            v = res.valid[sl]
+            m = float(res.raw_reward[sl][v].mean()) if v.any() else 0.0
+            ub = self.ref[K]["ub_dp"]
+            out["por_k"]["free" if K is None else str(K)] = {
+                "margen": m, "valid_rate": float(v.mean()),
+                "gap_ub_dp_pct": float((ub - m) / abs(ub) * 100.0) if ub else float("nan"),
+                "b3": self.ref[K]["b3"], "ub_dp": ub,
+            }
+        out["margen"] = float(res.raw_reward[res.valid].mean()) if res.valid.any() else 0.0
+        out["valid_rate"] = float(res.valid.mean())
+        out["score"] = float(margen.mean())    # inválidos cuentan 0: elige el mejor update
+        return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -450,6 +417,8 @@ def run_am_training(
     avail_expected_arr: np.ndarray = None,  # [num_nodes, num_nodes]
     market_process = None,   # MarketProcess opcional (proceso exógeno de cargas y tarifas). None = días
                              # reales del histórico (comportamiento de siempre).
+    best_checkpoint_path: str = None,  # con market_process: ruta donde se guarda el update con mejor
+                                       # margen de validación (agent + critic); None = no se guarda.
     trial_callback: callable = None,  # HPO opcional: fn(step, n_updates, log_entry) -> bool
                                        # (True = detener el entrenamiento ya, p.ej. Optuna pruning).
                                        # Solo se invoca en los updates de log_freq (donde greedy_reward
@@ -474,6 +443,10 @@ def run_am_training(
                      tarifas se sortean del proceso exógeno (cada episodio es un mundo con semilla
                      propia, generada desde MARKET_SEED_TRAIN) en vez de leerse del histórico; el
                      día de inicio solo aporta el día de la semana. No se usa rm_pen_stack.
+    best_checkpoint_path : con market_process, guarda {"agent", "critic"} del update con mejor
+                     margen en los mundos de validación (ValidacionSimulada). El log trae el margen
+                     de validación en `val`, y `greedy_reward` / `greedy_valid_rate` pasan a ser el
+                     margen (USD) y la validez en esos mundos.
     trial_callback : callable opcional fn(step, n_updates, log_entry) -> bool, invocado en
                      cada update de log_freq; si devuelve True, el entrenamiento se detiene
                      ahí mismo (usado por hpo_optuna.py para pruning).
@@ -553,6 +526,19 @@ def run_am_training(
         distance_arr=distance_arr,
         diesel_arr=diesel_arr,
     )
+    # Entorno del monitor greedy: replay de los días de entrenamiento (market_process=None),
+    # aunque el entrenamiento use mundos simulados. Si ya hay rm_pen_stack se reutiliza.
+    eval_env = VectorRoutingEnv(
+        time_matrix=time_matrix,
+        rate_stack=rate_stack,
+        loads_stack=loads_stack,
+        rm_pen_stack=rm_pen_stack if rm_pen_stack is not None else build_rm_pen_stack(
+            rate_stack[:num_train_days], loads_stack[:num_train_days],
+            distance_arr, diesel_arr,
+        ),
+        num_nodes=num_nodes,
+        max_duration=MAX_DURATION,
+    )
     # Generador PROPIO de semillas de mundo (nunca el estado global de numpy): una
     # semilla por episodio y update, independiente de las decisiones del agente.
     world_rng = np.random.default_rng(MARKET_SEED_TRAIN)
@@ -574,6 +560,21 @@ def run_am_training(
     # Niveles de K balanceados sobre el set fijo de evaluación — mismo eval_rng
     # dedicado (nunca np.random global), calculado una sola vez.
     eval_k_levels    = _balanced_k_assignment(n_eval_episodes, eval_rng)
+
+    # ── Validación en mundos simulados (solo con proceso exógeno) ─────────────
+    val = None
+    if market_process is not None:
+        val = ValidacionSimulada(
+            market_process, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
+            time_matrix_arr, ltr_stack, trucks_stack, reward_global_p95, avail_expected_arr,
+        )
+        refs = " | ".join(
+            f"K={'libre' if K is None else K}: B3 {r['b3']:.0f}, UB-DP {r['ub_dp']:.0f}"
+            for K, r in val.ref.items()
+        )
+        print(f"Validación: {val.M} mundos × K∈{{{', '.join('libre' if K is None else str(K) for K in val.niveles)}}} "
+              f"(semilla {MARKET_SEED_VAL}) | referencias (USD): {refs}")
+    best_score = -np.inf
 
     episode_rewards = []
     episode_losses  = []
@@ -648,18 +649,20 @@ def run_am_training(
                 market   = build_market_features_batch(cur_nodes, day_idx, ltr_stack) if ltr_stack is not None \
                            else np.zeros((B, 1), dtype=np.float32)                                     # (B, 1)
                 budget   = build_budget_features_batch(vec_env.k_remaining, vec_env.k_restricted)      # (B, 2)
+                dow      = build_dow_features_batch(vec_env.current_dow)                               # (B, 7)
 
                 # Single forward pass over the full batch
                 node_feats_t = torch.from_numpy(node_feats).to(DEVICE)
                 temporal_t   = torch.from_numpy(temporal).to(DEVICE)
                 market_t     = torch.from_numpy(market).to(DEVICE)
                 budget_t     = torch.from_numpy(budget).to(DEVICE)
+                dow_t        = torch.from_numpy(dow).to(DEVICE)
                 cur_nodes_t  = torch.tensor(cur_nodes, dtype=torch.long, device=DEVICE)
                 mask_t       = torch.from_numpy(masks).to(DEVICE)
 
                 actions_t, log_probs_t, _, values_t = _forward(
                     agent, critic, node_feats_t, temporal_t, cur_nodes_t, mask_t,
-                    market_feats_t=market_t, budget_feats_t=budget_t,
+                    market_feats_t=market_t, budget_feats_t=budget_t, dow_feats_t=dow_t,
                 )
                 actions   = actions_t.cpu().numpy()    # (B,) int64
                 log_probs = log_probs_t.cpu().numpy()  # (B,)
@@ -676,6 +679,7 @@ def run_am_training(
                         "temporal":     temporal[b],           # (3,)
                         "market_feats": market[b],             # (1,)
                         "budget_feats": budget[b],              # (2,)
+                        "dow_feats":    dow[b],                 # (7,)
                         "current_node": int(cur_nodes[b]),
                         "mask":         masks[b],              # (N,) int8
                         "action":       int(actions[b]),
@@ -701,15 +705,14 @@ def run_am_training(
         # para comparar en las mismas unidades y la misma realización del mundo.
         # Resetea vec_env (su estado post-rollout muestreado ya no se necesita).
         if USE_SELF_CRITICAL:
-            greedy_ep_rewards = _collect_greedy_rollout(
+            greedy_ep_rewards = greedy_rollout(
                 agent, vec_env, start_nodes_arr, start_day_idxs,
-                rm_pen_stack, time_matrix_arr, distance_arr,
-                trucks_stack, reward_global_p95,
-                ltr_stack, num_nodes,
+                time_matrix_arr, distance_arr, trucks_stack, ltr_stack,
+                reward_global_p95, num_nodes,
                 k_max_arr=k_max_arr,
                 avail_expected_arr=avail_expected_arr,
                 world_seeds=world_seeds,
-            )
+            ).env_reward
         else:
             greedy_ep_rewards = None
 
@@ -737,6 +740,7 @@ def run_am_training(
                     done=trans["done"],
                     market_feats=trans["market_feats"],
                     budget_feats=trans["budget_feats"],
+                    dow_feats=trans["dow_feats"],
                 )
             ep_end = len(buffer)
             buffer.episode_boundaries.append(
@@ -809,6 +813,9 @@ def run_am_training(
                 bf_b   = torch.from_numpy(
                     np.stack([buffer.budget_feats[i] for i in idx_batch])
                 ).to(DEVICE)                                           # (B, 2)
+                dw_b   = torch.from_numpy(
+                    np.stack([buffer.dow_feats[i] for i in idx_batch])
+                ).to(DEVICE)                                           # (B, 7)
                 cn_b   = torch.tensor(
                     [buffer.current_nodes[i] for i in idx_batch],
                     dtype=torch.long
@@ -858,7 +865,7 @@ def run_am_training(
                     # Forward con gradientes
                     _, new_lp, entropy, new_val = _forward(
                         agent, critic, nf_b, tf_b, cn_b, mask_b,
-                        actions_t=act_b, market_feats_t=mf_b, budget_feats_t=bf_b,
+                        actions_t=act_b, market_feats_t=mf_b, budget_feats_t=bf_b, dow_feats_t=dw_b,
                     )
 
                     # ── Loss del actor (PPO-Clip) ────────────────────────────
@@ -1016,25 +1023,51 @@ def run_am_training(
 
         stop_now = False
         log_freq = max(1, n_updates // 20)
-        if (update + 1) % log_freq == 0:
-            greedy_reward, greedy_valid_rate = _evaluate_greedy(
-                agent, eval_start_nodes, eval_start_days,
-                time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-                ltr_stack, trucks_stack, reward_global_p95,
-                eval_k_levels=eval_k_levels,
-                avail_expected_arr=avail_expected_arr,
-            )
-            log_entry["greedy_reward"]     = greedy_reward
-            log_entry["greedy_valid_rate"] = greedy_valid_rate
+        val_freq = max(1, n_updates // VAL_CHECKS)
+        es_log = (update + 1) % log_freq == 0
+
+        # Validación en mundos simulados (observacional); guarda el mejor update.
+        v = None
+        if val is not None and (es_log or (update + 1) % val_freq == 0 or update == n_updates - 1):
+            v = val.evaluar(agent)
+            log_entry["val"]               = v["por_k"]
+            log_entry["greedy_reward"]     = v["margen"]
+            log_entry["greedy_valid_rate"] = v["valid_rate"]
+            if v["score"] > best_score:
+                best_score = v["score"]
+                log_entry["val_best"] = True
+                if best_checkpoint_path:
+                    torch.save({"agent": agent.state_dict(), "critic": critic.state_dict()}, best_checkpoint_path)
+
+        if es_log:
+            if val is None:
+                greedy_reward, greedy_valid_rate = _evaluate_greedy(
+                    agent, eval_env, eval_start_nodes, eval_start_days,
+                    time_matrix_arr, distance_arr, ltr_stack, trucks_stack,
+                    reward_global_p95, num_nodes,
+                    eval_k_levels=eval_k_levels,
+                    avail_expected_arr=avail_expected_arr,
+                )
+                log_entry["greedy_reward"]     = greedy_reward
+                log_entry["greedy_valid_rate"] = greedy_valid_rate
+            else:
+                greedy_reward, greedy_valid_rate = v["margen"], v["valid_rate"]
 
             episodes_done = (update + 1) * n_episodes_per_update
             # Línea compacta; loss/pol/val/clip/r_greedy/sc_adv/sc_loss siguen
             # en training_log y en las gráficas de plot_ppo_diagnostics.
+            if val is None:
+                monitor = f"| greedy {greedy_reward:6.1f} "
+            else:
+                monitor = "| val " + " ".join(
+                    f"K={k}:{d['margen']:.0f} (gapDP {d['gap_ub_dp_pct']:.1f}%, B3 {d['b3']:.0f})"
+                    for k, d in v["por_k"].items()
+                ) + (" *mejor " if log_entry.get("val_best") else " ")
             print(
                 f"  update {update+1:>5}/{n_updates} "
                 f"| ep {episodes_done:>6}/{total_episodes} "
                 f"| reward {avg_reward:6.1f} "
-                f"| greedy {greedy_reward:6.1f} "
+                f"{monitor}"
                 f"| greedy_valid {greedy_valid_rate:.2f} "
                 f"| ent {avg_entropy:.3f} "
                 f"| kl {avg_kl:.4f} "

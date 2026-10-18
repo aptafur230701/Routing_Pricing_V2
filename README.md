@@ -18,7 +18,7 @@ python inference.py     # inferencia interactiva con un checkpoint ya entrenado
 
 Todo lo que hay que tocar para un run distinto está al principio de
 `main()` en [main.py](main.py): `NUM_NODES`, `EVAL_ONLY`, `USE_TRANSFER`,
-`N_DAYS_PER_NODE`, `USE_MARKET_PROCESS`. Los hiperparámetros del modelo y del PPO están todos en
+`USE_MARKET_PROCESS`. Los hiperparámetros del modelo y del PPO están todos en
 [config.py](config.py).
 
 ## Arquitectura del modelo
@@ -48,7 +48,7 @@ problem_data.py ──► matrices (tiempo, tarifa, carga, distancia, diesel, LT
                 checkpoints/am_checkpoint_<N>nodes.pt
                               │
                               ▼
-                    evaluation.py (compara contra Solvers.py)
+                    evaluation.py (DRL vs B1/B2/B3 y cotas UB-PI/UB-DP)
                               │
                               ▼
                 results/<N>nodes/  (Excel + gráficos + training log)
@@ -73,12 +73,13 @@ nodos, ver `NODE_SEQUENCE`).
 | [attention_encoder.py](attention_encoder.py) | `AttentionEncoder` (Transformer) + `ContextNetwork`. |
 | [attention_decoder.py](attention_decoder.py) | `AttentionDecoder` (pointer network) con glimpse + pointer attention. |
 | [critic_head.py](critic_head.py) | `CriticHead`: estima V(s_t) para la ventaja PPO. |
-| [am_agent.py](am_agent.py) | `AMRoutingAgent`: combina encoder + contexto + decoder; expone `generate_route` y `beam_search_dynamic`. |
+| [am_agent.py](am_agent.py) | `AMRoutingAgent`: combina encoder + contexto + decoder; el rollout se ejecuta paso a paso sobre el entorno. |
 | [am_training.py](am_training.py) | Loop de entrenamiento PPO-Clip + GAE. |
+| [greedy_rollout.py](greedy_rollout.py) | Rollout greedy (argmax por nodo) sobre `VectorRoutingEnv`: evaluación del DRL en replay de días reales o en mundos simulados, baseline self-critical y monitor de entrenamiento. |
 | [debug_utils.py](debug_utils.py) | `check_tensor`: verificación de NaN/Inf en el forward pass (falla rápido en vez de silenciar con `nan_to_num`). Usado en producción por el encoder/decoder/training, no es un script de debug puntual. |
 | [transfer_learning.py](transfer_learning.py) | Warm-start de pesos entre tamaños de grafo (`NODE_SEQUENCE`). |
-| [Solvers.py](Solvers.py) | Baselines de comparación: heurística greedy, HGA-LNS (GA + LNS + 2-opt híbrido), rolling-horizon (determinista y estocástico), MC-Rollout, label-setting exacto/oráculo. |
-| [inference.py](inference.py) | Inferencia standalone: carga un checkpoint y genera una ruta desde un nodo dado. |
+| [Solvers.py](Solvers.py) | Label-setting oráculo (`solve_label_setting_oracle`), único solver que se conserva: resuelve UB-PI. |
+| [inference.py](inference.py) | Inferencia standalone: carga un checkpoint y genera una ruta greedy desde un nodo dado. |
 
 ### Proceso exógeno de cargas y tarifas (opcional)
 
@@ -86,7 +87,7 @@ Diseño completo en [proceso_exogeno_cargas_tarifas.md](proceso_exogeno_cargas_t
 Con `USE_MARKET_PROCESS = True` el entrenamiento ya no reproduce días del
 histórico: al llegar a cada nodo se sortean las cargas (binomial negativa con
 factor de día de la semana) y las tarifas (remuestreo del histórico de la lane).
-Con `False` (por defecto) todo se comporta como antes.
+Con `False` el entrenamiento reproduce días reales como antes. La evaluación siempre usa el proceso.
 
 | Archivo | Rol |
 |---|---|
@@ -98,17 +99,39 @@ Con `False` (por defecto) todo se comporta como antes.
 Constantes (`FECHA_INICIO`, `DIAS_EXCLUIDOS`, `MARKET_PHI_MAX`, semillas, M) en
 [config.py](config.py). La fórmula de recompensa del paso es `lane_reward` en
 [problem_data.py](problem_data.py), compartida por el modo real y el simulado.
-Pendiente (aplazado hasta reformular los baselines): evaluación con mundos
-simulados en `evaluation.py` / `Solvers.py` / `stats_analysis.py` y la
-comparación de política de la validación.
+
+### Baselines y evaluación
+
+Diseño completo en [baselines_drl_ruteo_estocastico.md](baselines_drl_ruteo_estocastico.md).
+El DRL se compara contra tres políticas no anticipativas y dos cotas superiores, todas sobre
+los mismos mundos simulados (mismo `world_seed`), paso a paso en `VectorRoutingEnv`:
+
+| Id | Baseline | Archivo |
+|---|---|---|
+| B1 | Greedy miope: arco válido de mayor `lane_reward` de la fila observada (PFA). | [baselines.py](baselines.py) |
+| B2 | Reoptimización determinista con valores esperados de los arcos futuros; ejecuta solo el primer arco. Solo con K finito (CFA). | [baselines.py](baselines.py) |
+| B3 | Política de un paso sobre la tabla V de la DP relajada (VFA de tabla). | [dp_relajada.py](dp_relajada.py) |
+| UB-DP | Cota ajustada: DP en (hogar, día de salida, nodo, franja de 15 min, k) permitiendo revisitar. Tabla en `datos/ubdp_tabla_<N>nodos.npz`, se recarga si coincide con los datos. | [dp_relajada.py](dp_relajada.py) |
+| UB-PI | Cota laxa: mejor ruta con el mundo completo conocido (`sample_world` + label-setting oráculo sin poda por dominancia). | [evaluation.py](evaluation.py), [Solvers.py](Solvers.py) |
+
+| Archivo | Rol |
+|---|---|
+| [evaluation.py](evaluation.py) | Arnés único (`ejecutar_politica`), `evaluar_mundos_simulados` (M mundos por K ∈ {5, libre}, nodo y día de la semana balanceados), `evaluar_replay` (días reales 90-119, "replay, no independiente del simulador"), `resumen_metodos`, diagnósticos. |
+| [excel_report.py](excel_report.py) | Excel de resultados: hojas Resumen, Mundos simulados y Replay. |
+| [stats_analysis.py](stats_analysis.py) | Diferencia pareada DRL − baseline con IC 95 % por bootstrap, Wilcoxon pareado de una cola con Holm, y gaps contra UB-DP y UB-PI. |
+| [tests/test_baselines.py](tests/test_baselines.py) | Tabla V vs recursión ingenua, máscara, determinismo, UB-PI ≥ políticas, B3 ≤ UB-DP, margen = Σ `lane_reward`, oráculo vs enumeración, y limpieza de nombres borrados. |
+
+Las políticas solo leen la máscara, la fila observada (`current_loads_row`, `current_rate_row`),
+el nodo, la hora, `k_remaining` y los visitados, más los parámetros del proceso; ninguna ve la
+semilla del mundo. El margen es la suma de `lane_reward` de los arcos recorridos (USD), no la
+recompensa del entorno. Los tiempos por decisión se miden en CPU con un solo hilo, también para
+el DRL.
 
 ### Validación final del modelo
 
 | Archivo | Rol |
 |---|---|
-| [evaluation.py](evaluation.py) | Corre la comparación DRL vs. todos los solvers de `Solvers.py`, genera diagnósticos y guarda resultados. |
-| [excel_report.py](excel_report.py) | Formato del Excel de resultados (hojas Summary / Per Node). |
-| [stats_analysis.py](stats_analysis.py) | Robustez estadística: descriptivos + test de Wilcoxon pareado de DRL contra cada baseline estocástico. |
+| [run_k_comparison.py](run_k_comparison.py) | Script aparte: evalúa en mundos simulados uno o varios niveles de K con un checkpoint ya entrenado. |
 
 
 ### Datos y artefactos
@@ -126,9 +149,10 @@ comparación de política de la validación.
    `USE_TRANSFER = True` para partir del checkpoint del tamaño anterior en
    `NODE_SEQUENCE` (o `False` para pesos aleatorios). `python main.py`.
 2. **Solo evaluar** un checkpoint existente sin reentrenar: `EVAL_ONLY = True`.
-3. **Comparar contra baselines**: `results/<N>nodes/DRL_Routing_Summary_AM.xlsx`
-   trae el gap de DRL contra cada solver de `Solvers.py`, más las hojas de
-   estadística de `stats_analysis.py` (Wilcoxon pareado).
+3. **Comparar contra baselines**: `main.py` calcula (o recarga) la tabla V de UB-DP,
+   evalúa en mundos simulados y en replay, e imprime el resumen.
+   `results/<N>nodes/DRL_Routing_Summary_AM.xlsx` trae márgenes, gaps contra UB-DP y
+   UB-PI, y las hojas de `stats_analysis.py` (bootstrap y Wilcoxon con Holm).
 4. **Entrenar con el proceso exógeno**: `USE_MARKET_PROCESS = True` en
    `main.py` (si falta `datos/market_params.npz` corre `fit_market_process.py`).
    Validar el simulador con `python validate_market_process.py`.
