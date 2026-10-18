@@ -26,6 +26,30 @@ from config import (
 )
 
 
+def lane_reward(
+    rate:     np.ndarray,
+    loads:    np.ndarray,
+    distance: np.ndarray,
+    diesel:   np.ndarray,
+) -> np.ndarray:
+    """Recompensa de recorrer una lane (sin penalizar la diagonal ni escalar).
+
+    Es la ÚNICA fórmula de recompensa del paso: la usan build_day_matrices (modo
+    real, días del histórico) y el entorno con market_process (filas sorteadas
+    al llegar al nodo), para que ambos modos no diverjan.
+
+        ingreso = tarifa por milla × distancia, solo si hay carga (loads > 0)
+        costo   = distancia × (diesel / MPG) + distancia × MARGINAL_COST_SIN_DIESEL
+        recompensa = round(ingreso − costo, 0)
+
+    Los cuatro argumentos son arrays con formas broadcast-compatibles: matrices
+    (N, N) en modo real, o filas (N,) / lotes (B, N) en modo simulado.
+    """
+    revenue = np.where(loads > 0, rate * distance, 0.0)
+    cost    = distance * (diesel / MPG) + distance * MARGINAL_COST_SIN_DIESEL
+    return np.round(revenue - cost, 0)
+
+
 def build_day_matrices(
     rate_day:     np.ndarray,
     loads_day:    np.ndarray,
@@ -52,11 +76,9 @@ def build_day_matrices(
     la máscara de acciones de los modos con filtrado de lanes, de modo que
     máscara y reward quedan consistentes. El umbral es `<= 0` (antes `<= 1`,
     sin justificación documentada — excluía también el caso `loads_day == 1`).
+    La fórmula vive en `lane_reward` (compartida con el modo market_process).
     """
-    revenue = (rate_day * distance_arr).copy()
-    revenue[loads_day <= 0] = 0
-    cost       = distance_arr * (diesel_arr / MPG) + distance_arr * MARGINAL_COST_SIN_DIESEL
-    reward_arr = np.round(revenue - cost, 0)
+    reward_arr = lane_reward(rate_day, loads_day, distance_arr, diesel_arr)
 
     penalized_arr = reward_arr.copy()
     np.fill_diagonal(penalized_arr, BIG_M_PENALTY)

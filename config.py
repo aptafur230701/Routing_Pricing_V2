@@ -91,6 +91,20 @@ LOADS_EXPECTED_CLIP = 100.0  # p95 de E[loads] por lane (train, excl. diagonal) 
 # ── Reproducibility ───────────────────────────────────────────
 SEED = 42
 
+# ── Proceso exógeno de cargas y tarifas (market_process) ─────
+# Ver proceso_exogeno_cargas_tarifas.md. Ningún índice de día va escrito a
+# mano: el número de días sale de la forma de loads_stack / rate_stack y las
+# fechas salen de FECHA_INICIO + índice del día.
+FECHA_INICIO         = "2026-01-01"   # fecha del día 0 del histórico (jueves)
+DIAS_EXCLUIDOS       = []             # fechas ("AAAA-MM-DD") a dejar fuera del ajuste, solo si
+                                      # la fuente confirma que son erróneas. Vacía = usa todos los días.
+MARKET_PHI_MAX       = 1000.0         # tope de la dispersión phi (phi → ∞ equivale a Poisson)
+MARKET_N_GRUPOS      = 4              # grupos de volumen h (cuartiles de mu_ij) para estimar phi_h
+MARKET_PARAMS_PATH   = "datos/market_params.npz"   # relativo a la raíz del proyecto
+MARKET_SEED_TRAIN    = 20260   # semilla de los mundos de entrenamiento
+MARKET_SEED_EVAL     = 777001  # semilla base de los mundos de evaluación (distinta de la de entrenamiento)
+MARKET_M_EVAL_WORLDS = 100     # M: nº de mundos de evaluación (Paso 6, aplazado; lo usa sample_world)
+
 # ── Device ───────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

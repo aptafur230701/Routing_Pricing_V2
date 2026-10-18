@@ -1,0 +1,420 @@
+"""
+test_market_process.py
+======================
+Pruebas del proceso exógeno de cargas y tarifas (proceso_exogeno_cargas_tarifas.md):
+
+  · misma semilla y mismos parámetros ⇒ misma salida
+  · la salida no cambia con las acciones del agente
+  · formas, tipos y tarifa positiva en todas las lanes
+  · con market_process=None el entorno reproduce las recompensas de siempre
+  · la función de recompensa compartida coincide con rm_pen_stack
+  · media y proporción de ceros simuladas ≈ histórico en cada grupo de volumen h
+  · con DIAS_EXCLUIDOS vacía el ajuste usa todos los días de la matriz
+  · smoke de entrenamiento con market_process
+"""
+
+import os
+
+import numpy as np
+import pytest
+
+import am_training
+from config import (
+    MAX_DURATION, REWARD_SCALE_FACTOR, BIG_M_PENALTY, DIAS_EXCLUIDOS, FECHA_INICIO,
+)
+from fit_market_process import ajustar, dia_de_semana, cargar_matrices_completas, params_path
+from market_process import MarketProcess, asegurar_parametros
+from problem_data import load_matrices, build_rm_pen_stack, build_day_matrices, lane_reward
+from routing_env import RoutingEnv, VectorRoutingEnv
+
+NUM_NODES = 10
+
+
+@pytest.fixture(scope="module")
+def data():
+    (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
+     ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95) = load_matrices(NUM_NODES)
+    return dict(
+        time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack,
+        distance_arr=distance_arr, diesel_arr=diesel_arr,
+        ltr_stack=ltr_stack, trucks_stack=trucks_stack,
+        avail_expected_arr=avail_expected_arr, reward_global_p95=reward_global_p95,
+    )
+
+
+@pytest.fixture(scope="module")
+def mp():
+    asegurar_parametros()
+    return MarketProcess(NUM_NODES)
+
+
+def _scalar_env(data, market_process=None):
+    return RoutingEnv(
+        data["time_matrix"], data["rate_stack"], data["loads_stack"],
+        data["distance_arr"], data["diesel_arr"], NUM_NODES, MAX_DURATION,
+        market_process=market_process,
+    )
+
+
+def _vector_env(data, market_process=None, rm_pen_stack=None):
+    return VectorRoutingEnv(
+        time_matrix=data["time_matrix"], rate_stack=data["rate_stack"],
+        loads_stack=data["loads_stack"], rm_pen_stack=rm_pen_stack,
+        num_nodes=NUM_NODES, max_duration=MAX_DURATION,
+        market_process=market_process,
+        distance_arr=data["distance_arr"], diesel_arr=data["diesel_arr"],
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reproducibilidad
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_misma_semilla_misma_salida(mp):
+    nodos = np.arange(NUM_NODES).repeat(3)
+    dias  = np.tile([0, 5, 40], NUM_NODES)
+
+    a = mp.sample_arrivals(nodos, dias, np.random.default_rng(7))
+    b = mp.sample_arrivals(nodos, dias, np.random.default_rng(7))
+    c = mp.sample_arrivals(nodos, dias, np.random.default_rng(8))
+    assert np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1])
+    assert not np.array_equal(a[0], c[0])
+
+    w1 = mp.sample_world(123, 6, dia_inicial=2)
+    w2 = mp.sample_world(123, 6, dia_inicial=2)
+    w3 = mp.sample_world(124, 6, dia_inicial=2)
+    assert np.array_equal(w1[0], w2[0]) and np.array_equal(w1[1], w2[1])
+    assert not np.array_equal(w1[0], w3[0])
+
+
+def test_sorteo_por_mundo_no_depende_del_lote(mp):
+    """Cada fila es función pura de (semilla, nodo, día): invertir o recortar el lote no la cambia."""
+    nodos = np.array([0, 3, 3, 7, 9]); dias = np.array([0, 1, 2, 3, 4]); sem = np.array([5, 5, 6, 7, 7])
+    l, r = mp.sample_arrivals_por_mundo(nodos, dias, sem)
+    l_inv, r_inv = mp.sample_arrivals_por_mundo(nodos[::-1], dias[::-1], sem[::-1])
+    assert np.array_equal(l, l_inv[::-1]) and np.array_equal(r, r_inv[::-1])
+    l_sub, r_sub = mp.sample_arrivals_por_mundo(nodos[2:3], dias[2:3], sem[2:3])
+    assert np.array_equal(l[2], l_sub[0]) and np.array_equal(r[2], r_sub[0])
+
+
+def _correr_politica(env, mp, seed_politica, world_seeds, starts, days):
+    """Corre una política aleatoria y devuelve {(b, nodo, día): (loads_row, rate_row)} observados."""
+    B = len(starts)
+    rng = np.random.RandomState(seed_politica)
+    masks = env.reset(starts, days, world_seeds=world_seeds)
+    vistos = {}
+    active = np.ones(B, dtype=bool)
+
+    def registrar():
+        for b in np.where(active)[0]:
+            dia = int(env._start_day_idx[b]) + int(env.time_elapsed[b] // 14)
+            vistos[(b, int(env.current_node[b]), dia)] = (
+                env.current_loads_row[b].copy(), env.current_rate_row[b].copy(),
+            )
+
+    registrar()
+    for _ in range(NUM_NODES):
+        if not active.any():
+            break
+        actions = np.array([rng.choice(np.where(m == 1)[0]) for m in masks])
+        _, terminated, masks = env.step(actions)
+        active &= ~terminated
+        registrar()
+    return vistos
+
+
+def test_salida_no_cambia_con_las_acciones_del_agente(data, mp):
+    B = 40
+    rng = np.random.RandomState(0)
+    starts = rng.randint(0, NUM_NODES, B).astype(np.int64)
+    days = rng.randint(0, 90, B).astype(np.int64)
+    seeds = rng.randint(0, 2**31 - 1, B)
+
+    vistos_a = _correr_politica(_vector_env(data, mp), mp, 1, seeds, starts, days)
+    vistos_b = _correr_politica(_vector_env(data, mp), mp, 2, seeds, starts, days)
+
+    # Dos políticas distintas recorren rutas distintas, pero donde coinciden en
+    # (episodio, nodo, día) ven exactamente las mismas cargas y tarifas...
+    comunes = set(vistos_a) & set(vistos_b)
+    assert len(comunes) >= B   # al menos el nodo de inicio de cada episodio
+    for k in comunes:
+        assert np.array_equal(vistos_a[k][0], vistos_b[k][0])
+        assert np.array_equal(vistos_a[k][1], vistos_b[k][1])
+    assert set(vistos_a) != set(vistos_b)   # (y sí tomaron decisiones distintas)
+
+    # ... y todo lo observado es el sorteo puro del proceso para esa terna.
+    for (b, nodo, dia), (l, r) in {**vistos_a, **vistos_b}.items():
+        l_ref, r_ref = mp.sample_arrivals_por_mundo([nodo], [dia], [seeds[b]])
+        assert np.array_equal(l, l_ref[0]) and np.array_equal(r, r_ref[0])
+
+
+def test_entorno_ve_el_mismo_mundo_que_sample_world(data, mp):
+    w_loads, w_rate = mp.sample_world(99, 8, dia_inicial=3)
+    env = _scalar_env(data, mp)
+    env.reset(seed=0, options={"start_node": 2, "start_day_idx": 3, "world_seed": 99})
+    assert np.array_equal(env.current_loads_row, w_loads[0, 2])
+    assert np.allclose(env.current_rate_row, w_rate[0, 2])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Formas, tipos, positividad
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_formas_tipos_y_tarifa_positiva(mp):
+    B = 64
+    rng = np.random.default_rng(0)
+    nodos = rng.integers(0, NUM_NODES, B); dias = rng.integers(0, 120, B)
+
+    loads, rates = mp.sample_arrivals(nodos, dias, rng)
+    for l, r in (
+        (loads, rates),
+        mp.sample_arrivals_por_mundo(nodos, dias, np.arange(B)),
+    ):
+        assert l.shape == (B, NUM_NODES) and r.shape == (B, NUM_NODES)
+        assert np.issubdtype(l.dtype, np.integer) and l.min() >= 0
+        assert np.issubdtype(r.dtype, np.floating)
+        assert np.all(r > 0)                       # positiva en TODAS las lanes
+        assert np.isfinite(r).all()
+
+    lr, rr = mp.llegada_a_nodo(3, 10, np.random.default_rng(0))
+    assert lr.shape == (NUM_NODES,) and rr.shape == (NUM_NODES,) and np.all(rr > 0)
+
+    w_loads, w_rate = mp.sample_world(1, 5)
+    assert w_loads.shape == (5, NUM_NODES, NUM_NODES) == w_rate.shape
+    assert np.all(w_rate > 0)
+
+
+def test_lane_sin_cargas_historicas_no_genera_cargas(mp):
+    sin_cargas = mp.params.mu == 0
+    if not sin_cargas.any():
+        pytest.skip("todas las lanes de estos nodos tienen cargas históricas")
+    loads, _ = mp.sample_arrivals(
+        np.repeat(np.arange(NUM_NODES), 200), np.tile(np.arange(200) % 120, NUM_NODES),
+        np.random.default_rng(0),
+    )
+    nodos = np.repeat(np.arange(NUM_NODES), 200)
+    for i in range(NUM_NODES):
+        assert np.all(loads[nodos == i][:, sin_cargas[i]] == 0)
+
+
+def test_dia_de_semana_desde_fecha_inicio():
+    dias = np.arange(120)
+    assert FECHA_INICIO == "2026-01-01"                      # jueves
+    assert np.array_equal(dia_de_semana(dias), (dias + 3) % 7)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entorno: market_process=None reproduce lo de siempre
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Recompensas capturadas del entorno ANTES del cambio (commit 2041437) con la
+# política fija indicada, NUM_NODES=10: (start_node, start_day_idx, k_max, acciones, recompensas).
+RUTAS_REFERENCIA = [
+    (3, 7,  None, [4, 3],       [6.02, 6.780314665726757]),
+    (0, 0,  5,    [1, 0],       [-0.93, 18.159410411377465]),
+    (8, 40, None, [1, 6, 8],    [-16.41, 16.26, 5.829027930721375]),
+    (5, 89, 5,    [3, 5],       [-2.88, 15.366317596641899]),
+]
+
+
+@pytest.mark.parametrize("start,day,k,acciones,esperadas", RUTAS_REFERENCIA)
+def test_market_none_reproduce_recompensas_de_antes(data, start, day, k, acciones, esperadas):
+    env = _scalar_env(data, market_process=None)
+    env.reset(seed=0, options={"start_node": start, "start_day_idx": day, "k_max": k})
+    rewards = [env.step(a)[1] for a in acciones]
+    assert rewards == pytest.approx(esperadas, abs=1e-9)
+
+
+@pytest.mark.parametrize("start,day,k,acciones,esperadas", RUTAS_REFERENCIA)
+def test_vector_env_market_none_coincide_con_referencia(data, start, day, k, acciones, esperadas):
+    rm_pen = build_rm_pen_stack(data["rate_stack"], data["loads_stack"],
+                                data["distance_arr"], data["diesel_arr"])
+    env = _vector_env(data, None, rm_pen)
+    env.reset(np.array([start]), np.array([day]), k_max_arr=[k])
+    rewards = [float(env.step(np.array([a]))[0][0]) for a in acciones]
+    assert rewards == pytest.approx(esperadas, abs=1e-5)   # float32
+
+
+def test_lane_reward_coincide_con_rm_pen_stack(data):
+    rm_pen = build_rm_pen_stack(data["rate_stack"], data["loads_stack"],
+                                data["distance_arr"], data["diesel_arr"])
+    for d in (0, 17, 89):
+        for i in (0, 4, 9):
+            fila = lane_reward(
+                data["rate_stack"][d, i], data["loads_stack"][d, i],
+                data["distance_arr"][i], data["diesel_arr"][i],
+            ).astype(np.float32)
+            fila[i] = BIG_M_PENALTY
+            assert np.array_equal(fila, rm_pen[d, i])
+    # y build_day_matrices (que ahora la llama) sigue dando lo mismo que la fórmula original
+    d = 5
+    rev = data["rate_stack"][d] * data["distance_arr"]
+    rev[data["loads_stack"][d] <= 0] = 0
+    from config import MPG, MARGINAL_COST_SIN_DIESEL
+    cost = data["distance_arr"] * (data["diesel_arr"] / MPG) + data["distance_arr"] * MARGINAL_COST_SIN_DIESEL
+    assert np.array_equal(build_day_matrices(
+        data["rate_stack"][d], data["loads_stack"][d], data["distance_arr"], data["diesel_arr"])[0],
+        np.round(rev - cost, 0))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entorno con market_process
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_mascara_y_recompensa_usan_las_filas_sorteadas(data, mp):
+    env = _scalar_env(data, mp)
+    _, info = env.reset(seed=0, options={"start_node": 1, "start_day_idx": 10, "world_seed": 5})
+    rng = np.random.RandomState(0)
+    for _ in range(30):
+        mask = info["action_mask"]
+        nodo_actual = env.current_node
+        loads, rates = env.current_loads_row, env.current_rate_row
+        if nodo_actual != env.start_node:
+            # lanes sin carga ⇒ fuera de la máscara (salvo el retorno al depot)
+            sin_carga = (loads == 0)
+            sin_carga[env.start_node] = False
+            assert np.all(mask[sin_carga] == 0)
+        accion = int(rng.choice(np.where(mask == 1)[0]))
+        esperado = lane_reward(
+            rates[accion], loads[accion],
+            data["distance_arr"][nodo_actual, accion], data["diesel_arr"][nodo_actual, accion],
+        ) / REWARD_SCALE_FACTOR
+        _, r, term, _, info = env.step(accion)
+        if not term:
+            assert r == pytest.approx(float(esperado), abs=1e-6)   # sin bono/penalización terminal
+        else:
+            break
+
+
+def test_escalar_y_vectorial_coinciden_con_el_mismo_mundo(data, mp):
+    starts = np.array([0, 3, 7]); days = np.array([4, 50, 88]); seeds = np.array([11, 22, 33])
+    venv = _vector_env(data, mp)
+    masks = venv.reset(starts, days, world_seeds=seeds)
+    senvs = []
+    for b in range(3):
+        e = _scalar_env(data, mp)
+        e.reset(seed=0, options={"start_node": int(starts[b]), "start_day_idx": int(days[b]),
+                                 "world_seed": int(seeds[b])})
+        senvs.append(e)
+    activos = [True] * 3
+    rng = np.random.RandomState(3)
+    for _ in range(NUM_NODES):
+        acts = np.array([rng.choice(np.where(m == 1)[0]) for m in masks])
+        rewards, term, masks = venv.step(acts)
+        for b in range(3):
+            if not activos[b]:
+                continue
+            _, r, t, _, info = senvs[b].step(int(acts[b]))
+            assert r == pytest.approx(float(rewards[b]), abs=1e-5)
+            assert t == bool(term[b])
+            if t:
+                activos[b] = False
+        if not any(activos):
+            break
+
+
+def test_rewards_row_vectorial_es_la_fila_observada(data, mp):
+    venv = _vector_env(data, mp)
+    venv.reset(np.array([2, 6]), np.array([0, 30]), world_seeds=np.array([1, 2]))
+    for b, nodo in enumerate((2, 6)):
+        esperado = lane_reward(
+            venv.current_rate_row[b], venv.current_loads_row[b],
+            data["distance_arr"][nodo], data["diesel_arr"][nodo],
+        ).astype(np.float32)
+        esperado[nodo] = BIG_M_PENALTY
+        assert np.array_equal(venv.reward_rows[b], esperado)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validación estadística: media y ceros por grupo de volumen h
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_media_y_ceros_simulados_se_parecen_al_historico_por_grupo():
+    n = 35
+    mp35 = MarketProcess(n)
+    hist = np.load(os.path.join(os.path.dirname(__file__), "..", "datos", "load_availability.npy"))[:, :n, :n]
+    D = hist.shape[0]
+    grupo = mp35.params.grupo
+    universo = hist.sum(0) > 0
+
+    rng = np.random.default_rng(1)
+    nodos = np.repeat(np.arange(n), D); dias = np.tile(np.arange(D), n)
+    reps = 100
+    media = np.zeros((n, n)); ceros = np.zeros((n, n))
+    for _ in range(reps):
+        l, _r = mp35.sample_arrivals(nodos, dias, rng)
+        l = l.reshape(n, D, n)
+        media += l.mean(axis=1); ceros += (l == 0).mean(axis=1)
+    media /= reps; ceros /= reps
+
+    for h in range(len(mp35.params.phi)):
+        sel = universo & (grupo == h)
+        assert sel.sum() > 0
+        assert media[sel].mean() == pytest.approx(hist.mean(0)[sel].mean(), rel=0.03)
+        assert ceros[sel].mean() == pytest.approx((hist == 0).mean(0)[sel].mean(), abs=0.03)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ajuste
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _panel_sintetico(D=21, N=6, seed=0):
+    rng = np.random.default_rng(seed)
+    loads = rng.poisson(8, size=(D, N, N)).astype(float)
+    loads[:, 0, 1] = 0    # una lane sin cargas en todo el histórico
+    rate = rng.uniform(2, 4, size=(D, N, N))
+    return loads, rate
+
+
+def test_dias_excluidos_vacia_por_defecto_y_ajuste_usa_todos_los_dias():
+    assert list(DIAS_EXCLUIDOS) == []
+    for D in (21, 35):   # el número de días sale de la forma de la matriz
+        loads, rate = _panel_sintetico(D=D)
+        p = ajustar(loads, rate, FECHA_INICIO, DIAS_EXCLUIDOS)
+        assert len(p["dias_usados"]) == D
+        assert np.array_equal(p["dias_usados"], np.arange(D))
+        assert p["tarifas"].shape[0] == D
+        assert p["fechas_ajuste"][0] == FECHA_INICIO
+        assert p["s"].mean() == pytest.approx(1.0)
+        assert p["mu"][0, 1] == 0 and not p["universo"][0, 1]
+
+
+def test_ajuste_excluye_solo_las_fechas_indicadas():
+    loads, rate = _panel_sintetico(D=21)
+    p = ajustar(loads, rate, FECHA_INICIO, ["2026-01-05", "2026-01-06"])
+    assert len(p["dias_usados"]) == 19
+    assert 4 not in p["dias_usados"] and 5 not in p["dias_usados"]
+    with pytest.raises(ValueError):
+        ajustar(loads, rate, FECHA_INICIO, ["2025-12-31"])
+
+
+def test_parametros_guardados_usan_todos_los_dias_del_archivo():
+    """Con DIAS_EXCLUIDOS vacía, el .npz guardado incluye todos los días de las matrices."""
+    assert list(DIAS_EXCLUIDOS) == []
+    asegurar_parametros()
+    loads, rate = cargar_matrices_completas()
+    with np.load(params_path()) as z:
+        assert z["tarifas"].shape[0] == loads.shape[0] == len(z["dias_usados"])
+        assert np.array_equal(z["dias_usados"], np.arange(loads.shape[0]))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Smoke de entrenamiento con market_process
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_smoke_entrenamiento_con_market_process(data, mp, monkeypatch):
+    monkeypatch.setattr(am_training, "PPO_N_EPISODES_PER_UPDATE", 24)
+    monkeypatch.setattr(am_training, "get_episodes_per_node", lambda n: 6)   # 60 ep, 2 updates
+    agent, critic, ep_rewards, ep_losses, log = am_training.run_am_training(
+        data["time_matrix"], data["rate_stack"][:90], data["loads_stack"][:90],
+        data["distance_arr"], data["diesel_arr"], NUM_NODES,
+        ltr_stack=data["ltr_stack"], trucks_stack=data["trucks_stack"],
+        reward_global_p95=data["reward_global_p95"],
+        avail_expected_arr=data["avail_expected_arr"],
+        market_process=mp,
+    )
+    assert len(log) >= 1 and np.isfinite(ep_rewards).all()
+    for entry in log:
+        for d in entry["k_diagnostics"].values():
+            if d is not None and "conformity_rate" in d:
+                assert d["conformity_rate"] == 1.0

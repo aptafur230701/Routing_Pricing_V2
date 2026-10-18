@@ -59,8 +59,13 @@ def _run_am(
     pretrained_agent=None, pretrained_critic=None,
     ltr_stack=None, trucks_stack=None,
     reward_global_p95=1.0, avail_expected_arr=None,
+    market_process=None,
 ):
-    """Pipeline AM: entrenamiento PPO → checkpoint."""
+    """Pipeline AM: entrenamiento PPO → checkpoint.
+
+    market_process: MarketProcess opcional; si se pasa, el entrenamiento sortea
+    cargas y tarifas del proceso exógeno en vez de reproducir días del histórico.
+    """
     from am_training import run_am_training
 
     episodes_per_node = get_episodes_per_node(NUM_NODES)
@@ -79,6 +84,7 @@ def _run_am(
         ltr_stack=ltr_stack, trucks_stack=trucks_stack,
         reward_global_p95=reward_global_p95,
         avail_expected_arr=avail_expected_arr,
+        market_process=market_process,
     )
     train_time = time.time() - t0
     print(f"Training time: {train_time:.1f} s")
@@ -249,12 +255,18 @@ def _evaluate_and_report(
 
 def main():
     # ── Cambia estos valores según lo que quieras hacer ───────────────────────
-    NUM_NODES       = 20     # opciones: 10 · 20 · 35 · 50 · 75 · 100
+    NUM_NODES       = 10     # opciones: 10 · 20 · 35 · 50 · 75 · 100
     EVAL_ONLY       = False   # True: carga checkpoint y salta entrenamiento
     USE_TRANSFER    = True   # True: warm-start desde el checkpoint del tamaño anterior en
                               # NODE_SEQUENCE (requiere mismo AM_D_H/AM_N_LAYERS que la fuente).
                               # False: entrena desde pesos aleatorios con la arquitectura de config.py.
     N_DAYS_PER_NODE = 3      # días de evaluación por nodo (1 = comportamiento original)
+    USE_MARKET_PROCESS = True  # True: el entrenamiento sortea cargas y tarifas del proceso exógeno
+                                # (proceso_exogeno_cargas_tarifas.md) en vez de reproducir días del
+                                # histórico. Si datos/market_params.npz no existe, corre el ajuste.
+                                # False: comportamiento de siempre. La evaluación sigue siendo por
+                                # replay de los días de eval (la evaluación con mundos simulados
+                                # está aplazada hasta reformular los baselines).
     # ──────────────────────────────────────────────────────────────────────────
 
     cwd          = os.path.dirname(os.path.abspath(__file__))
@@ -275,6 +287,13 @@ def main():
 
     time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
         ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
+
+    # ── Proceso exógeno de cargas y tarifas (opcional) ───────────────────────
+    market_process = None
+    if USE_MARKET_PROCESS:
+        from market_process import MarketProcess, asegurar_parametros
+        asegurar_parametros()
+        market_process = MarketProcess(NUM_NODES)
 
     # ── Train / eval split (temporal — el modelo no ve los días de eval) ──────
     rate_train  = rate_stack[:TRAIN_DAYS]
@@ -298,6 +317,7 @@ def main():
             ltr_stack=ltr_stack, trucks_stack=trucks_stack,
             reward_global_p95=reward_global_p95,
             avail_expected_arr=avail_expected_arr,
+            market_process=market_process,
         )
         ppo_plot_path = os.path.join(output_dir, "PPO_Diagnostics_AM.png")
         plot_ppo_diagnostics(training_log, NUM_NODES, ppo_plot_path)

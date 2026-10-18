@@ -444,6 +444,9 @@ def build_node_features_batch(
     trucks_stack_raw:  np.ndarray = None,   # (N, num_days_ltr, 3)
     reward_global_p95: float      = 1.0,
     avail_expected_arr: np.ndarray = None,  # (N, N) — E[loads] histórico (train), usado en feature [6]
+    reward_rows:       np.ndarray = None,   # (B, N) — recompensa de las lanes salientes ya observada
+                                            # al llegar al nodo actual (modo market_process). Si se
+                                            # pasa, reemplaza la lectura de rm_pen_stack (que puede ser None).
 ) -> np.ndarray:                            # (B, N, N_NODE_FEATURES=8) float32
     """
     Batched version of build_node_features.
@@ -460,7 +463,11 @@ def build_node_features_batch(
 
     # ── f0: reward from rm_pen_stack ──────────────────────────────────────────
     # rm_pen_stack[day_idx[b], current_node[b], j] for all j → (B, N)
-    feats[:, :, 0] = rm_pen_stack[day_idx, current_node, :]   # fancy: (B, N)
+    # (con market_process, la fila sorteada al llegar al nodo actual)
+    if reward_rows is not None:
+        feats[:, :, 0] = reward_rows
+    else:
+        feats[:, :, 0] = rm_pen_stack[day_idx, current_node, :]   # fancy: (B, N)
 
     # ── f1: travel time from current node to each j ───────────────────────────
     feats[:, :, 1] = time_matrix_arr[current_node, :]          # (B, N)

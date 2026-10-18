@@ -35,6 +35,20 @@ La máscara de acciones (info["action_mask"]) excluye:
   start_node siempre permanece válido (la violación de tiempo al regresar la
   detecta _check_termination, no la máscara).
 
+Modo market_process (opcional, por defecto desactivado)
+-------------------------------------------------------
+Con `market_process=None` el entorno reproduce días reales del histórico (todo
+lo descrito arriba). Si se pasa un `MarketProcess` (market_process.py), al
+resetear y al llegar a cada nodo las cargas y tarifas de las lanes salientes se
+SORTEAN del proceso exógeno (loads_row, rate_row) en vez de leerse de
+loads_stack / rate_stack:
+  · la máscara usa loads_row > 0 con las mismas reglas de hoy;
+  · la recompensa del paso usa las filas sorteadas al llegar al nodo actual, con
+    la fórmula compartida problem_data.lane_reward (no se usa rm_pen_stack);
+  · el día de inicio del episodio solo aporta el día de la semana;
+  · cada episodio es un "mundo" con semilla propia (`world_seed`): los sorteos
+    son función de (world_seed, nodo, día) y no dependen de las acciones.
+
 Presupuesto de cardinalidad K (número de arcos, incluido el retorno)
 ----------------------------------------------------------------------
 Se pasa por episodio vía reset(options={"start_node": s, "k_max": K}).
@@ -61,8 +75,10 @@ from config import (
     REWARD_SCALE_FACTOR,
     RETURN_SUCCESS_BONUS,
     TIME_VIOLATION_PENALTY,
+    BIG_M_PENALTY,
+    MARKET_SEED_TRAIN,
 )
-from problem_data import build_day_matrices, draw_lane_availability
+from problem_data import build_day_matrices, draw_lane_availability, lane_reward
 
 
 class RoutingEnv(gym.Env):
@@ -83,6 +99,9 @@ class RoutingEnv(gym.Env):
     diesel_arr     : np.ndarray  (num_nodes × num_nodes)
     num_nodes      : int
     max_duration   : float, opcional (default: MAX_DURATION)
+    market_process : MarketProcess, opcional (default: None = días reales del
+                     histórico). Si se pasa, cargas y tarifas se sortean al llegar
+                     a cada nodo (ver docstring del módulo).
     """
 
     metadata = {"render_modes": []}
@@ -96,6 +115,7 @@ class RoutingEnv(gym.Env):
         diesel_arr:     np.ndarray,
         num_nodes:      int,
         max_duration:   float = MAX_DURATION,
+        market_process = None,
     ):
         super().__init__()
 
@@ -122,6 +142,12 @@ class RoutingEnv(gym.Env):
         # Cache: day_idx → reward_matrix_penalized (np.ndarray).
         # Persists across episodes since build_day_matrices is deterministic.
         self._rm_pen_cache:       dict     = {}
+        # Modo market_process
+        self._market               = market_process
+        self._world_seed:          int      = None
+        self._reward_row:          np.ndarray = None   # (N,) recompensa penalizada de las lanes salientes
+        self._current_loads_row:   np.ndarray = None   # (N,) cargas sorteadas al llegar al nodo actual
+        self._current_rate_row:    np.ndarray = None   # (N,) tarifa por milla sorteada
 
     # ─────────────────────────────────────────────────────────────────────────
     # Ciclo de vida del entorno
@@ -159,11 +185,18 @@ class RoutingEnv(gym.Env):
 
         # Disponibilidad inicial para las lanes salientes del nodo de inicio.
         # time_elapsed=0 → arrival_day = start_day_idx (sin offset).
-        max_day = self._rate_stack.shape[0] - 1
-        arrival_day = min(self._start_day_idx, max_day)
-        self._current_lane_exists = draw_lane_availability(
-            self._start_node, arrival_day, self._loads_stack,
-        )
+        if self._market is not None:
+            if options is not None and "world_seed" in options:
+                self._world_seed = int(options["world_seed"])
+            else:
+                self._world_seed = int(self.np_random.integers(0, 2**31 - 1))
+            self._revelar_mercado(self._start_node, self._start_day_idx)
+        else:
+            max_day = self._rate_stack.shape[0] - 1
+            arrival_day = min(self._start_day_idx, max_day)
+            self._current_lane_exists = draw_lane_availability(
+                self._start_node, arrival_day, self._loads_stack,
+            )
 
         info = {
             "action_mask": self._get_action_mask(),
@@ -199,11 +232,15 @@ class RoutingEnv(gym.Env):
         # 5. Revelar disponibilidad de lanes desde next_node (post-decisión).
         # Seed basado en (start_day_idx, node, arrival_day): dos rutas que llegan
         # al mismo nodo el mismo día de calendario ven la misma realización.
-        max_day     = self._rate_stack.shape[0] - 1
-        arrival_day = min(self._start_day_idx + int(next_time // 14), max_day)
-        self._current_lane_exists = draw_lane_availability(
-            next_node, arrival_day, self._loads_stack,
-        )
+        if self._market is not None:
+            # El día de llegada no se recorta al histórico: el mundo es ilimitado.
+            self._revelar_mercado(next_node, self._start_day_idx + int(next_time // 14))
+        else:
+            max_day     = self._rate_stack.shape[0] - 1
+            arrival_day = min(self._start_day_idx + int(next_time // 14), max_day)
+            self._current_lane_exists = draw_lane_availability(
+                next_node, arrival_day, self._loads_stack,
+            )
 
         # 6. Máscara del siguiente estado
         next_mask = self._get_action_mask()
@@ -226,6 +263,26 @@ class RoutingEnv(gym.Env):
     def _transition(self, next_node: int) -> float:
         return self._time_elapsed + float(self._time_matrix[self._current_node, next_node])
 
+    def _revelar_mercado(self, node: int, arrival_day: int) -> None:
+        """Sortea (loads_row, rate_row) del nodo al llegar y fija máscara y recompensas.
+
+        Las filas se observan solo al llegar al nodo. Es función pura de
+        (world_seed, nodo, día): no depende de las acciones del agente.
+        """
+        loads, rates = self._market.sample_arrivals_por_mundo(
+            [node], [arrival_day], [self._world_seed],
+        )
+        self._current_loads_row = loads[0]
+        self._current_rate_row  = rates[0]
+        self._current_lane_exists = (loads[0] > 0).astype(np.int8)
+        # Recompensa de salir de `node` por cada lane: fórmula compartida con
+        # build_day_matrices; diagonal penalizada igual que en rm_pen_stack.
+        row = lane_reward(
+            rates[0], loads[0], self._distance_arr[node], self._diesel_arr[node],
+        ).astype(np.float32)
+        row[node] = BIG_M_PENALTY
+        self._reward_row = row
+
     def _get_current_day_idx(self) -> int:
         day_offset = int(self._time_elapsed // 14)
         raw = self._start_day_idx + day_offset
@@ -244,9 +301,12 @@ class RoutingEnv(gym.Env):
     def _compute_reward(
         self, next_node: int, next_time: float, terminated: bool
     ) -> float:
-        current_day_idx = self._get_current_day_idx()
-        rm_pen = self._get_rm_pen(current_day_idx)
-        raw_reward = float(rm_pen[self._current_node, next_node])
+        if self._market is not None:
+            raw_reward = float(self._reward_row[next_node])
+        else:
+            current_day_idx = self._get_current_day_idx()
+            rm_pen = self._get_rm_pen(current_day_idx)
+            raw_reward = float(rm_pen[self._current_node, next_node])
         step_reward = raw_reward / REWARD_SCALE_FACTOR
 
         terminal_reward = 0.0
@@ -356,6 +416,21 @@ class RoutingEnv(gym.Env):
     def k_restricted(self) -> bool:
         return self._k_restricted
 
+    @property
+    def world_seed(self):
+        """Semilla del mundo del episodio (None sin market_process)."""
+        return self._world_seed
+
+    @property
+    def current_loads_row(self):
+        """(N,) cargas sorteadas al llegar al nodo actual (None sin market_process)."""
+        return self._current_loads_row
+
+    @property
+    def current_rate_row(self):
+        """(N,) tarifa por milla sorteada al llegar al nodo actual (None sin market_process)."""
+        return self._current_rate_row
+
 
 class VectorRoutingEnv:
     """
@@ -370,6 +445,13 @@ class VectorRoutingEnv:
     rm_pen_stack : np.ndarray (num_train_days, N, N) float32
                    Penalized reward matrices precomputed by build_rm_pen_stack().
                    Passed in from training to avoid recomputing per step.
+                   Con market_process puede ser None (no se usa).
+    market_process : MarketProcess, opcional (default None = días reales).
+                   Si se pasa, cargas y tarifas de las lanes salientes se sortean
+                   al llegar a cada nodo (ver docstring del módulo); requiere
+                   distance_arr y diesel_arr para la recompensa.
+    market_seed    : semilla del generador que reparte las semillas de mundo
+                   cuando reset() no recibe `world_seeds`.
     """
 
     def __init__(
@@ -380,7 +462,15 @@ class VectorRoutingEnv:
         rm_pen_stack:    np.ndarray,
         num_nodes:       int,
         max_duration:    float = MAX_DURATION,
+        market_process = None,
+        distance_arr:    np.ndarray = None,
+        diesel_arr:      np.ndarray = None,
+        market_seed:     int = MARKET_SEED_TRAIN,
     ):
+        if market_process is None and rm_pen_stack is None:
+            raise ValueError("rm_pen_stack es obligatorio sin market_process")
+        if market_process is not None and (distance_arr is None or diesel_arr is None):
+            raise ValueError("market_process requiere distance_arr y diesel_arr")
         self._time_matrix_arr = (
             time_matrix.to_numpy(dtype=float)
             if hasattr(time_matrix, "to_numpy")
@@ -391,6 +481,15 @@ class VectorRoutingEnv:
         self._rm_pen_stack   = rm_pen_stack   # (num_train_days, N, N)
         self.num_nodes       = num_nodes
         self.max_duration    = max_duration
+        self._market         = market_process
+        self._distance_arr   = distance_arr
+        self._diesel_arr     = diesel_arr
+        self._seed_rng       = np.random.default_rng(market_seed)   # reparte semillas de mundo
+        # Último día con datos (para clamp de features históricas como LTR/camiones).
+        self._max_day = (
+            self._rm_pen_stack.shape[0] if self._rm_pen_stack is not None
+            else rate_stack.shape[0]
+        ) - 1
 
         # Initialized by reset()
         self._B:                   int        = 0
@@ -406,6 +505,11 @@ class VectorRoutingEnv:
         self._k_max:               np.ndarray = None   # (B,) int64 — indefinido donde no restringido
         self._k_remaining:         np.ndarray = None   # (B,) int64 — indefinido donde no restringido
         self._last_time_violation: np.ndarray = None   # (B,) bool — poblado por step()
+        # Modo market_process
+        self._world_seed:          np.ndarray = None   # (B,) int64 — semilla del mundo de cada episodio
+        self._reward_row:          np.ndarray = None   # (B, N) float32 — recompensa penalizada de las lanes salientes
+        self._current_loads_row:   np.ndarray = None   # (B, N) int64 — cargas sorteadas al llegar
+        self._current_rate_row:    np.ndarray = None   # (B, N) float32 — tarifa por milla sorteada
 
     # ─────────────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -416,6 +520,8 @@ class VectorRoutingEnv:
         start_nodes:    np.ndarray,   # (B,) int64
         start_day_idxs: np.ndarray,   # (B,) int64
         k_max_arr:      list = None,  # length-B list of (int | None); None ⇒ all free
+        world_seeds:    np.ndarray = None,  # (B,) semillas de mundo (solo market_process);
+                                            # None ⇒ se reparten desde market_seed
     ) -> np.ndarray:                  # masks (B, N) int8
         B = len(start_nodes)
         N = self.num_nodes
@@ -444,15 +550,28 @@ class VectorRoutingEnv:
             self._k_remaining = self._k_max.copy()
         self._last_time_violation = np.zeros(B, dtype=bool)
 
-        # Initial lane availability: one draw_lane_availability call per row
-        max_day = self._rate_stack.shape[0] - 1
-        lane_rows = []
-        for b in range(B):
-            arrival_day = min(int(self._start_day_idx[b]), max_day)
-            lane_rows.append(draw_lane_availability(
-                int(self._start_node[b]), arrival_day, self._loads_stack,
-            ))
-        self._current_lane_exists = np.stack(lane_rows)   # (B, N) int8
+        if self._market is not None:
+            # Cada episodio es un mundo con semilla propia. Pasar las MISMAS
+            # semillas a otro reset (p.ej. el rollout greedy del self-critical)
+            # reproduce las mismas realizaciones de cargas y tarifas.
+            if world_seeds is None:
+                world_seeds = self._seed_rng.integers(0, 2**31 - 1, size=B)
+            self._world_seed = np.asarray(world_seeds, dtype=np.int64)
+            self._current_lane_exists = np.zeros((B, N), dtype=np.int8)
+            self._reward_row          = np.zeros((B, N), dtype=np.float32)
+            self._current_loads_row   = np.zeros((B, N), dtype=np.int64)
+            self._current_rate_row    = np.zeros((B, N), dtype=np.float32)
+            self._revelar_mercado(np.arange(B), self._start_day_idx)
+        else:
+            # Initial lane availability: one draw_lane_availability call per row
+            max_day = self._rate_stack.shape[0] - 1
+            lane_rows = []
+            for b in range(B):
+                arrival_day = min(int(self._start_day_idx[b]), max_day)
+                lane_rows.append(draw_lane_availability(
+                    int(self._start_node[b]), arrival_day, self._loads_stack,
+                ))
+            self._current_lane_exists = np.stack(lane_rows)   # (B, N) int8
 
         return self._compute_masks()
 
@@ -482,16 +601,17 @@ class VectorRoutingEnv:
         terminated_a = self._active & cond_a
 
         # ── Reward (computed BEFORE state update, using current node/day) ──────
-        max_rm_day = self._rm_pen_stack.shape[0] - 1
-        day_idx = np.minimum(
-            self._start_day_idx + (self._time_elapsed // 14).astype(np.int64),
-            max_rm_day,
-        )   # (B,)
-
-        step_reward = (
-            self._rm_pen_stack[day_idx, self._current_node, actions].astype(np.float32)
-            / REWARD_SCALE_FACTOR
-        )
+        if self._market is not None:
+            # Filas sorteadas al llegar al nodo actual (fórmula compartida lane_reward).
+            raw_reward = self._reward_row[np.arange(B), actions]
+        else:
+            max_rm_day = self._rm_pen_stack.shape[0] - 1
+            day_idx = np.minimum(
+                self._start_day_idx + (self._time_elapsed // 14).astype(np.int64),
+                max_rm_day,
+            )   # (B,)
+            raw_reward = self._rm_pen_stack[day_idx, self._current_node, actions]
+        step_reward = raw_reward.astype(np.float32) / REWARD_SCALE_FACTOR
 
         # Terminal reward components (using visited_mask BEFORE the state update)
         n_intermediate = self._visited_mask.sum(axis=1).astype(np.float32) - 1   # (B,)
@@ -527,15 +647,22 @@ class VectorRoutingEnv:
         self._k_remaining   = np.where(self._active, self._k_remaining - 1, self._k_remaining)
 
         # ── Lane revelation (active rows NOT terminated by condition A) ───────
-        max_day = self._rate_stack.shape[0] - 1
-        for b in np.where(self._active & ~cond_a)[0]:
-            arrival_day = min(
-                int(self._start_day_idx[b]) + int(self._time_elapsed[b] // 14),
-                max_day,
-            )
-            self._current_lane_exists[b] = draw_lane_availability(
-                int(self._current_node[b]), arrival_day, self._loads_stack,
-            )
+        reveal = np.where(self._active & ~cond_a)[0]
+        if self._market is not None:
+            # El día de llegada no se recorta al histórico: el mundo es ilimitado.
+            if len(reveal):
+                arrival_day = self._start_day_idx[reveal] + (self._time_elapsed[reveal] // 14).astype(np.int64)
+                self._revelar_mercado(reveal, arrival_day)
+        else:
+            max_day = self._rate_stack.shape[0] - 1
+            for b in reveal:
+                arrival_day = min(
+                    int(self._start_day_idx[b]) + int(self._time_elapsed[b] // 14),
+                    max_day,
+                )
+                self._current_lane_exists[b] = draw_lane_availability(
+                    int(self._current_node[b]), arrival_day, self._loads_stack,
+                )
 
         # ── Update active after condition A ───────────────────────────────────
         self._active = self._active & ~cond_a
@@ -558,6 +685,28 @@ class VectorRoutingEnv:
     # ─────────────────────────────────────────────────────────────────────────
     # Internal helpers
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _revelar_mercado(self, rows: np.ndarray, arrival_day: np.ndarray) -> None:
+        """Sortea (loads_row, rate_row) de las filas `rows` al llegar a su nodo actual.
+
+        Actualiza la disponibilidad de lanes (máscara) y la fila de recompensas.
+        Cada fila es función pura de (semilla de mundo, nodo, día): no depende de
+        las acciones del agente ni de qué otras filas sigan activas.
+        """
+        nodes = self._current_node[rows]
+        loads, rates = self._market.sample_arrivals_por_mundo(
+            nodes, arrival_day, self._world_seed[rows],
+        )
+        self._current_loads_row[rows] = loads
+        self._current_rate_row[rows]  = rates
+        self._current_lane_exists[rows] = (loads > 0).astype(np.int8)
+        # Recompensa de salir de `nodes` por cada lane: fórmula compartida con
+        # build_day_matrices; diagonal penalizada igual que en rm_pen_stack.
+        reward = lane_reward(
+            rates, loads, self._distance_arr[nodes], self._diesel_arr[nodes],
+        ).astype(np.float32)
+        reward[np.arange(len(rows)), nodes] = BIG_M_PENALTY
+        self._reward_row[rows] = reward
 
     def _compute_masks(self) -> np.ndarray:
         """Compute action masks for all B episodes. Returns (B, N) int8."""
@@ -629,11 +778,34 @@ class VectorRoutingEnv:
 
     @property
     def current_day_idx(self) -> np.ndarray:
-        max_day = self._rm_pen_stack.shape[0] - 1
         return np.minimum(
             self._start_day_idx + (self._time_elapsed // 14).astype(np.int64),
-            max_day,
+            self._max_day,
         )
+
+    @property
+    def reward_rows(self) -> np.ndarray:
+        """(B, N) float32 — recompensa penalizada de las lanes salientes del nodo
+        actual (f0 de las features del agente). Con market_process sale de las
+        filas sorteadas al llegar; sin él, de rm_pen_stack en el día actual."""
+        if self._market is not None:
+            return self._reward_row
+        return self._rm_pen_stack[self.current_day_idx, self._current_node, :]
+
+    @property
+    def world_seed(self) -> np.ndarray:
+        """(B,) semillas de mundo de los episodios (None sin market_process)."""
+        return self._world_seed
+
+    @property
+    def current_loads_row(self) -> np.ndarray:
+        """(B, N) cargas sorteadas al llegar al nodo actual (None sin market_process)."""
+        return self._current_loads_row
+
+    @property
+    def current_rate_row(self) -> np.ndarray:
+        """(B, N) tarifa por milla sorteada al llegar al nodo actual (None sin market_process)."""
+        return self._current_rate_row
 
     @property
     def k_remaining(self) -> np.ndarray:

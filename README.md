@@ -18,7 +18,7 @@ python inference.py     # inferencia interactiva con un checkpoint ya entrenado
 
 Todo lo que hay que tocar para un run distinto está al principio de
 `main()` en [main.py](main.py): `NUM_NODES`, `EVAL_ONLY`, `USE_TRANSFER`,
-`N_DAYS_PER_NODE`. Los hiperparámetros del modelo y del PPO están todos en
+`N_DAYS_PER_NODE`, `USE_MARKET_PROCESS`. Los hiperparámetros del modelo y del PPO están todos en
 [config.py](config.py).
 
 ## Arquitectura del modelo
@@ -80,6 +80,28 @@ nodos, ver `NODE_SEQUENCE`).
 | [Solvers.py](Solvers.py) | Baselines de comparación: heurística greedy, HGA-LNS (GA + LNS + 2-opt híbrido), rolling-horizon (determinista y estocástico), MC-Rollout, label-setting exacto/oráculo. |
 | [inference.py](inference.py) | Inferencia standalone: carga un checkpoint y genera una ruta desde un nodo dado. |
 
+### Proceso exógeno de cargas y tarifas (opcional)
+
+Diseño completo en [proceso_exogeno_cargas_tarifas.md](proceso_exogeno_cargas_tarifas.md).
+Con `USE_MARKET_PROCESS = True` el entrenamiento ya no reproduce días del
+histórico: al llegar a cada nodo se sortean las cargas (binomial negativa con
+factor de día de la semana) y las tarifas (remuestreo del histórico de la lane).
+Con `False` (por defecto) todo se comporta como antes.
+
+| Archivo | Rol |
+|---|---|
+| [fit_market_process.py](fit_market_process.py) | Estima s_d, mu_ij y phi_h con todos los días del histórico y guarda `datos/market_params.npz`. `main.py` lo corre solo si el archivo no existe. |
+| [market_process.py](market_process.py) | `MarketProcess`: `sample_arrivals` (lotes con un Generator), `sample_arrivals_por_mundo` (usado por el entorno; determinista por semilla de mundo, nodo y día) y `sample_world` (mundo completo [D, N, N] para baselines). |
+| [validate_market_process.py](validate_market_process.py) | Simula 1.000 réplicas del periodo y compara cargas por lane y tarifas con el histórico (tablas y gráficos en `results/market_validation/`). |
+| [tests/test_market_process.py](tests/test_market_process.py) | Reproducibilidad, independencia de las acciones, formas, equivalencia con `market_process=None`, recompensa compartida, ajuste y smoke de entrenamiento. |
+
+Constantes (`FECHA_INICIO`, `DIAS_EXCLUIDOS`, `MARKET_PHI_MAX`, semillas, M) en
+[config.py](config.py). La fórmula de recompensa del paso es `lane_reward` en
+[problem_data.py](problem_data.py), compartida por el modo real y el simulado.
+Pendiente (aplazado hasta reformular los baselines): evaluación con mundos
+simulados en `evaluation.py` / `Solvers.py` / `stats_analysis.py` y la
+comparación de política de la validación.
+
 ### Validación final del modelo
 
 | Archivo | Rol |
@@ -107,7 +129,10 @@ nodos, ver `NODE_SEQUENCE`).
 3. **Comparar contra baselines**: `results/<N>nodes/DRL_Routing_Summary_AM.xlsx`
    trae el gap de DRL contra cada solver de `Solvers.py`, más las hojas de
    estadística de `stats_analysis.py` (Wilcoxon pareado).
-4. **Inferencia puntual**: `python inference.py` con un checkpoint ya
+4. **Entrenar con el proceso exógeno**: `USE_MARKET_PROCESS = True` en
+   `main.py` (si falta `datos/market_params.npz` corre `fit_market_process.py`).
+   Validar el simulador con `python validate_market_process.py`.
+5. **Inferencia puntual**: `python inference.py` con un checkpoint ya
    guardado en `checkpoints/`.
 
 ## Requisitos

@@ -37,6 +37,7 @@ from config import (
     PPO_WEIGHT_DECAY,
     USE_SELF_CRITICAL, SELF_CRITICAL_COEF, SELF_CRITICAL_WARMUP_UPDATES,
     K_TRAINING_LEVELS,
+    MARKET_SEED_TRAIN,
 )
 from routing_env import VectorRoutingEnv
 from problem_data import build_rm_pen_stack
@@ -351,6 +352,7 @@ def _collect_greedy_rollout(
     num_nodes:       int,
     k_max_arr:       list = None,   # MISMOS niveles de K que el rollout muestreado del update
     avail_expected_arr: np.ndarray = None,
+    world_seeds:     np.ndarray = None,   # MISMAS semillas de mundo que el rollout muestreado (market_process)
 ) -> np.ndarray:
     """
     Rollout greedy (argmax, beam=1) vectorizado sobre los MISMOS
@@ -366,6 +368,11 @@ def _collect_greedy_rollout(
     el mismo del rollout muestreado: si el baseline se calcula con un K
     distinto, la ventaja queda contaminada.
 
+    Con market_process, `world_seeds` DEBE ser el mismo del rollout muestreado:
+    cada sorteo es función de (semilla de mundo, nodo, día), así que ambos
+    rollouts ven las mismas cargas y tarifas cuando llegan al mismo nodo el
+    mismo día y la ventaja R_sample − R_greedy no mezcla ruido del mundo.
+
     Asume que agent/critic ya están en eval() (llamado entre la fase de
     recolección y la fase de update del loop principal). No samplea ni usa
     RNG global: greedy_action es argmax puro, así que no perturba la
@@ -374,7 +381,8 @@ def _collect_greedy_rollout(
     B = len(start_nodes_arr)
     ep_rewards = np.zeros(B, dtype=np.float32)
 
-    masks  = vec_env.reset(start_nodes_arr, start_day_idxs, k_max_arr=k_max_arr)
+    masks  = vec_env.reset(start_nodes_arr, start_day_idxs, k_max_arr=k_max_arr,
+                           world_seeds=world_seeds)
     active = np.ones(B, dtype=bool)
 
     with torch.no_grad():
@@ -394,6 +402,7 @@ def _collect_greedy_rollout(
                 trucks_stack_raw=trucks_stack,
                 reward_global_p95=reward_global_p95,
                 avail_expected_arr=avail_expected_arr,
+                reward_rows=vec_env.reward_rows,
             )
             temporal = build_temporal_features_batch(time_el, step_cnt, MAX_DURATION, num_nodes)
             market   = build_market_features_batch(cur_nodes, day_idx, ltr_stack) if ltr_stack is not None \
@@ -439,6 +448,8 @@ def run_am_training(
     trucks_stack:      np.ndarray = None,   # [num_nodes, 120, 3]
     reward_global_p95: float      = 1.0,
     avail_expected_arr: np.ndarray = None,  # [num_nodes, num_nodes]
+    market_process = None,   # MarketProcess opcional (proceso exógeno de cargas y tarifas). None = días
+                             # reales del histórico (comportamiento de siempre).
     trial_callback: callable = None,  # HPO opcional: fn(step, n_updates, log_entry) -> bool
                                        # (True = detener el entrenamiento ya, p.ej. Optuna pruning).
                                        # Solo se invoca en los updates de log_freq (donde greedy_reward
@@ -459,6 +470,10 @@ def run_am_training(
     trucks_stack   : np.ndarray [num_nodes, 120, 3] — camiones por hub, día y delta
     avail_expected_arr : np.ndarray [num_nodes, num_nodes] — E[loads] histórico
                      (train), usado solo como feature de entrada (avail_prior)
+    market_process : MarketProcess | None — si se pasa, en cada llegada a un nodo las cargas y
+                     tarifas se sortean del proceso exógeno (cada episodio es un mundo con semilla
+                     propia, generada desde MARKET_SEED_TRAIN) en vez de leerse del histórico; el
+                     día de inicio solo aporta el día de la semana. No se usa rm_pen_stack.
     trial_callback : callable opcional fn(step, n_updates, log_entry) -> bool, invocado en
                      cada update de log_freq; si devuelve True, el entrenamiento se detiene
                      ahí mismo (usado por hpo_optuna.py para pruning).
@@ -518,10 +533,13 @@ def run_am_training(
         if hasattr(time_matrix, "to_numpy")
         else np.asarray(time_matrix, dtype=float)
     )
-    rm_pen_stack = build_rm_pen_stack(
-        rate_stack[:num_train_days], loads_stack[:num_train_days],
-        distance_arr, diesel_arr,
-    )   # (num_train_days, N, N) float32
+    if market_process is None:
+        rm_pen_stack = build_rm_pen_stack(
+            rate_stack[:num_train_days], loads_stack[:num_train_days],
+            distance_arr, diesel_arr,
+        )   # (num_train_days, N, N) float32
+    else:
+        rm_pen_stack = None   # con proceso exógeno la recompensa sale de las filas sorteadas
 
     # ── Entorno vectorizado (una sola instancia, reutilizada en cada update) ──
     vec_env = VectorRoutingEnv(
@@ -531,12 +549,20 @@ def run_am_training(
         rm_pen_stack=rm_pen_stack,
         num_nodes=num_nodes,
         max_duration=MAX_DURATION,
+        market_process=market_process,
+        distance_arr=distance_arr,
+        diesel_arr=diesel_arr,
     )
+    # Generador PROPIO de semillas de mundo (nunca el estado global de numpy): una
+    # semilla por episodio y update, independiente de las decisiones del agente.
+    world_rng = np.random.default_rng(MARKET_SEED_TRAIN)
 
     print(
         f"\n--- Entrenamiento AM-PPO: {total_episodes} episodios "
         f"({n_updates} updates × {n_episodes_per_update} ep/update) ---"
     )
+    if market_process is not None:
+        print("Modo: proceso exógeno de cargas y tarifas (market_process) — un mundo por episodio.")
 
     # ── Set fijo de evaluación greedy (mismos episodios en cada chequeo) ──────
     # RandomState propio, separado del RNG global de numpy: así no perturba la
@@ -590,7 +616,12 @@ def run_am_training(
         # since episodes of different lengths interleave in the step loop.
         ep_bufs        = [[] for _ in range(B)]
 
-        masks  = vec_env.reset(start_nodes_arr, start_day_idxs, k_max_arr=k_max_arr)   # (B, N)
+        # Un mundo (semilla) por episodio; el rollout greedy del self-critical reusa
+        # las mismas semillas para ver la misma realización.
+        world_seeds = world_rng.integers(0, 2**31 - 1, size=B) if market_process is not None else None
+
+        masks  = vec_env.reset(start_nodes_arr, start_day_idxs, k_max_arr=k_max_arr,
+                               world_seeds=world_seeds)   # (B, N)
         active = np.ones(B, dtype=bool)
 
         with torch.no_grad():
@@ -611,6 +642,7 @@ def run_am_training(
                     trucks_stack_raw=trucks_stack,
                     reward_global_p95=reward_global_p95,
                     avail_expected_arr=avail_expected_arr,
+                    reward_rows=vec_env.reward_rows,
                 )   # (B, N, 8)
                 temporal = build_temporal_features_batch(time_el, step_cnt, MAX_DURATION, num_nodes)   # (B, 3)
                 market   = build_market_features_batch(cur_nodes, day_idx, ltr_stack) if ltr_stack is not None \
@@ -676,6 +708,7 @@ def run_am_training(
                 ltr_stack, num_nodes,
                 k_max_arr=k_max_arr,
                 avail_expected_arr=avail_expected_arr,
+                world_seeds=world_seeds,
             )
         else:
             greedy_ep_rewards = None
