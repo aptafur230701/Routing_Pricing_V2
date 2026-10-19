@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from config import TRAIN_DAYS
 from fit_market_process import dia_de_semana, params_path, main as _ajustar
 
 
@@ -170,7 +171,13 @@ class MarketProcess:
 
 
 def asegurar_parametros() -> None:
-    """Corre el ajuste (fit_market_process) si datos/market_params.npz no existe."""
-    if not os.path.exists(params_path()):
+    """Corre el ajuste (fit_market_process) si datos/market_params.npz no existe o se ajustó
+    con días distintos de los TRAIN_DAYS de entrenamiento (p. ej. un archivo viejo con los 120)."""
+    if os.path.exists(params_path()):
+        with np.load(params_path()) as z:
+            if len(z["dias_usados"]) == TRAIN_DAYS:
+                return
+        print("market_params.npz no se ajustó con los días de entrenamiento: reajustando...")
+    else:
         print("market_params.npz no existe: corriendo el ajuste del proceso exógeno...")
-        _ajustar()
+    _ajustar()

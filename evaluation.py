@@ -20,6 +20,9 @@ escala).
 """
 
 import copy
+import hashlib
+import os
+import pickle
 import time
 import numpy as np
 import pandas as pd
@@ -29,7 +32,7 @@ from config import (
     MAX_DURATION, K_MAX, TRAIN_DAYS,
     MARKET_SEED_EVAL, MARKET_M_EVAL_WORLDS, REPLAY_MAX_CASOS,
 )
-from baselines import Observacion, PoliticaB1, PoliticaB2
+from baselines import Observacion, PoliticaB1, PoliticaB2, calcular_ev_esperado
 from dp_relajada import PoliticaB3
 from greedy_rollout import greedy_rollout
 from problem_data import build_rm_pen_stack, lane_reward
@@ -94,6 +97,7 @@ def rollout_drl_env(
     avail_expected_arr: np.ndarray = None,
     world_seed:     int        = None,
     device:         torch.device = None,
+    ev_esperado:    np.ndarray = None,   # (7, N, N) calcular_ev_esperado; obligatorio con USE_CONTINUATION_FEATURES
 ) -> tuple:
     """Una ruta del agente: paso a paso en el entorno, argmax en cada nodo.
 
@@ -117,6 +121,7 @@ def rollout_drl_env(
         avail_expected_arr=avail_expected_arr,
         world_seeds=None if world_seed is None else np.array([world_seed], dtype=np.int64),
         device=device,
+        ev_esperado=ev_esperado,
     )
     if not res.valid[0]:
         return None, -np.inf, np.inf
@@ -250,6 +255,7 @@ class ContextoEval:
         self.dist, self.diesel, self.N = distance_arr, diesel_arr, num_nodes
         self.ltr, self.trucks = ltr_stack, trucks_stack
         self.avail, self.p95 = avail_expected_arr, reward_global_p95
+        self.ev = calcular_ev_esperado(market, distance_arr, diesel_arr)   # una vez por evaluación
         self.politicas = {
             "B1": PoliticaB1(distance_arr, diesel_arr),
             "B2": PoliticaB2(market, self.T, distance_arr, diesel_arr),
@@ -272,6 +278,7 @@ def _ejecutar_drl(ctx, env, nodo, dia, K, world_seed, dow0, loads_stack=None, ra
             ctx.agent_cpu, envc, np.array([nodo], dtype=np.int64), np.array([dia], dtype=np.int64),
             ctx.T, ctx.dist, ctx.trucks, ctx.ltr, ctx.p95, ctx.N,
             k_max_arr=[K], avail_expected_arr=ctx.avail, world_seeds=seeds, device=torch.device("cpu"),
+            ev_esperado=ctx.ev,
         )
         total = time.perf_counter() - t0
         ruta = res.routes[0]
@@ -344,20 +351,91 @@ def _fila(modo, K, mundo, nodo, dia_abs, start_day, world_seed, dow, metodo, m, 
     }
 
 
+def _firma_cache(ctx, *partes) -> str:
+    """Huella de lo que determina los baselines y las cotas: el ev (proceso ajustado), la tabla V
+    de UB-DP y el diseño de la evaluación. Si cambia algo de eso, el caché no se reutiliza."""
+    h = hashlib.sha1(np.ascontiguousarray(ctx.ev).tobytes())
+    h.update(np.ascontiguousarray(ctx.tabla.V_k).tobytes())
+    h.update(np.ascontiguousarray(ctx.tabla.V_libre).tobytes())
+    h.update(repr((partes, MAX_DURATION)).encode())
+    return h.hexdigest()
+
+
+def _filas_con_cache(cache_path, firma, calcular, verbose=True) -> pd.DataFrame:
+    """Filas de B1, B2, B3 y cotas (no dependen del DRL): se calculan una vez y se reusan.
+
+    cache_path None ⇒ sin caché. Un caché con otra firma se recalcula y se sobrescribe."""
+    if cache_path and os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            c = pickle.load(f)
+        if c.get("firma") == firma:
+            if verbose:
+                print(f"  baselines y cotas: reutilizados de {cache_path}")
+            return c["df"]
+    df = calcular()
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump({"firma": firma, "df": df}, f)
+    return df
+
+
+def _combinar(base: pd.DataFrame, drl: pd.DataFrame, k_levels) -> pd.DataFrame:
+    """Une las filas de baselines y del DRL en el orden de siempre: (mundo, K, método)."""
+    df = pd.concat([base, drl], ignore_index=True)
+    orden_k = {_etiqueta_k(K): n for n, K in enumerate(k_levels)}
+    orden_m = {m: n for n, m in enumerate(_METODOS)}
+    clave = pd.DataFrame({"m": df["mundo"], "k": df["K"].map(orden_k), "n": df["metodo"].map(orden_m)})
+    return df.iloc[clave.sort_values(["m", "k", "n"], kind="stable").index].reset_index(drop=True)
+
+
 def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, loads_train,
                              distance_arr, diesel_arr, num_nodes, ltr_stack, trucks_stack,
                              avail_expected_arr, reward_global_p95,
-                             M=MARKET_M_EVAL_WORLDS, k_levels=(K_MAX, None), verbose=True) -> pd.DataFrame:
+                             M=MARKET_M_EVAL_WORLDS, k_levels=(K_MAX, None), verbose=True,
+                             cache_path=None) -> pd.DataFrame:
     """DRL, B1, B2 (solo K finito) y B3 sobre los mismos M mundos simulados, por nivel de K.
 
     Los mismos mundos (nodo, día, world_seed) se usan en todos los niveles de K. Devuelve un
     DataFrame largo: una fila por (K, mundo, método) con el margen en USD, la factibilidad,
     las métricas operativas y las cotas ub_dp / ub_pi del mundo.
+
+    cache_path : B1, B2, B3, UB-PI y UB-DP no dependen del DRL, así que con una ruta se calculan una
+        sola vez y se reusan entre corridas (mientras no cambie el proceso, la tabla V ni el diseño).
     """
     ctx = ContextoEval(agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
                        ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95)
     env = make_sim_env(time_matrix, rate_train, loads_train, distance_arr, diesel_arr, num_nodes, market)
     dis = disenar_mundos(num_nodes, M, market, num_dias=rate_train.shape[0])
+
+    def cotas(m, nodo, dow, K, mundo_pi):
+        pi, _ = ub_pi(market, time_matrix, distance_arr, diesel_arr, num_nodes, nodo, K, mundo_pi)
+        dp = tabla.ub_dp(nodo, dow, K) if (K is None or 2 <= K <= tabla.K) else float("nan")
+        return dp, pi
+
+    def baselines():
+        filas = []
+        with _UnHilo():
+            for m in range(M):
+                nodo, dow = int(dis["nodo"][m]), int(dis["dow"][m])
+                dia, ws = int(dis["start_day"][m]), int(dis["world_seed"][m])
+                mundo_pi = market.sample_world(ws, _DIAS_SIMULADOS_UB_PI, dia)    # solo para UB-PI
+                for K in k_levels:
+                    dp, pi = cotas(m, nodo, dow, K, mundo_pi)
+                    for nombre in _METODOS[1:]:
+                        if nombre == "B2" and K is None:
+                            continue                                       # B2 solo con K finito
+                        res = ejecutar_politica(ctx.politicas[nombre], env, nodo, dia, K, ws,
+                                                distance_arr, diesel_arr, dow)
+                        filas.append(_fila("simulado", K, m, nodo, dia, dia, ws, dow, nombre, res, dp, pi))
+                if verbose and (m + 1) % 100 == 0:
+                    print(f"  mundos simulados (baselines y cotas): {m + 1}/{M}", flush=True)
+        return pd.DataFrame(filas)
+
+    firma = _firma_cache(ctx, "simulado", num_nodes, M, MARKET_SEED_EVAL, tuple(k_levels), rate_train.shape[0])
+    base = _filas_con_cache(cache_path, firma, baselines, verbose)
+    cota = base.groupby(["K", "mundo"])[["ub_dp", "ub_pi"]].first()
+
     filas = []
     with _UnHilo():
         # Calentamiento de torch (primera llamada) fuera de la medición.
@@ -366,22 +444,13 @@ def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, load
         for m in range(M):
             nodo, dow = int(dis["nodo"][m]), int(dis["dow"][m])
             dia, ws = int(dis["start_day"][m]), int(dis["world_seed"][m])
-            mundo_pi = market.sample_world(ws, _DIAS_SIMULADOS_UB_PI, dia)    # solo para UB-PI
             for K in k_levels:
-                pi, _ = ub_pi(market, time_matrix, distance_arr, diesel_arr, num_nodes, nodo, K, mundo_pi)
-                dp = tabla.ub_dp(nodo, dow, K) if (K is None or 2 <= K <= tabla.K) else float("nan")
-                for nombre in _METODOS:
-                    if nombre == "B2" and K is None:
-                        continue                                       # B2 solo con K finito
-                    if nombre == "DRL":
-                        res = _ejecutar_drl(ctx, env, nodo, dia, K, ws, dow)
-                    else:
-                        res = ejecutar_politica(ctx.politicas[nombre], env, nodo, dia, K, ws,
-                                                distance_arr, diesel_arr, dow)
-                    filas.append(_fila("simulado", K, m, nodo, dia, dia, ws, dow, nombre, res, dp, pi))
-            if verbose and (m + 1) % 10 == 0:
-                print(f"  mundos simulados: {m + 1}/{M}", flush=True)
-    df = pd.DataFrame(filas)
+                dp, pi = cota.loc[(_etiqueta_k(K), m)]
+                res = _ejecutar_drl(ctx, env, nodo, dia, K, ws, dow)
+                filas.append(_fila("simulado", K, m, nodo, dia, dia, ws, dow, "DRL", res, dp, pi))
+            if verbose and (m + 1) % 100 == 0:
+                print(f"  mundos simulados (DRL): {m + 1}/{M}", flush=True)
+    df = _combinar(base, pd.DataFrame(filas), k_levels)
     _avisar_si_supera_cota(df)
     return df
 
@@ -401,39 +470,59 @@ def casos_replay(num_nodes: int, num_dias: int, max_casos: int = REPLAY_MAX_CASO
 def evaluar_replay(agent, market, tabla, time_matrix, rate_eval, loads_eval,
                    distance_arr, diesel_arr, num_nodes, ltr_eval, trucks_eval,
                    avail_expected_arr, reward_global_p95,
-                   k_levels=(K_MAX, None), max_casos=REPLAY_MAX_CASOS, verbose=True) -> pd.DataFrame:
+                   k_levels=(K_MAX, None), max_casos=REPLAY_MAX_CASOS, verbose=True,
+                   cache_path=None) -> pd.DataFrame:
     """El mismo arnés con market_process=None sobre los días reales de evaluación (días 90-119).
 
-    Descriptivo: replay, no independiente del simulador (el proceso se ajustó con los 120
-    días). ltr_eval / trucks_eval deben estar recortados a los mismos días que rate_eval.
+    Fuera de muestra respecto del proceso (se ajusta solo con los TRAIN_DAYS de
+    entrenamiento). ltr_eval / trucks_eval deben estar recortados a los mismos días que rate_eval.
     UB-PI se resuelve sobre el histórico; UB-DP no aplica (es una cota del proceso).
+    cache_path : como en evaluar_mundos_simulados, para B1, B2, B3 y UB-PI.
     """
     ctx = ContextoEval(agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
                        ltr_eval, trucks_eval, avail_expected_arr, reward_global_p95)
     env = make_replay_env(time_matrix, rate_eval, loads_eval, distance_arr, diesel_arr, num_nodes,
                           day_offset=TRAIN_DAYS)
     nodos, dias = casos_replay(num_nodes, rate_eval.shape[0], max_casos)
+
+    def baselines():
+        filas = []
+        with _UnHilo():
+            for c, (nodo, dia) in enumerate(zip(nodos, dias)):
+                nodo, dia = int(nodo), int(dia)
+                dow = int(market.dia_semana(TRAIN_DAYS + dia))
+                for K in k_levels:
+                    pi, _ = ub_pi(market, time_matrix, distance_arr, diesel_arr, num_nodes, nodo, K,
+                                  (loads_eval, rate_eval), start_day_idx=dia)
+                    for nombre in _METODOS[1:]:
+                        if nombre == "B2" and K is None:
+                            continue
+                        res = ejecutar_politica(ctx.politicas[nombre], env, nodo, dia, K, None,
+                                                distance_arr, diesel_arr, dow, loads_eval, rate_eval)
+                        filas.append(_fila("replay", K, c, nodo, TRAIN_DAYS + dia, dia, None, dow,
+                                           nombre, res, float("nan"), pi))
+                if verbose and (c + 1) % 100 == 0:
+                    print(f"  replay (baselines y cotas): {c + 1}/{len(nodos)}", flush=True)
+        return pd.DataFrame(filas)
+
+    firma = _firma_cache(ctx, "replay", num_nodes, max_casos, tuple(k_levels), rate_eval.shape[0],
+                         loads_eval.shape, float(loads_eval.sum()), float(rate_eval.sum()))
+    base = _filas_con_cache(cache_path, firma, baselines, verbose)
+    cota = base.groupby(["K", "mundo"])[["ub_dp", "ub_pi"]].first()
+
     filas = []
     with _UnHilo():
         for c, (nodo, dia) in enumerate(zip(nodos, dias)):
             nodo, dia = int(nodo), int(dia)
             dow = int(market.dia_semana(TRAIN_DAYS + dia))
             for K in k_levels:
-                pi, _ = ub_pi(market, time_matrix, distance_arr, diesel_arr, num_nodes, nodo, K,
-                              (loads_eval, rate_eval), start_day_idx=dia)
-                for nombre in _METODOS:
-                    if nombre == "B2" and K is None:
-                        continue
-                    if nombre == "DRL":
-                        res = _ejecutar_drl(ctx, env, nodo, dia, K, None, dow, loads_eval, rate_eval)
-                    else:
-                        res = ejecutar_politica(ctx.politicas[nombre], env, nodo, dia, K, None,
-                                                distance_arr, diesel_arr, dow, loads_eval, rate_eval)
-                    filas.append(_fila("replay", K, c, nodo, TRAIN_DAYS + dia, dia, None, dow,
-                                       nombre, res, float("nan"), pi))
-            if verbose and (c + 1) % 50 == 0:
-                print(f"  replay: {c + 1}/{len(nodos)}", flush=True)
-    df = pd.DataFrame(filas)
+                dp, pi = cota.loc[(_etiqueta_k(K), c)]
+                res = _ejecutar_drl(ctx, env, nodo, dia, K, None, dow, loads_eval, rate_eval)
+                filas.append(_fila("replay", K, c, nodo, TRAIN_DAYS + dia, dia, None, dow,
+                                   "DRL", res, dp, pi))
+            if verbose and (c + 1) % 100 == 0:
+                print(f"  replay (DRL): {c + 1}/{len(nodos)}", flush=True)
+    df = _combinar(base, pd.DataFrame(filas), k_levels)
     _avisar_si_supera_cota(df)
     return df
 

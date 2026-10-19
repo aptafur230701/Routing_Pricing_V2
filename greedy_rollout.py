@@ -31,8 +31,8 @@ from attention_encoder import (
 class GreedyResult:
     """Resultado de un rollout greedy sobre B episodios.
 
-    env_reward : (B,) recompensa del entorno (escalada, con bonos y penalizaciones
-                 terminales) — la que compara el self-critical con el rollout muestreado.
+    env_reward : (B,) recompensa del entorno (escalada por REWARD_SCALE_FACTOR, con la penalización
+                 terminal por violar el tiempo y, solo con USE_REWARD_SHAPING, los bonos de retorno) — la que compara el self-critical con el rollout muestreado.
     raw_reward : (B,) suma de las recompensas de las lanes recorridas, en unidades
                  originales (las de los solvers). Solo significativa si valid[b].
     routes     : list[list[int]] — nodos visitados, desde start_node hasta donde terminó
@@ -64,6 +64,8 @@ def greedy_rollout(
                                              # rollout muestreado hacen que ambos vean el mismo mundo
     max_duration:       float      = MAX_DURATION,
     device:             torch.device = None,   # dispositivo del agente (default: DEVICE de config)
+    ev_esperado:        np.ndarray = None,   # (7, N, N) calcular_ev_esperado (baselines.py); obligatorio con
+                                             # USE_CONTINUATION_FEATURES (features de continuación f8–f11)
 ) -> GreedyResult:
     """Rollout greedy (argmax por nodo) vectorizado sobre un VectorRoutingEnv.
 
@@ -107,6 +109,7 @@ def greedy_rollout(
                     reward_global_p95=reward_global_p95,
                     avail_expected_arr=avail_expected_arr,
                     reward_rows=env.reward_rows,
+                    ev=ev_esperado, time_elapsed=env.time_elapsed, dow0=env.start_dow,
                 )
                 temporal = build_temporal_features_batch(
                     env.time_elapsed, env.step_count, max_duration, num_nodes,

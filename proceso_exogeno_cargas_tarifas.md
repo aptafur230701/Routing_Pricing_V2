@@ -109,7 +109,7 @@ El modelo de cargas se estima sobre `loads_stack`, que ya incluye los días en q
 
 **Días atípicos.** El volumen total del mercado tiene 12 días atípicos: el 13 de marzo y del 27 de marzo al 6 de abril. El 13 de marzo y del 27 al 30 de marzo el total es entre 3,4 y 4,5 veces el promedio de ese día de la semana; del 31 de marzo al 6 de abril cae a entre 0,38 y 0,53 veces. Se está revisando con el equipo de datos si son un problema de captura o demanda real. Mientras tanto no se excluyen: el ajuste usa todos los días. Incluirlos mueve los factores de día de la semana (lunes 1,43 frente a 1,31 sin ellos; viernes 1,14 frente a 0,96) y baja el phi del grupo de mayor volumen de 4,4 a 2,6, es decir, más sobredispersión: los picos y caídas del mercado se absorben como variabilidad extra de cada lane.
 
-**Días de ajuste.** Se usan todos los días de `loads_stack` y `rate_stack` (120 en el archivo actual), sin excluir ninguno. El código no lleva índices de día escritos a mano: el número de días sale de la forma de las matrices y las fechas salen de `FECHA_INICIO` (1 de enero de 2026) más el índice del día. Así, si el archivo se actualiza, el ajuste incluye todos los días nuevos. `DIAS_EXCLUIDOS`, una lista de fechas vacía por defecto, permite dejar fuera días que la fuente confirme como erróneos.
+**Días de ajuste.** Se usan solo los primeros `TRAIN_DAYS` días (90) de `loads_stack` y `rate_stack`; los días 90-119 quedan fuera del ajuste para que el replay de evaluación sea fuera de muestra. El código no lleva índices de día escritos a mano: el número de días sale de la forma de las matrices y las fechas salen de `FECHA_INICIO` (1 de enero de 2026) más el índice del día. `DIAS_EXCLUIDOS`, una lista de fechas vacía por defecto, permite dejar fuera días que la fuente confirme como erróneos.
 
 **Construcción**
 
@@ -142,7 +142,7 @@ La media es m = mu_ij × s_d y la varianza es m + m² / phi. Se usa binomial neg
 ### Estimación, en orden
 
 1. **Factores de día de la semana.** Sumar las cargas de todas las lanes por fecha. Para cada día de la semana d, promediar esa suma entre sus fechas (unas 17 por día) y dividir por el promedio de todas las fechas. Reescalar para que los siete factores promedien 1.
-2. **Tasa por lane.** Para cada lane, dividir su total de cargas n_ij entre la exposición E, que es la suma de s_d sobre las 120 fechas del histórico:
+2. **Tasa por lane.** Para cada lane, dividir su total de cargas n_ij entre la exposición E, que es la suma de s_d sobre las fechas de ajuste (los `TRAIN_DAYS` días de entrenamiento):
 
    ```latex
    \mu_{ij} = \frac{n_{ij}}{E}

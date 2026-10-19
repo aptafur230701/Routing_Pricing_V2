@@ -4,8 +4,10 @@ fit_market_process.py
 Estimación del proceso exógeno de cargas y tarifas (fases 1 a 3 de
 proceso_exogeno_cargas_tarifas.md).
 
-  Fase 1 — datos de ajuste: todas las matrices [día, origen, destino] de 194
-           nodos, menos las fechas de DIAS_EXCLUIDOS (vacía por defecto).
+  Fase 1 — datos de ajuste: las matrices [día, origen, destino] de 194 nodos
+           de los primeros TRAIN_DAYS días (los de entrenamiento), menos las fechas
+           de DIAS_EXCLUIDOS (vacía por defecto). Los días de evaluación quedan
+           fuera del ajuste para que el replay sea fuera de muestra.
   Fase 2 — cargas: binomial negativa NegBin(mu_ij · s_d, phi_h)
              · s_d  : factor del día de la semana, promedio 1
              · mu_ij: tasa diaria base de la lane = n_ij / E  (E = Σ s_d sobre las fechas)
@@ -18,9 +20,8 @@ Uso
 ---
     python fit_market_process.py
 
-Escribe datos/market_params.npz (indexable por [origen, destino]). El número de
-días sale de la forma de las matrices y las fechas de FECHA_INICIO + índice del
-día: si el archivo se actualiza, el ajuste incluye los días nuevos solo.
+Escribe datos/market_params.npz (indexable por [origen, destino]). El ajuste usa los
+primeros TRAIN_DAYS días; las fechas salen de FECHA_INICIO + índice del día.
 """
 
 import os
@@ -29,7 +30,7 @@ from scipy.optimize import minimize_scalar
 from scipy.special import gammaln
 
 from config import (
-    FECHA_INICIO, DIAS_EXCLUIDOS, MARKET_PHI_MAX, MARKET_N_GRUPOS, MARKET_PARAMS_PATH,
+    FECHA_INICIO, DIAS_EXCLUIDOS, TRAIN_DAYS, MARKET_PHI_MAX, MARKET_N_GRUPOS, MARKET_PARAMS_PATH,
 )
 
 _CWD = os.path.dirname(os.path.abspath(__file__))
@@ -57,12 +58,12 @@ def dia_de_semana(dias, fecha_inicio: str = FECHA_INICIO):
 # Fase 1 — datos de ajuste
 # ─────────────────────────────────────────────────────────────────────────────
 
-def cargar_matrices_completas() -> tuple:
-    """Lee loads_stack y rate_stack completos (194 nodos, todos los días)."""
+def cargar_matrices_completas(max_dias: int = None) -> tuple:
+    """Lee loads_stack y rate_stack (194 nodos); los primeros `max_dias` días, o todos si es None."""
     data_dir = os.path.join(_CWD, "datos")
     loads = np.load(os.path.join(data_dir, "load_availability.npy"))
     rate  = np.load(os.path.join(data_dir, "rate.npy"))
-    num_dias = min(loads.shape[0], rate.shape[0])
+    num_dias = min(loads.shape[0], rate.shape[0], max_dias or loads.shape[0])
     return loads[:num_dias].astype(np.float64), rate[:num_dias].astype(np.float64)
 
 
@@ -206,7 +207,8 @@ def imprimir_resumen(params: dict) -> None:
 
 
 def main() -> dict:
-    loads, rate = cargar_matrices_completas()
+    # Solo los días de entrenamiento: los de evaluación no deben filtrarse al proceso.
+    loads, rate = cargar_matrices_completas(TRAIN_DAYS)
     params = ajustar(loads, rate, FECHA_INICIO, DIAS_EXCLUIDOS)
     imprimir_resumen(params)
     path = guardar(params)

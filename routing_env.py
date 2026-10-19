@@ -76,6 +76,7 @@ from config import (
     RETURN_SUCCESS_BONUS,
     TIME_VIOLATION_PENALTY,
     BIG_M_PENALTY,
+    USE_REWARD_SHAPING,
     MARKET_SEED_TRAIN,
 )
 from fit_market_process import dia_de_semana
@@ -314,13 +315,14 @@ class RoutingEnv(gym.Env):
         if terminated:
             if next_node == self._start_node:
                 if next_time <= self.max_duration:
-                    n_intermediate = len(self._visited_set) - 1
-                    time_util = next_time / self.max_duration
-                    terminal_reward = (
-                        RETURN_SUCCESS_BONUS
-                        + (RETURN_SUCCESS_BONUS * 0.5) * (n_intermediate / (self.num_nodes - 1))
-                        + (RETURN_SUCCESS_BONUS * 0.3) * time_util
-                    )
+                    if USE_REWARD_SHAPING:
+                        n_intermediate = len(self._visited_set) - 1
+                        time_util = next_time / self.max_duration
+                        terminal_reward = (
+                            RETURN_SUCCESS_BONUS
+                            + (RETURN_SUCCESS_BONUS * 0.5) * (n_intermediate / (self.num_nodes - 1))
+                            + (RETURN_SUCCESS_BONUS * 0.3) * time_util
+                        )
                 else:
                     terminal_reward = TIME_VIOLATION_PENALTY
             else:
@@ -633,7 +635,7 @@ class VectorRoutingEnv:
         self._last_time_violation = time_fail.copy()
 
         terminal_reward = np.zeros(B, dtype=np.float32)
-        if success.any():
+        if USE_REWARD_SHAPING and success.any():
             denom = max(N - 1, 1)
             terminal_reward[success] = (
                 RETURN_SUCCESS_BONUS
@@ -801,6 +803,12 @@ class VectorRoutingEnv:
         último día con datos (con market_process el mundo es ilimitado)."""
         dias = self._day_offset + self._start_day_idx + (self._time_elapsed // 14).astype(np.int64)
         return dia_de_semana(dias)
+
+    @property
+    def start_dow(self) -> np.ndarray:
+        """(B,) día de la semana (lunes = 0) del día de salida de cada episodio
+        (day_offset + start_day_idx, sin recortar al último día con datos)."""
+        return dia_de_semana(self._day_offset + self._start_day_idx)
 
     @property
     def reward_rows(self) -> np.ndarray:

@@ -12,7 +12,7 @@ que dependan de num_nodes. El Transformer opera sobre conjuntos de
 embeddings de tamaño variable — lo que cambia entre tamaños es el
 número de nodos en runtime, no los pesos del modelo.
 
-  encoder.input_proj   : 8 → d_h          (independiente de N)
+  encoder.input_proj   : N_NODE_FEATURES (8, o 12 con USE_CONTINUATION_FEATURES) → d_h  (independiente de N)
   encoder.layers[i]    : d_h → d_h        (independiente de N)
   context_net.proj     : 2·d_h+3+n_market+n_budget → d_h  (independiente de N)
   decoder.glimpse      : d_h → d_h        (independiente de N)
@@ -60,7 +60,9 @@ def _reconcile_state_dict(target_sd: dict, source_sd: dict) -> tuple:
       1. Shape idéntica → se copia el tensor del checkpoint tal cual.
       2. Caso especial de expansión de entrada: mismo out_features y
          in_features del checkpoint < in_features del destino (ej.
-         context_net.proj.0.weight al añadir el bloque de budget features) →
+         context_net.proj.0.weight al añadir el bloque de budget features, o
+         encoder.input_proj.proj.weight al pasar de 8 a 12 features de nodo con
+         USE_CONTINUATION_FEATURES: copia las 8 columnas viejas y deja las 4 nuevas en cero) →
          se conserva el tensor destino (ya inicializado) pero se ponen TODAS
          sus columnas en cero y se copian las columnas viejas en las primeras
          posiciones. Con las columnas nuevas en cero, la contribución de las
@@ -240,7 +242,7 @@ def transfer_checkpoint(
 
     checkpoint = torch.load(source_checkpoint, map_location=DEVICE)
 
-    # Instanciar modelos destino con la arquitectura actual (N_NODE_FEATURES=8, n_market=1)
+    # Instanciar modelos destino con la arquitectura actual (N_NODE_FEATURES según USE_CONTINUATION_FEATURES, n_market=1)
     agent  = AMRoutingAgent(
         num_nodes=target_num_nodes,
         d_h=d_h, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff,

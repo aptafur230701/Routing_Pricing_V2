@@ -81,7 +81,9 @@ import optuna
 import torch
 
 import am_training
+from baselines import calcular_ev_esperado
 from config import SEED
+from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
 
 # Hiperparámetros congelados de referencia (para restaurar entre trials y
@@ -163,6 +165,7 @@ def make_objective(num_nodes: int, updates_per_trial: int, data: dict, seeds: li
                     ltr_stack=data["ltr_stack"], trucks_stack=data["trucks_stack"],
                     reward_global_p95=data["reward_global_p95"],
                     avail_expected_arr=data["avail_expected_arr"],
+                    ev_esperado=data["ev_esperado"],
                     trial_callback=_cb,
                 )
                 del agent, critic
@@ -204,6 +207,9 @@ def run(num_nodes: int, n_trials: int, updates_per_trial: int,
         avail_expected_arr=avail_expected_arr,
         reward_global_p95=reward_global_p95,
     )
+    # HPO entrena con días reales (sin market_process): el ev sale del proceso ajustado, una vez.
+    asegurar_parametros()
+    data["ev_esperado"] = calcular_ev_esperado(MarketProcess(num_nodes), distance_arr, diesel_arr)
 
     n_episodes_per_update = _BASELINE["PPO_N_EPISODES_PER_UPDATE"]
     episodes_per_node_trial = int(np.ceil(updates_per_trial * n_episodes_per_update / num_nodes))

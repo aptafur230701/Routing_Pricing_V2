@@ -18,6 +18,7 @@ from config import (
     DEVICE,
     K_TRAINING_LEVELS, MARKET_SEED_EVAL, MARKET_SEED_VAL, TRAIN_DAYS, get_val_worlds,
 )
+from baselines import calcular_ev_esperado
 from evaluation import disenar_mundos
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
@@ -37,6 +38,7 @@ def _val(d):
     return am_training.ValidacionSimulada(
         d["market"], d["tm"], d["rate"], d["loads"], d["dist"], d["diesel"], N,
         np.asarray(d["tm"], dtype=float), d["ltr"], d["trucks"], d["p95"], d["avail"],
+        ev_esperado=calcular_ev_esperado(d["market"], d["dist"], d["diesel"]),
     )
 
 

@@ -6,6 +6,8 @@ This file is imported by all modules, so it should not contain any heavy depende
 
 """
 
+import os
+
 import torch
 
 # ── Problem identity ──────────────────────────────────────────
@@ -22,6 +24,10 @@ REWARD_SCALE_FACTOR    = 100.0
 RETURN_SUCCESS_BONUS   =  500.0 / REWARD_SCALE_FACTOR
 TIME_VIOLATION_PENALTY =  -3000.0 / REWARD_SCALE_FACTOR
 BIG_M_PENALTY          = -1e9
+USE_REWARD_SHAPING     = False   # True: el retorno exitoso suma RETURN_SUCCESS_BONUS + bonos por n_intermediate
+                                 # y time_util (shaping que no es margen). False: terminal_reward = 0 en el
+                                 # retorno exitoso, así que el reward del episodio es margen / REWARD_SCALE_FACTOR.
+                                 # TIME_VIOLATION_PENALTY se aplica en ambos casos. Ablacionable.
 
 # ── Evaluation ────────────────────────────────────────────────
 N_EVAL_EPISODES = 50
@@ -51,7 +57,8 @@ PPO_LR                    = 7.574781400016766e-05   # Learning rate para el acto
                                     # iba muy por debajo del target 0.02 con clip < 0.10,
                                     # indicando under-stepping. knob: subir hacia 5e-5 si KL se
                                     # mantiene < ~0.015 y el reward sigue subiendo pasado update 150.
-PPO_GAMMA                 = 0.99   # Factor de descuento para las recompensas futuras
+PPO_GAMMA                 = 1.0    # Factor de descuento. 1.0: horizonte finito de 2–5 pasos, sin descuento
+                                    # (el margen del episodio es la suma de las lanes). Era 0.99.
 PPO_GAE_LAMBDA            = 0.9738083627173082   # Factor de GAE
 PPO_CLIP_EPS              = 0.22021368918814568   # Clip PPO para limitar cambios de política
 PPO_ENTROPY_COEF_START    = 0.07842497176858756   # coeficiente de entropía al inicio del entrenamiento
@@ -67,6 +74,18 @@ SELF_CRITICAL_COEF           = 0.5     # peso del término self-critical en el l
 SELF_CRITICAL_WARMUP_UPDATES = 50      # no aplicar self-critical hasta este update
                                         # (deja que el crítico se estabilice primero)
 
+# ── Selección del mejor checkpoint (am_training.py) ───────────
+# "max": guarda el update con el mayor score puntual de validación (comportamiento anterior).
+# "moving_avg": guarda los pesos del update CENTRAL de la ventana de CKPT_WINDOW validaciones
+# consecutivas cuya media de score es la mejor hasta ahora (menos ruido, menos selección por azar).
+CKPT_SELECTION = "moving_avg"   # "moving_avg" | "max"
+CKPT_WINDOW    = 3
+
+# ── Learning rate con decaimiento coseno ──────────────────────
+USE_LR_COSINE  = True   # True: el LR de actor y critic baja con coseno desde su valor inicial hasta
+                        # LR_FINAL_FRAC de ese valor al terminar n_updates (un scheduler.step() por update).
+LR_FINAL_FRAC  = 0.10
+
 # ── Cardinalidad de ruta (K) ───────────────────────────────────
 # K_MAX es el único techo restringido que se entrena — la restricción real de
 # la operación. Formulación ≤K: con un solo nivel, el caso libre
@@ -80,6 +99,12 @@ K_NORM = K_MAX  # normalizador GLOBAL de k_remaining_norm: va de 1.0 (presupuest
 K_LEVELS          = [K_MAX]              # un solo nivel restringido — la constraint real
 K_TRAINING_LEVELS = K_LEVELS + [None]    # + caso libre (None) — 2 niveles en total
 
+# ── Features de continuación por nodo ────────────────────────
+USE_CONTINUATION_FEATURES = True   # True: 4 features extra por nodo j (N_NODE_FEATURES = 12) con la
+                                   # información de qué pasa después de j (tiempo y holgura de regreso a
+                                   # casa, valor esperado de volver a casa y de seguir un salto más; ver
+                                   # attention_encoder.py). False: las 8 features de siempre. Ablacionable.
+
 # ── Train / eval split ───────────────────────────────────────
 TRAIN_DAYS = 90   # días usados para entrenamiento; el resto (días 90-119) queda para evaluación
 
@@ -89,7 +114,7 @@ TRUCKS_CLIP        =  50.0   # p95 de trucks delta=1 es 45
 LOADS_EXPECTED_CLIP = 100.0  # p95 de E[loads] por lane (train, excl. diagonal) es ~66; 100 es techo seguro
 
 # ── Reproducibility ───────────────────────────────────────────
-SEED = 42
+SEED = int(os.environ.get("SEED", 42))   # torch/numpy del entrenamiento; variable de entorno SEED para variar por corrida
 
 # ── Proceso exógeno de cargas y tarifas (market_process) ─────
 # Ver proceso_exogeno_cargas_tarifas.md. Ningún índice de día va escrito a
@@ -101,9 +126,11 @@ DIAS_EXCLUIDOS       = []             # fechas ("AAAA-MM-DD") a dejar fuera del 
 MARKET_PHI_MAX       = 1000.0         # tope de la dispersión phi (phi → ∞ equivale a Poisson)
 MARKET_N_GRUPOS      = 4              # grupos de volumen h (cuartiles de mu_ij) para estimar phi_h
 MARKET_PARAMS_PATH   = "datos/market_params.npz"   # relativo a la raíz del proyecto
-MARKET_SEED_TRAIN    = 20260   # semilla de los mundos de entrenamiento
+MARKET_SEED_TRAIN    = int(os.environ.get("MARKET_SEED_TRAIN", 20260))   # semilla de los mundos de entrenamiento
+                                                                          # (variable de entorno para variarla por corrida)
 MARKET_SEED_EVAL     = 777001  # semilla base de los mundos de evaluación (distinta de la de entrenamiento)
-MARKET_M_EVAL_WORLDS = 100     # M: nº de mundos de evaluación simulados por nivel de K
+MARKET_M_EVAL_WORLDS = 1000    # M: nº de mundos de evaluación simulados por nivel de K (eran 100). Con
+                                # MARKET_SEED_EVAL fija, todas las corridas y baselines ven los MISMOS mundos.
 
 # ── Validación durante el entrenamiento (mundos simulados) ───
 # Mundos fijos con semilla propia (distinta de entrenamiento y de MARKET_SEED_EVAL, para que el
@@ -128,6 +155,11 @@ UBDP_TABLA_PATH = "datos/ubdp_tabla_{n}nodos.npz"   # relativo a la raíz del pr
 REPLAY_MAX_CASOS = 300   # tope de casos (nodo, día) del replay por nivel de K; si hay más, se toma un subconjunto balanceado
 BOOTSTRAP_B     = 10000   # remuestreos del intervalo bootstrap de la diferencia pareada
 BOOTSTRAP_SEED  = 20261019
+
+# ── Etiqueta de corrida ──────────────────────────────────────
+# Vacía por defecto (results/<N>nodes y checkpoints/ de siempre). Con RUN_TAG="abl_a" main.py usa
+# results/<N>nodes_abl_a y checkpoints/abl_a, para correr ablaciones sin pisar otras corridas.
+RUN_TAG = os.environ.get("RUN_TAG", "")
 
 # ── Device ───────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

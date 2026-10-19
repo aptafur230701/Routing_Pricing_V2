@@ -18,7 +18,9 @@ import numpy as np
 
 from config import DEVICE, MAX_DURATION, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF
 from am_agent import AMRoutingAgent
+from baselines import calcular_ev_esperado
 from evaluation import make_replay_env, rollout_drl_env
+from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
 from transfer_learning import load_checkpoint_compatible
 
@@ -69,8 +71,11 @@ def load_latest_day():
         time_matrix, rate_stack[last:], loads_stack[last:], distance_arr, diesel_arr, NUM_NODES,
         day_offset=last,
     )
+    asegurar_parametros()
+    ev_esperado = calcular_ev_esperado(MarketProcess(NUM_NODES), distance_arr, diesel_arr)   # una vez
     return dict(
         env=env,
+        ev_esperado=ev_esperado,
         time_matrix_arr=np.asarray(time_matrix, dtype=float),
         distance_arr=distance_arr,
         ltr_stack=ltr_stack[:, last:],
@@ -95,6 +100,7 @@ def run_inference(agent: AMRoutingAgent, start_node: int, day: dict):
         NUM_NODES,
         reward_global_p95=day["reward_global_p95"],
         avail_expected_arr=day["avail_expected_arr"],
+        ev_esperado=day["ev_esperado"],
     )
     inference_ms = (time.perf_counter() - t0) * 1000
 

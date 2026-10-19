@@ -33,10 +33,11 @@ import torch
 warnings.filterwarnings("ignore")
 
 from config import (
-    SEED, DEVICE,
+    SEED, DEVICE, RUN_TAG,
     get_episodes_per_node, TRAIN_DAYS,
     AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF,
 )
+from baselines import calcular_ev_esperado
 from problem_data import load_matrices
 from dp_relajada import cargar_o_calcular_tabla
 from evaluation import (
@@ -62,7 +63,7 @@ def _run_am(
     pretrained_agent=None, pretrained_critic=None,
     ltr_stack=None, trucks_stack=None,
     reward_global_p95=1.0, avail_expected_arr=None,
-    market_process=None, best_checkpoint_path=None,
+    market_process=None, best_checkpoint_path=None, ev_esperado=None,
 ):
     """Pipeline AM: entrenamiento PPO → checkpoint.
 
@@ -89,6 +90,7 @@ def _run_am(
         avail_expected_arr=avail_expected_arr,
         market_process=market_process,
         best_checkpoint_path=best_checkpoint_path,
+        ev_esperado=ev_esperado,
     )
     train_time = time.time() - t0
     print(f"Training time: {train_time:.1f} s")
@@ -140,18 +142,23 @@ def _evaluate_and_report(
     descriptivo y no independiente del simulador.
     """
     tabla = cargar_o_calcular_tabla(market_process, time_matrix, distance_arr, diesel_arr)
+    # B1, B2, B3, UB-PI y UB-DP no dependen del DRL: se calculan una vez por nº de nodos y se reusan
+    # entre corridas (semillas, ablaciones) mientras no cambien el proceso, la tabla V ni el diseño.
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos", "cache_eval")
 
     print("\n--- Evaluación en mundos simulados ---")
     sim_df = evaluar_mundos_simulados(
         agent, market_process, tabla, time_matrix,
         rate_stack[:TRAIN_DAYS], loads_stack[:TRAIN_DAYS], distance_arr, diesel_arr, NUM_NODES,
         ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95,
+        cache_path=os.path.join(cache_dir, f"baselines_simulado_{NUM_NODES}nodos.pkl"),
     )
     print("\n--- Replay de los días reales de evaluación ---")
     replay_df = evaluar_replay(
         agent, market_process, tabla, time_matrix,
         rate_stack[TRAIN_DAYS:], loads_stack[TRAIN_DAYS:], distance_arr, diesel_arr, NUM_NODES,
         ltr_stack[:, TRAIN_DAYS:], trucks_stack[:, TRAIN_DAYS:], avail_expected_arr, reward_global_p95,
+        cache_path=os.path.join(cache_dir, f"baselines_replay_{NUM_NODES}nodos.pkl"),
     )
 
     print(f"\n{'='*60}")
@@ -184,7 +191,6 @@ def _evaluate_and_report(
 
 
 def main():
-    # ── Cambia estos valores según lo que quieras hacer ───────────────────────
     NUM_NODES       = 35     # opciones: 10 · 20 · 35 · 50 · 75 · 100
     EVAL_ONLY       = False   # True: carga checkpoint y salta entrenamiento
     USE_TRANSFER    = True   # True: warm-start desde el checkpoint del tamaño anterior en
@@ -211,11 +217,12 @@ def main():
 
     set_seeds(SEED)
 
-    output_dir = os.path.join(cwd, "results", f"{NUM_NODES}nodes")
+    etiqueta = f"_{RUN_TAG}" if RUN_TAG else ""    # RUN_TAG (config.py): ablaciones sin pisar otras corridas
+    output_dir = os.path.join(cwd, "results", f"{NUM_NODES}nodes{etiqueta}")
     os.makedirs(output_dir, exist_ok=True)
 
     # Carpeta compartida de checkpoints (para transfer learning entre ramas)
-    checkpoint_dir = os.path.join(cwd, "checkpoints")
+    checkpoint_dir = os.path.join(cwd, "checkpoints", RUN_TAG) if RUN_TAG else os.path.join(cwd, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
@@ -226,6 +233,7 @@ def main():
     # el entrenamiento lo usa solo si USE_MARKET_PROCESS.
     asegurar_parametros()
     market_process = MarketProcess(NUM_NODES)
+    ev_esperado = calcular_ev_esperado(market_process, distance_arr, diesel_arr)   # una vez por nº de nodos
 
     # ── Train / eval split (temporal — el modelo no ve los días de eval) ──────
     rate_train  = rate_stack[:TRAIN_DAYS]
@@ -250,6 +258,7 @@ def main():
             avail_expected_arr=avail_expected_arr,
             market_process=market_process if USE_MARKET_PROCESS else None,
             best_checkpoint_path=_checkpoint_path(checkpoint_dir, NUM_NODES, True),
+            ev_esperado=ev_esperado,
         )
         best_path = _checkpoint_path(checkpoint_dir, NUM_NODES, True)
         if EVAL_BEST_CHECKPOINT and USE_MARKET_PROCESS and os.path.exists(best_path):

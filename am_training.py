@@ -19,6 +19,9 @@ Interfaz análoga a run_training() de training.py:
 · Usa RoutingEnv como entorno estándar (Siguiendo practicas de API Gymnasium).
 """
 
+import math
+from collections import deque
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -39,6 +42,8 @@ from config import (
     USE_SELF_CRITICAL, SELF_CRITICAL_COEF, SELF_CRITICAL_WARMUP_UPDATES,
     K_TRAINING_LEVELS,
     MARKET_SEED_TRAIN,
+    USE_CONTINUATION_FEATURES,
+    CKPT_SELECTION, CKPT_WINDOW, USE_LR_COSINE, LR_FINAL_FRAC,
 )
 from routing_env import VectorRoutingEnv
 from greedy_rollout import greedy_rollout
@@ -53,6 +58,7 @@ from attention_encoder import (
 )
 from am_agent import AMRoutingAgent
 from critic_head import CriticHead
+from baselines import calcular_ev_esperado
 from debug_utils import check_tensor
 from dp_relajada import cargar_o_calcular_tabla, PoliticaB3
 from evaluation import disenar_mundos, ejecutar_politica
@@ -296,6 +302,7 @@ def _evaluate_greedy(
     num_nodes:        int,
     eval_k_levels:    list = None,   # niveles de K por episodio (None ⇒ todos libres)
     avail_expected_arr: np.ndarray = None,
+    ev_esperado:      np.ndarray = None,   # (7, N, N) para las features de continuación
 ) -> tuple:
     """
     Recompensa promedio en modo greedy (argmax en cada nodo, sin búsqueda) sobre
@@ -326,6 +333,7 @@ def _evaluate_greedy(
         reward_global_p95, num_nodes,
         k_max_arr=eval_k_levels,
         avail_expected_arr=avail_expected_arr,
+        ev_esperado=ev_esperado,
     )
     avg_reward = float(res.raw_reward[res.valid].mean()) if res.valid.any() else 0.0
     valid_rate = float(res.valid.mean())
@@ -343,7 +351,8 @@ class ValidacionSimulada:
     """
 
     def __init__(self, market_process, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-                 num_nodes, time_matrix_arr, ltr_stack, trucks_stack, reward_global_p95, avail_expected_arr):
+                 num_nodes, time_matrix_arr, ltr_stack, trucks_stack, reward_global_p95, avail_expected_arr,
+                 ev_esperado=None):
         M = get_val_worlds(num_nodes)
         dis = disenar_mundos(num_nodes, M, market_process, num_dias=rate_stack.shape[0],
                              semilla=MARKET_SEED_VAL)
@@ -355,6 +364,7 @@ class ValidacionSimulada:
         self.k_arr = [K for K in self.niveles for _ in range(M)]
         self.args = (time_matrix_arr, distance_arr, trucks_stack, ltr_stack, reward_global_p95, num_nodes)
         self.avail = avail_expected_arr
+        self.ev = ev_esperado
         self.env = VectorRoutingEnv(
             time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack, rm_pen_stack=None,
             num_nodes=num_nodes, max_duration=MAX_DURATION, market_process=market_process,
@@ -364,6 +374,7 @@ class ValidacionSimulada:
         tabla = cargar_o_calcular_tabla(market_process, time_matrix, distance_arr, diesel_arr, verbose=False)
         b3 = PoliticaB3(tabla, distance_arr, diesel_arr)
         self.ref = {}
+        self.b3_mundos = {}   # K → (M,) márgenes de B3 mundo a mundo (para la diferencia pareada)
         for K in self.niveles:
             margenes, ubs = [], []
             for m in range(M):
@@ -372,6 +383,7 @@ class ValidacionSimulada:
                                       distance_arr, diesel_arr, dow)
                 margenes.append(r["margen"])
                 ubs.append(tabla.ub_dp(h, dow, K))
+            self.b3_mundos[K] = np.asarray(margenes, dtype=float)
             self.ref[K] = {"b3": float(np.mean(margenes)), "ub_dp": float(np.mean(ubs))}
 
     def evaluar(self, agent) -> dict:
@@ -379,6 +391,7 @@ class ValidacionSimulada:
         res = greedy_rollout(
             agent, self.env, self.nodos, self.dias, *self.args,
             k_max_arr=self.k_arr, avail_expected_arr=self.avail, world_seeds=self.semillas,
+            ev_esperado=self.ev,
         )
         margen = np.where(res.valid, res.raw_reward, 0.0)
         out = {"por_k": {}}
@@ -387,8 +400,9 @@ class ValidacionSimulada:
             v = res.valid[sl]
             m = float(res.raw_reward[sl][v].mean()) if v.any() else 0.0
             ub = self.ref[K]["ub_dp"]
+            dif_b3 = float(np.mean(res.raw_reward[sl] - self.b3_mundos[K]))   # media de (DRL − B3) mundo a mundo
             out["por_k"]["free" if K is None else str(K)] = {
-                "margen": m, "valid_rate": float(v.mean()),
+                "margen": m, "valid_rate": float(v.mean()), "dif_b3": dif_b3,
                 "gap_ub_dp_pct": float((ub - m) / abs(ub) * 100.0) if ub else float("nan"),
                 "b3": self.ref[K]["b3"], "ub_dp": ub,
             }
@@ -423,6 +437,9 @@ def run_am_training(
                                        # (True = detener el entrenamiento ya, p.ej. Optuna pruning).
                                        # Solo se invoca en los updates de log_freq (donde greedy_reward
                                        # está disponible). No acopla este módulo a Optuna.
+    ev_esperado: np.ndarray = None,   # (7, N, N) calcular_ev_esperado. Para las features de continuación;
+                                       # si es None se calcula una vez desde market_process (obligatorio
+                                       # en ese caso con USE_CONTINUATION_FEATURES).
 ) -> tuple:
     """
     Entrena AMRoutingAgent + CriticHead con PPO.
@@ -500,6 +517,14 @@ def run_am_training(
     actor_optimizer  = torch.optim.AdamW(agent.parameters(),  lr=lr, weight_decay=PPO_WEIGHT_DECAY)
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=lr * 10)
 
+    # LR con decaimiento coseno: cada LR baja desde su valor inicial hasta LR_FINAL_FRAC de ese valor
+    # al terminar n_updates (un scheduler.step() al final de cada update).
+    schedulers = []
+    if USE_LR_COSINE:
+        def _cos(u, n=n_updates, f=LR_FINAL_FRAC):
+            return f + (1.0 - f) * 0.5 * (1.0 + math.cos(math.pi * min(u, n) / max(n, 1)))
+        schedulers = [torch.optim.lr_scheduler.LambdaLR(o, _cos) for o in (actor_optimizer, critic_optimizer)]
+
     # ── Precomputar stack de reward matrices (una sola vez, fuera del loop) ──────
     time_matrix_arr = (
         time_matrix.to_numpy(dtype=float)
@@ -513,6 +538,12 @@ def run_am_training(
         )   # (num_train_days, N, N) float32
     else:
         rm_pen_stack = None   # con proceso exógeno la recompensa sale de las filas sorteadas
+
+    # ── Valor esperado por lane (features de continuación): una sola vez, fuera de los loops ──
+    if ev_esperado is None and USE_CONTINUATION_FEATURES:
+        if market_process is None:
+            raise ValueError("USE_CONTINUATION_FEATURES requiere ev_esperado o market_process")
+        ev_esperado = calcular_ev_esperado(market_process, distance_arr, diesel_arr)
 
     # ── Entorno vectorizado (una sola instancia, reutilizada en cada update) ──
     vec_env = VectorRoutingEnv(
@@ -567,6 +598,7 @@ def run_am_training(
         val = ValidacionSimulada(
             market_process, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
             time_matrix_arr, ltr_stack, trucks_stack, reward_global_p95, avail_expected_arr,
+            ev_esperado=ev_esperado,
         )
         refs = " | ".join(
             f"K={'libre' if K is None else K}: B3 {r['b3']:.0f}, UB-DP {r['ub_dp']:.0f}"
@@ -575,6 +607,11 @@ def run_am_training(
         print(f"Validación: {val.M} mundos × K∈{{{', '.join('libre' if K is None else str(K) for K in val.niveles)}}} "
               f"(semilla {MARKET_SEED_VAL}) | referencias (USD): {refs}")
     best_score = -np.inf
+    # Selección por media móvil: pesos (CPU) y score de las últimas CKPT_WINDOW validaciones.
+    ventana = deque(maxlen=CKPT_WINDOW)
+    best_ma = -np.inf
+    ckpt_update = None        # update cuyos pesos están hoy en best_checkpoint_path
+    ckpt_score = None         # score puntual de ese update
 
     episode_rewards = []
     episode_losses  = []
@@ -644,7 +681,8 @@ def run_am_training(
                     reward_global_p95=reward_global_p95,
                     avail_expected_arr=avail_expected_arr,
                     reward_rows=vec_env.reward_rows,
-                )   # (B, N, 8)
+                    ev=ev_esperado, time_elapsed=time_el, dow0=vec_env.start_dow,
+                )   # (B, N, N_NODE_FEATURES)
                 temporal = build_temporal_features_batch(time_el, step_cnt, MAX_DURATION, num_nodes)   # (B, 3)
                 market   = build_market_features_batch(cur_nodes, day_idx, ltr_stack) if ltr_stack is not None \
                            else np.zeros((B, 1), dtype=np.float32)                                     # (B, 1)
@@ -675,7 +713,7 @@ def run_am_training(
                 # Write transitions — only for rows active BEFORE this step
                 for b in np.where(active)[0]:
                     ep_bufs[b].append({
-                        "node_feats":   node_feats[b],        # (N, 8)
+                        "node_feats":   node_feats[b],        # (N, N_NODE_FEATURES)
                         "temporal":     temporal[b],           # (3,)
                         "market_feats": market[b],             # (1,)
                         "budget_feats": budget[b],              # (2,)
@@ -712,6 +750,7 @@ def run_am_training(
                 k_max_arr=k_max_arr,
                 avail_expected_arr=avail_expected_arr,
                 world_seeds=world_seeds,
+                ev_esperado=ev_esperado,
             ).env_reward
         else:
             greedy_ep_rewards = None
@@ -1033,11 +1072,33 @@ def run_am_training(
             log_entry["val"]               = v["por_k"]
             log_entry["greedy_reward"]     = v["margen"]
             log_entry["greedy_valid_rate"] = v["valid_rate"]
-            if v["score"] > best_score:
+            log_entry["val_score"] = v["score"]
+            if CKPT_SELECTION == "moving_avg":
+                ventana.append({
+                    "update": update + 1, "score": v["score"],
+                    "agent":  {k: t.detach().cpu().clone() for k, t in agent.state_dict().items()},
+                    "critic": {k: t.detach().cpu().clone() for k, t in critic.state_dict().items()},
+                })
+                ma = float(np.mean([w["score"] for w in ventana])) if len(ventana) == CKPT_WINDOW else None
+                if ma is not None and ma > best_ma:
+                    best_ma = ma
+                    centro = ventana[len(ventana) // 2]         # update CENTRAL de la ventana, no el último
+                    ckpt_update, ckpt_score = centro["update"], centro["score"]
+                    log_entry["val_best"] = True
+                    if best_checkpoint_path:
+                        torch.save({"agent": centro["agent"], "critic": centro["critic"]}, best_checkpoint_path)
+                log_entry["val_ma"] = ma
+                log_entry["ckpt_update"] = ckpt_update
+                log_entry["ckpt_score"] = ckpt_score
+            elif v["score"] > best_score:
                 best_score = v["score"]
                 log_entry["val_best"] = True
+                ckpt_update, ckpt_score = update + 1, v["score"]
                 if best_checkpoint_path:
                     torch.save({"agent": agent.state_dict(), "critic": critic.state_dict()}, best_checkpoint_path)
+            if CKPT_SELECTION != "moving_avg":
+                log_entry["ckpt_update"] = ckpt_update
+                log_entry["ckpt_score"] = ckpt_score
 
         if es_log:
             if val is None:
@@ -1047,6 +1108,7 @@ def run_am_training(
                     reward_global_p95, num_nodes,
                     eval_k_levels=eval_k_levels,
                     avail_expected_arr=avail_expected_arr,
+                    ev_esperado=ev_esperado,
                 )
                 log_entry["greedy_reward"]     = greedy_reward
                 log_entry["greedy_valid_rate"] = greedy_valid_rate
@@ -1060,9 +1122,10 @@ def run_am_training(
                 monitor = f"| greedy {greedy_reward:6.1f} "
             else:
                 monitor = "| val " + " ".join(
-                    f"K={k}:{d['margen']:.0f} (gapDP {d['gap_ub_dp_pct']:.1f}%, B3 {d['b3']:.0f})"
+                    f"K={k}:{d['margen']:.0f} (Δ vs B3 {d['dif_b3']:+.1f}, gapDP {d['gap_ub_dp_pct']:.1f}%, B3 {d['b3']:.0f})"
                     for k, d in v["por_k"].items()
-                ) + (" *mejor " if log_entry.get("val_best") else " ")
+                ) + (f" | MA{CKPT_WINDOW} {log_entry['val_ma']:.0f} " if log_entry.get("val_ma") is not None else " ") \
+                  + (f"*guardado upd {log_entry['ckpt_update']} " if log_entry.get("val_best") else "")
             print(
                 f"  update {update+1:>5}/{n_updates} "
                 f"| ep {episodes_done:>6}/{total_episodes} "
@@ -1095,9 +1158,24 @@ def run_am_training(
             if trial_callback is not None:
                 stop_now = bool(trial_callback(update + 1, n_updates, log_entry))
 
+        log_entry["lr_actor"] = actor_optimizer.param_groups[0]["lr"]
+        for sch in schedulers:
+            sch.step()
+
         training_log.append(log_entry)
         if stop_now:
             break
+
+    # Entrenamientos tan cortos que nunca llenaron la ventana: guarda el centro de lo que haya.
+    if CKPT_SELECTION == "moving_avg" and ckpt_update is None and ventana and best_checkpoint_path:
+        centro = ventana[len(ventana) // 2]
+        torch.save({"agent": centro["agent"], "critic": centro["critic"]}, best_checkpoint_path)
+        ckpt_update = centro["update"]
+        for e in training_log:
+            if e["update"] == ckpt_update:
+                e["val_best"] = True
+        if training_log:
+            training_log[-1]["ckpt_update"] = ckpt_update
 
     print("Entrenamiento AM-PPO completo.")
     return agent, critic, episode_rewards, episode_losses, training_log

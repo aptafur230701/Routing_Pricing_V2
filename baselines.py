@@ -44,6 +44,24 @@ class Observacion:
     dia_semana_salida: int
 
 
+def calcular_ev_esperado(market, distance_arr, diesel_arr) -> np.ndarray:
+    """Recompensa esperada por lane y día de la semana, (7, N, N).
+
+        E[r_jl] = P(N_jl ≥ 1) · q̄_jl · dist_jl − c_jl,   P(N ≥ 1) = 1 − (φ / (φ + m_jl))^φ
+
+    con m = mu_jl · s_d (d = día de la semana de llegada) y q̄ la tarifa media histórica de la
+    lane. Es el valor que usa B2 para los arcos futuros y el que alimenta las features de
+    continuación del DRL; se calcula una vez por número de nodos.
+    """
+    p = market.params
+    phi = p.phi[p.grupo]                                              # (N, N)
+    q_medio = p.tarifas.mean(axis=0).astype(float)                    # (N, N)
+    costo = distance_arr * (diesel_arr / MPG) + distance_arr * MARGINAL_COST_SIN_DIESEL
+    m = p.mu[None, :, :] * p.s[:, None, None]                         # (7, N, N)
+    prob = 1.0 - (phi[None] / (phi[None] + m)) ** phi[None]           # P(N ≥ 1); m = 0 ⇒ 0
+    return prob * q_medio[None] * distance_arr[None] - costo[None]    # (7, N, N)
+
+
 class PoliticaB1:
     """B1, greedy miope (PFA): arco válido de mayor `lane_reward` según la fila observada.
 
@@ -78,17 +96,11 @@ class PoliticaB2:
     nombre = "B2"
 
     def __init__(self, market, time_matrix, distance_arr, diesel_arr, max_duration=MAX_DURATION):
-        p = market.params
         self._T = np.asarray(time_matrix, dtype=float)
         self._dist, self._diesel = distance_arr, diesel_arr
         self._max = float(max_duration)
         self.N = self._T.shape[0]
-        phi = p.phi[p.grupo]                                              # (N, N)
-        q_medio = p.tarifas.mean(axis=0).astype(float)                    # (N, N)
-        costo = distance_arr * (diesel_arr / MPG) + distance_arr * MARGINAL_COST_SIN_DIESEL
-        m = p.mu[None, :, :] * p.s[:, None, None]                         # (7, N, N)
-        prob = 1.0 - (phi[None] / (phi[None] + m)) ** phi[None]           # P(N ≥ 1); m = 0 ⇒ 0
-        self._ev = prob * q_medio[None] * distance_arr[None] - costo[None]   # (7, N, N)
+        self._ev = calcular_ev_esperado(market, distance_arr, diesel_arr)   # (7, N, N)
 
     def actuar(self, obs: Observacion) -> int:
         i, h = obs.nodo, obs.casa

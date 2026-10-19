@@ -20,11 +20,12 @@ import pytest
 
 import am_training
 from config import (
-    MAX_DURATION, REWARD_SCALE_FACTOR, BIG_M_PENALTY, DIAS_EXCLUIDOS, FECHA_INICIO,
+    MAX_DURATION, REWARD_SCALE_FACTOR, BIG_M_PENALTY, DIAS_EXCLUIDOS, FECHA_INICIO, TRAIN_DAYS,
 )
 from fit_market_process import ajustar, dia_de_semana, cargar_matrices_completas, params_path
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices, build_rm_pen_stack, build_day_matrices, lane_reward
+import routing_env
 from routing_env import RoutingEnv, VectorRoutingEnv
 
 NUM_NODES = 10
@@ -217,8 +218,14 @@ RUTAS_REFERENCIA = [
 ]
 
 
+@pytest.fixture
+def con_shaping(monkeypatch):
+    """Las referencias de arriba se capturaron con el bono de retorno (USE_REWARD_SHAPING = True)."""
+    monkeypatch.setattr(routing_env, "USE_REWARD_SHAPING", True)
+
+
 @pytest.mark.parametrize("start,day,k,acciones,esperadas", RUTAS_REFERENCIA)
-def test_market_none_reproduce_recompensas_de_antes(data, start, day, k, acciones, esperadas):
+def test_market_none_reproduce_recompensas_de_antes(con_shaping, data, start, day, k, acciones, esperadas):
     env = _scalar_env(data, market_process=None)
     env.reset(seed=0, options={"start_node": start, "start_day_idx": day, "k_max": k})
     rewards = [env.step(a)[1] for a in acciones]
@@ -226,13 +233,33 @@ def test_market_none_reproduce_recompensas_de_antes(data, start, day, k, accione
 
 
 @pytest.mark.parametrize("start,day,k,acciones,esperadas", RUTAS_REFERENCIA)
-def test_vector_env_market_none_coincide_con_referencia(data, start, day, k, acciones, esperadas):
+def test_vector_env_market_none_coincide_con_referencia(con_shaping, data, start, day, k, acciones, esperadas):
     rm_pen = build_rm_pen_stack(data["rate_stack"], data["loads_stack"],
                                 data["distance_arr"], data["diesel_arr"])
     env = _vector_env(data, None, rm_pen)
     env.reset(np.array([start]), np.array([day]), k_max_arr=[k])
     rewards = [float(env.step(np.array([a]))[0][0]) for a in acciones]
     assert rewards == pytest.approx(esperadas, abs=1e-5)   # float32
+
+
+@pytest.mark.parametrize("start,day,k,acciones,esperadas", RUTAS_REFERENCIA)
+def test_sin_shaping_el_retorno_exitoso_es_solo_margen(monkeypatch, data, start, day, k, acciones, esperadas):
+    """USE_REWARD_SHAPING = False: el último paso (retorno a casa, a tiempo) no suma bono alguno:
+    recompensa = lane / REWARD_SCALE_FACTOR, tanto en RoutingEnv como en VectorRoutingEnv."""
+    rm_pen = build_rm_pen_stack(data["rate_stack"], data["loads_stack"],
+                                data["distance_arr"], data["diesel_arr"])
+    monkeypatch.setattr(routing_env, "USE_REWARD_SHAPING", False)
+    env = _scalar_env(data, market_process=None)
+    env.reset(seed=0, options={"start_node": start, "start_day_idx": day, "k_max": k})
+    venv = _vector_env(data, None, rm_pen)
+    venv.reset(np.array([start]), np.array([day]), k_max_arr=[k])
+    for a in acciones:
+        i, d = env.current_node, env.current_day_idx
+        r_lane = float(rm_pen[d, i, a]) / REWARD_SCALE_FACTOR
+        r = env.step(a)[1]
+        rv = float(venv.step(np.array([a]))[0][0])
+        assert r == pytest.approx(r_lane, abs=1e-9)
+        assert rv == pytest.approx(r_lane, abs=1e-5)
 
 
 def test_lane_reward_coincide_con_rm_pen_stack(data):
@@ -332,7 +359,7 @@ def test_rewards_row_vectorial_es_la_fila_observada(data, mp):
 def test_media_y_ceros_simulados_se_parecen_al_historico_por_grupo():
     n = 35
     mp35 = MarketProcess(n)
-    hist = np.load(os.path.join(os.path.dirname(__file__), "..", "datos", "load_availability.npy"))[:, :n, :n]
+    hist = np.load(os.path.join(os.path.dirname(__file__), "..", "datos", "load_availability.npy"))[:TRAIN_DAYS, :n, :n]   # días de ajuste
     D = hist.shape[0]
     grupo = mp35.params.grupo
     universo = hist.sum(0) > 0
@@ -388,14 +415,15 @@ def test_ajuste_excluye_solo_las_fechas_indicadas():
         ajustar(loads, rate, FECHA_INICIO, ["2025-12-31"])
 
 
-def test_parametros_guardados_usan_todos_los_dias_del_archivo():
-    """Con DIAS_EXCLUIDOS vacía, el .npz guardado incluye todos los días de las matrices."""
+def test_parametros_guardados_usan_solo_dias_de_entrenamiento():
+    """El .npz guardado se ajusta con los primeros TRAIN_DAYS días, sin los de evaluación."""
     assert list(DIAS_EXCLUIDOS) == []
     asegurar_parametros()
-    loads, rate = cargar_matrices_completas()
+    loads, rate = cargar_matrices_completas(TRAIN_DAYS)
+    assert loads.shape[0] == TRAIN_DAYS
     with np.load(params_path()) as z:
-        assert z["tarifas"].shape[0] == loads.shape[0] == len(z["dias_usados"])
-        assert np.array_equal(z["dias_usados"], np.arange(loads.shape[0]))
+        assert z["tarifas"].shape[0] == len(z["dias_usados"]) == TRAIN_DAYS
+        assert np.array_equal(z["dias_usados"], np.arange(TRAIN_DAYS))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

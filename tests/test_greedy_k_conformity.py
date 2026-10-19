@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 import torch
 
-from config import DEVICE, K_LEVELS
+from config import DEVICE, K_LEVELS, REWARD_SCALE_FACTOR, TIME_VIOLATION_PENALTY
 from am_agent import AMRoutingAgent
 from greedy_rollout import greedy_rollout
 from problem_data import build_rm_pen_stack
@@ -45,6 +45,7 @@ def synthetic():
         time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack,
         distance_arr=distance_arr, diesel_arr=diesel_arr,
         trucks_stack=trucks_stack, ltr_stack=ltr_stack, rm_pen_stack=rm_pen_stack,
+        ev_esperado=np.random.RandomState(0).uniform(-50, 200, size=(7, N, N)),   # features de continuación
     )
 
 
@@ -72,6 +73,7 @@ def _run(agent, env, synthetic, k_max):
         synthetic["trucks_stack"], synthetic["ltr_stack"],
         reward_global_p95=1.0, num_nodes=N,
         k_max_arr=[k_max] * N, max_duration=MAX_DURATION_SYN,
+        ev_esperado=synthetic["ev_esperado"],
     )
 
 
@@ -123,6 +125,17 @@ def test_greedy_rollout_raw_reward_is_sum_of_lane_rewards(agent, env, synthetic)
     for route, raw in zip(res.routes, res.raw_reward):
         expected = sum(float(rm[a, b]) for a, b in zip(route[:-1], route[1:]))
         assert raw == pytest.approx(expected)
+
+
+def test_greedy_env_reward_es_margen_sin_bonos(agent, env, synthetic, monkeypatch):
+    """Sin shaping, env_reward (el que alimenta el self-critical) es margen / REWARD_SCALE_FACTOR
+    en las rutas válidas: sin bono de retorno ni términos de n_intermediate / time_util."""
+    import routing_env
+    monkeypatch.setattr(routing_env, "USE_REWARD_SHAPING", False)
+    for k in (*K_LEVELS, None):
+        res = _run(agent, env, synthetic, k)
+        assert res.valid.all()
+        assert res.env_reward == pytest.approx(res.raw_reward / REWARD_SCALE_FACTOR, abs=1e-5)
 
 
 def test_greedy_route_replays_in_scalar_routing_env(agent, env, synthetic):

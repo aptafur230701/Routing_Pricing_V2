@@ -34,7 +34,9 @@ import pytest
 import numpy as np
 
 from config import MAX_DURATION, TRAIN_DAYS
+from baselines import calcular_ev_esperado
 from evaluation import make_replay_env, rollout_drl_env
+from market_process import MarketProcess, asegurar_parametros
 from transfer_learning import load_checkpoint_compatible
 from problem_data import load_matrices
 from Solvers import solve_label_setting_oracle
@@ -76,6 +78,8 @@ def test_free_case_rollout_quality_vs_exact_optimum(loaded):
     num_days = loads_stack.shape[0]
     time_matrix_np = np.asarray(time_matrix, dtype=float)
     env = make_replay_env(time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, NUM_NODES)
+    asegurar_parametros()
+    ev_esperado = calcular_ev_esperado(MarketProcess(NUM_NODES), distance_arr, diesel_arr)
 
     drl_rewards, opt_rewards = [], []
     for day in range(TRAIN_DAYS, num_days):
@@ -86,6 +90,7 @@ def test_free_case_rollout_quality_vs_exact_optimum(loaded):
                 reward_global_p95=reward_global_p95,
                 avail_expected_arr=avail_expected_arr,
                 k_max=None,   # caso libre — k_restricted=0
+                ev_esperado=ev_esperado,
             )
             assert route is not None, f"start_node={start_node} day={day}: ruta inválida"
             assert route[0] == start_node and route[-1] == start_node, (
