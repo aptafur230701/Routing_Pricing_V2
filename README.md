@@ -91,9 +91,9 @@ Con `False` el entrenamiento reproduce días reales como antes. La evaluación s
 
 | Archivo | Rol |
 |---|---|
-| [fit_market_process.py](fit_market_process.py) | Estima s_d, mu_ij y phi_h con todos los días del histórico y guarda `datos/market_params.npz`. `main.py` lo corre solo si el archivo no existe. |
+| [fit_market_process.py](fit_market_process.py) | Estima s_d, mu_ij y phi_h con los primeros `TRAIN_DAYS` días (0-89) del histórico, sin los de evaluación, y guarda `datos/market_params.npz`. `main.py` lo corre solo si el archivo no existe. |
 | [market_process.py](market_process.py) | `MarketProcess`: `sample_arrivals` (lotes con un Generator), `sample_arrivals_por_mundo` (usado por el entorno; determinista por semilla de mundo, nodo y día) y `sample_world` (mundo completo [D, N, N] para baselines). |
-| [validate_market_process.py](validate_market_process.py) | Simula 1.000 réplicas del periodo y compara cargas por lane y tarifas con el histórico (tablas y gráficos en `results/market_validation/`). |
+| [validate_market_process.py](validate_market_process.py) | Simula 1.000 réplicas del periodo de ajuste (dentro de muestra) y compara cargas por lane y tarifas con el histórico (tablas y gráficos en `results/market_validation/`). |
 | [tests/test_market_process.py](tests/test_market_process.py) | Reproducibilidad, independencia de las acciones, formas, equivalencia con `market_process=None`, recompensa compartida, ajuste y smoke de entrenamiento. |
 
 Constantes (`FECHA_INICIO`, `DIAS_EXCLUIDOS`, `MARKET_PHI_MAX`, semillas, M) en
@@ -109,14 +109,14 @@ los mismos mundos simulados (mismo `world_seed`), paso a paso en `VectorRoutingE
 | Id | Baseline | Archivo |
 |---|---|---|
 | B1 | Greedy miope: arco válido de mayor `lane_reward` de la fila observada (PFA). | [baselines.py](baselines.py) |
-| B2 | Reoptimización determinista con valores esperados de los arcos futuros; ejecuta solo el primer arco. Solo con K finito (CFA). | [baselines.py](baselines.py) |
+| B2 | Reoptimización determinista con valores esperados de los arcos futuros; ejecuta solo el primer arco. Con K = 5 y con K libre (CFA); con K libre la enumeración exacta solo es viable hasta ~50 nodos. | [baselines.py](baselines.py) |
 | B3 | Política de un paso sobre la tabla V de la DP relajada (VFA de tabla). | [dp_relajada.py](dp_relajada.py) |
 | UB-DP | Cota ajustada: DP en (hogar, día de salida, nodo, franja de 15 min, k) permitiendo revisitar. Tabla en `datos/ubdp_tabla_<N>nodos.npz`, se recarga si coincide con los datos. | [dp_relajada.py](dp_relajada.py) |
 | UB-PI | Cota laxa: mejor ruta con el mundo completo conocido (`sample_world` + label-setting oráculo sin poda por dominancia). | [evaluation.py](evaluation.py), [Solvers.py](Solvers.py) |
 
 | Archivo | Rol |
 |---|---|
-| [evaluation.py](evaluation.py) | Arnés único (`ejecutar_politica`), `evaluar_mundos_simulados` (M mundos por K ∈ {5, libre}, nodo y día de la semana balanceados), `evaluar_replay` (días reales 90-119, "replay, no independiente del simulador"), `resumen_metodos`, diagnósticos. |
+| [evaluation.py](evaluation.py) | Arnés único (`ejecutar_politica`), `evaluar_mundos_simulados` (M mundos por K ∈ {5, libre}, nodo y día de la semana balanceados), `evaluar_replay` (días reales 90-119, fuera de muestra: "replay, fuera de muestra (días 90-119)"), `resumen_metodos`, diagnósticos. |
 | [excel_report.py](excel_report.py) | Excel de resultados: hojas Resumen, Mundos simulados y Replay. |
 | [stats_analysis.py](stats_analysis.py) | Diferencia pareada DRL − baseline con IC 95 % por bootstrap, Wilcoxon pareado de una cola con Holm, y gaps contra UB-DP y UB-PI. |
 | [tests/test_baselines.py](tests/test_baselines.py) | Tabla V vs recursión ingenua, máscara, determinismo, UB-PI ≥ políticas, B3 ≤ UB-DP, margen = Σ `lane_reward`, oráculo vs enumeración, y limpieza de nombres borrados. |

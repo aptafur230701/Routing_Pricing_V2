@@ -3,9 +3,10 @@ validate_market_process.py
 ==========================
 Validación del simulador (fase 6 de proceso_exogeno_cargas_tarifas.md).
 
-Como los parámetros se estiman con todos los días, la validación es DENTRO DE
-MUESTRA: se simulan R réplicas (1.000 por defecto) del periodo completo con los
-parámetros estimados y se comparan con el histórico.
+Los parámetros se estiman con los primeros TRAIN_DAYS días, así que esta validación es
+DENTRO DE MUESTRA: se simulan R réplicas (1.000 por defecto) del periodo de ajuste con los
+parámetros estimados y se comparan con ese mismo histórico. La prueba fuera de muestra es
+el replay de los días 90-119 de la evaluación.
 
   1. Cargas por lane  — media diaria y proporción de días en cero, agrupadas por
                         grupo de volumen h. Se lee: ¿el valor real cae dentro del
@@ -14,7 +15,8 @@ parámetros estimados y se comparan con el histórico.
                         distancia (cuartiles), con QQ-plot, y tarifa media real vs
                         simulada por mes (muestra la tendencia que el remuestreo no
                         reproduce).
-  3. Política         — APLAZADA hasta que exista el modo de escenarios (Paso 6).
+  3. Política         — no se hace aquí: está en evaluation.py (mundos simulados y replay
+                        fuera de muestra de los días 90-119).
 
 Uso
 ---
@@ -235,9 +237,9 @@ def main():
     print(cuantiles.to_string(index=False))
     print("\n== 2b. Tarifa media por mes ==")
     print(mensual.to_string(index=False))
-    print("\n== 3. Política: APLAZADA (requiere el modo de escenarios del Paso 6) ==")
+    print("\n== 3. Política: ver evaluation.py (mundos simulados y replay fuera de muestra) ==")
     print(f"\nTablas y gráficos en: {args.salida}")
-    print("Nota: validación dentro de muestra (parámetros estimados con todos los días); "
+    print("Nota: validación dentro de muestra (parámetros estimados con los días de ajuste); "
           "el diagnóstico es de ajuste, no de generalización.")
 
 

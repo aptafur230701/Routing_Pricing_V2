@@ -43,7 +43,7 @@ from config import (
     K_TRAINING_LEVELS,
     MARKET_SEED_TRAIN,
     USE_CONTINUATION_FEATURES,
-    CKPT_SELECTION, CKPT_WINDOW, USE_LR_COSINE, LR_FINAL_FRAC,
+    CKPT_SELECTION, CKPT_WINDOW, USE_LR_COSINE, LR_FINAL_FRAC, hp,
 )
 from routing_env import VectorRoutingEnv
 from greedy_rollout import greedy_rollout
@@ -479,10 +479,15 @@ def run_am_training(
     n_heads               = AM_N_HEADS
     n_layers              = AM_N_LAYERS
     d_ff                  = AM_D_FF
-    n_episodes_per_update = PPO_N_EPISODES_PER_UPDATE
+    # hp(): lo definido en config.HP_POR_NODOS para este tamaño manda; si no cambia el valor,
+    # se usa el global del módulo (que hpo_optuna.py sobreescribe por trial).
+    n_episodes_per_update = hp("PPO_N_EPISODES_PER_UPDATE", PPO_N_EPISODES_PER_UPDATE)
     n_ppo_epochs          = PPO_N_EPOCHS
     ppo_batch_size        = PPO_BATCH_SIZE
-    lr                    = PPO_LR
+    lr                    = hp("PPO_LR", PPO_LR)
+    entropy_start         = hp("PPO_ENTROPY_COEF_START", PPO_ENTROPY_COEF_START)
+    entropy_end           = hp("PPO_ENTROPY_COEF_END",   PPO_ENTROPY_COEF_END)
+    lr_final_frac         = hp("LR_FINAL_FRAC", LR_FINAL_FRAC)
     gamma                 = PPO_GAMMA
     gae_lambda            = PPO_GAE_LAMBDA
     clip_eps              = PPO_CLIP_EPS
@@ -521,7 +526,7 @@ def run_am_training(
     # al terminar n_updates (un scheduler.step() al final de cada update).
     schedulers = []
     if USE_LR_COSINE:
-        def _cos(u, n=n_updates, f=LR_FINAL_FRAC):
+        def _cos(u, n=n_updates, f=lr_final_frac):
             return f + (1.0 - f) * 0.5 * (1.0 + math.cos(math.pi * min(u, n) / max(n, 1)))
         schedulers = [torch.optim.lr_scheduler.LambdaLR(o, _cos) for o in (actor_optimizer, critic_optimizer)]
 
@@ -620,7 +625,7 @@ def run_am_training(
     # ── Loop principal ────────────────────────────────────────────────────────
     for update in range(n_updates):
         progress     = update / max(1, n_updates - 1)
-        entropy_coef = PPO_ENTROPY_COEF_START + (PPO_ENTROPY_COEF_END - PPO_ENTROPY_COEF_START) * progress
+        entropy_coef = entropy_start + (entropy_end - entropy_start) * progress
 
         buffer = RolloutBuffer()
         update_ep_rewards = []

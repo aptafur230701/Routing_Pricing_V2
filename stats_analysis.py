@@ -9,11 +9,12 @@ Unidad de análisis: la diferencia de margen (USD) DRL − baseline en un mismo 
     (BOOTSTRAP_B remuestreos, semilla fija; Agarwal et al., 2021).
   · Wilcoxon de rangos con signo, pareado y de una cola (H1: DRL > baseline), con
     corrección de Holm por las comparaciones de cada (modo, K) (Accorsi, Lodi y Vigo).
-  · B2 solo existe con K finito, así que se compara solo en esos mundos.
+  · B2 se compara en todos los niveles de K, incluido el libre.
   · Gap de cada método contra UB-DP y contra UB-PI: (UB − método) / |UB| · 100 sobre los
     promedios de los mismos mundos, con intervalo bootstrap.
 
-El replay se calcula igual pero va etiquetado: "replay, no independiente del simulador".
+El replay (días reales 90-119, que ni el entrenamiento ni el ajuste del proceso vieron) se calcula
+igual pero va etiquetado: "replay, fuera de muestra (días 90-119)".
 """
 
 import numpy as np
@@ -24,7 +25,7 @@ from config import BOOTSTRAP_B, BOOTSTRAP_SEED
 
 REFERENCIA = "DRL"
 BASELINES = ("B1", "B2", "B3")
-NOTA_REPLAY = "replay, no independiente del simulador"
+NOTA_REPLAY = "replay, fuera de muestra (días 90-119)"
 
 
 def etiqueta_modo(modo: str) -> str:

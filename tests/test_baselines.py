@@ -24,9 +24,9 @@ import pytest
 import torch
 
 from am_agent import AMRoutingAgent
-from baselines import Observacion, PoliticaB1
+from baselines import Observacion, PoliticaB1, PoliticaB2
 from config import (
-    MAX_DURATION, TRAIN_DAYS, K_MAX, MARKET_SEED_TRAIN, MARKET_SEED_EVAL,
+    MAX_DURATION, TRAIN_DAYS, K_MAX, MARKET_SEED_TRAIN, MARKET_SEED_EVAL, MARKET_SEED_EVAL_FINAL,
 )
 from dp_relajada import calcular_tabla, _sortear_filas
 import evaluation as ev
@@ -166,6 +166,34 @@ def test_b1_desempata_por_indice_menor(inst10):
     assert plano.actuar(obs) == 2          # todo empata: el índice menor
 
 
+def test_b2_libre_equivale_a_un_tope_de_cardinalidad_inalcanzable(inst10):
+    """Con k_restante None, B2 elige lo mismo que con un K tan grande que nunca limita."""
+    n = inst10.n
+    pol = PoliticaB2(inst10.market, inst10.T, inst10.dist, inst10.diesel)
+    rng = np.random.default_rng(3)
+    for nodo in range(n):
+        vis = np.zeros(n, dtype=bool)
+        vis[nodo] = True
+        mascara = np.ones(n, dtype=np.int8)
+        mascara[nodo] = 0
+        loads_row = rng.integers(0, 4, size=n).astype(float)
+        rate_row = rng.uniform(1.5, 3.0, size=n)
+        kw = dict(nodo=nodo, casa=nodo, tiempo=0.0, visitados=vis, mascara=mascara,
+                  loads_row=loads_row, rate_row=rate_row, dia_semana_salida=2)
+        libre = pol.actuar(Observacion(k_restante=None, **kw))
+        grande = pol.actuar(Observacion(k_restante=n + 5, **kw))
+        assert libre == grande and mascara[libre]
+
+
+def test_conjunto_de_evaluacion_final_no_comparte_mundos_con_el_de_desarrollo(inst10):
+    a = ev.disenar_mundos(inst10.n, 1000, inst10.market, semilla=MARKET_SEED_EVAL)
+    b = ev.disenar_mundos(inst10.n, 1000, inst10.market, semilla=MARKET_SEED_EVAL_FINAL)
+    assert MARKET_SEED_EVAL_FINAL not in (MARKET_SEED_EVAL, MARKET_SEED_TRAIN)
+    assert not set(a["world_seed"].tolist()) & set(b["world_seed"].tolist())
+    c = ev.disenar_mundos(inst10.n, 1000, inst10.market, semilla=MARKET_SEED_EVAL_FINAL)
+    assert (b["world_seed"] == c["world_seed"]).all()          # reproducible
+
+
 def _sin_tiempos(df):
     return df.drop(columns=["ms_decision"]).assign(ruta=df["ruta"].astype(str))
 
@@ -175,7 +203,7 @@ def test_politicas_respetan_mascara_y_son_deterministas(inst10):
     a = inst10.simular(M=8)
     b = inst10.simular(M=8)
     assert set(a["metodo"]) == {"DRL", "B1", "B2", "B3"}
-    assert not ((a["metodo"] == "B2") & (a["K"] == "libre")).any()      # B2 solo con K finito
+    assert ((a["metodo"] == "B2") & (a["K"] == "libre")).any()          # B2 también con K libre
     pd.testing.assert_frame_equal(_sin_tiempos(a), _sin_tiempos(b))
 
 
@@ -319,12 +347,11 @@ def test_holm_y_comparacion_pareada():
             filas.append(dict(modo="simulado", K=k, mundo=i, metodo="DRL", margen=b + 50 + rng.normal(0, 20)))
             filas.append(dict(modo="simulado", K=k, mundo=i, metodo="B1", margen=b))
             filas.append(dict(modo="simulado", K=k, mundo=i, metodo="B3", margen=b + 100))
-            if k == "5":
-                filas.append(dict(modo="simulado", K=k, mundo=i, metodo="B2", margen=b + 20))
+            filas.append(dict(modo="simulado", K=k, mundo=i, metodo="B2", margen=b + 20))
     df = pd.DataFrame(filas)
     tabla = st.comparar_con_baselines(df, B=2000)
     assert set(tabla["comparacion"]) == {"DRL − B1", "DRL − B2", "DRL − B3"}
-    assert len(tabla[tabla["K"] == "libre"]) == 2                 # B2 solo con K finito
+    assert len(tabla[tabla["K"] == "libre"]) == 3                 # B2 también con K libre
     fila = tabla[(tabla["K"] == "5") & (tabla["comparacion"] == "DRL − B1")].iloc[0]
     assert fila["ic95_inf"] < fila["dif_media_usd"] < fila["ic95_sup"]
     assert fila["p_una_cola"] < 0.001 and fila["p_holm"] >= fila["p_una_cola"]

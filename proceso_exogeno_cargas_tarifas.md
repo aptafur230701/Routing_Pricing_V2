@@ -41,17 +41,17 @@ En el marco de Powell (2019) es **información exógena**: llega al sistema desp
 | Sin shrinkage en la tasa base | La lane mediana tiene cientos de cargas en el periodo, y las lanes con menos de una carga al día son una cuarta parte de las lanes pero menos del 1 % del volumen |
 | Tarifa remuestreada del histórico de cada lane | La tarifa no depende del día de la semana ni, de forma relevante, del número de cargas, y el remuestreo no supone ninguna forma funcional |
 | Lanes independientes entre sí | Es una simplificación asumida: la correlación media entre lanes del mismo origen es 0,14, frente a 0,045 entre orígenes distintos. Se declara como limitación |
-| Parámetros estimados con todos los días | Decisión tomada: aprovechar todo el histórico. La consecuencia es que la validación es dentro de muestra y el replay de días reales no es una prueba independiente del simulador (se reporta como referencia descriptiva) |
+| Parámetros estimados solo con los días de entrenamiento (0-89) | Decisión tomada: dejar los días 90-119 fuera del ajuste. La consecuencia es que el replay de esos días es una prueba fuera de muestra, mientras que la validación del simulador sobre los días de ajuste sigue siendo dentro de muestra |
 | Parámetros tratados como conocidos | Se simplifica: no se modela la incertidumbre sobre los parámetros |
 
-La regla general que guía el diseño es la parsimonia: con 120 días por lane no hay datos para modelos más complejos, y cada pieza se justifica con evidencia de los datos.
+La regla general que guía el diseño es la parsimonia: con 90 días de ajuste por lane no hay datos para modelos más complejos, y cada pieza se justifica con evidencia de los datos.
 
 ### Cómo encaja con el resto del proyecto
 
 - **No cambia la arquitectura del modelo** (encoder, decoder, critic) ni los hiperparámetros de PPO. Cambia lo que el entorno le muestra al agente.
 - **El modo actual sigue funcionando y es el valor por defecto.** El proceso nuevo se activa pasando un objeto `market_process` al entorno. Con `market_process=None` los resultados deben ser idénticos a los actuales.
 - **El reloj es el del entorno actual.** El tiempo está en horas de servicio: 14 horas equivalen a un día de mercado, y la duración máxima de la ruta es de 77 horas. El proceso solo necesita el día de la semana del día de llegada a cada nodo.
-- **Alcance actual.** Se implementa el proceso exógeno, su uso en el entrenamiento y su validación. La evaluación con mundos simulados y los baselines (Paso 6) se aplazan hasta que se reformulen los baselines. `sample_world` se implementa igual, para que queden listos.
+- **Alcance actual.** Se implementó el proceso exógeno, su uso en el entrenamiento, su validación y la evaluación con mundos simulados y baselines (Paso 6, ver `baselines_drl_ruteo_estocastico.md`).
 - **Camino al pricing.** Hoy la tarifa se remuestrea sin condicionar. Las extensiones naturales, que **no** se hacen ahora, son la tendencia del nivel de tarifa, su persistencia de un día al siguiente y su relación con el mercado (LTR, supply, llegadas de camiones).
 
 ### Principios que no deben romperse
@@ -91,7 +91,7 @@ El histórico de 120 días contiene todas las cargas publicadas en el spot marke
 - Las tasas de cada lane son estables en el periodo, salvo el efecto del día de la semana. Para las cargas es una aproximación. Para la tarifa hay una tendencia al alza y persistencia día a día que el remuestreo no reproduce (fase 3); se declaran como limitaciones.
 - La tarifa por milla de una lane no depende del día de la semana ni, de forma relevante, del número de cargas (evidencia en la fase 3).
 - Una lane sin cargas en todo el histórico no genera cargas.
-- Los parámetros se estiman con todos los días del histórico, sin excluir ninguno, y se tratan como conocidos.
+- Los parámetros se estiman con los primeros `TRAIN_DAYS` días (0-89), sin excluir ninguno de ellos, y se tratan como conocidos. Los días 90-119 no participan.
 - El agente no altera el proceso: sus decisiones no cambian las cargas ni las tarifas que encuentra.
 
 ## Proceso exógeno
@@ -107,19 +107,19 @@ El resultado son dos vectores de largo N (número de nodos): `loads_row`, con la
 
 El modelo de cargas se estima sobre `loads_stack`, que ya incluye los días en que la lane no tuvo cargas, y el de tarifas sobre `rate_stack`.
 
-**Días atípicos.** El volumen total del mercado tiene 12 días atípicos: el 13 de marzo y del 27 de marzo al 6 de abril. El 13 de marzo y del 27 al 30 de marzo el total es entre 3,4 y 4,5 veces el promedio de ese día de la semana; del 31 de marzo al 6 de abril cae a entre 0,38 y 0,53 veces. Se está revisando con el equipo de datos si son un problema de captura o demanda real. Mientras tanto no se excluyen: el ajuste usa todos los días. Incluirlos mueve los factores de día de la semana (lunes 1,43 frente a 1,31 sin ellos; viernes 1,14 frente a 0,96) y baja el phi del grupo de mayor volumen de 4,4 a 2,6, es decir, más sobredispersión: los picos y caídas del mercado se absorben como variabilidad extra de cada lane.
+**Días atípicos.** El volumen total del mercado tiene 12 días atípicos: el 13 de marzo y del 27 de marzo al 6 de abril. El 13 de marzo y del 27 al 30 de marzo el total es entre 3,4 y 4,5 veces el promedio de ese día de la semana; del 31 de marzo al 6 de abril cae a entre 0,38 y 0,53 veces. Se está revisando con el equipo de datos si son un problema de captura o demanda real. Mientras tanto no se excluyen: el ajuste usa todos sus días. Del 13 de marzo y el 27-30 de marzo (picos) y el 31 de marzo (caída), los 6 días quedan dentro del ajuste (días 85-89 y el 13 de marzo); del 1 al 6 de abril (caída, entre 0,28 y 0,44 veces el volumen de ajuste de ese día de la semana) quedan en el replay de evaluación, que por lo tanto incluye un régimen que el proceso no vio. Los porcentajes de este párrafo sobre el nivel de los atípicos (3,4 a 4,5 veces y 0,38 a 0,53 veces) se calcularon con los 120 días. Con los 90 días de ajuste, incluir los atípicos mueve los factores de día de la semana (lunes 1,45 frente a 1,29 sin ellos; viernes 1,19 frente a 0,96) y baja el phi del grupo de mayor volumen de 4,5 a 2,65, es decir, más sobredispersión: los picos y caídas del mercado se absorben como variabilidad extra de cada lane.
 
-**Días de ajuste.** Se usan solo los primeros `TRAIN_DAYS` días (90) de `loads_stack` y `rate_stack`; los días 90-119 quedan fuera del ajuste para que el replay de evaluación sea fuera de muestra. El código no lleva índices de día escritos a mano: el número de días sale de la forma de las matrices y las fechas salen de `FECHA_INICIO` (1 de enero de 2026) más el índice del día. `DIAS_EXCLUIDOS`, una lista de fechas vacía por defecto, permite dejar fuera días que la fuente confirme como erróneos.
+**Días de ajuste.** Se usan solo los primeros `TRAIN_DAYS` días (90) de `loads_stack` y `rate_stack`; los días 90-119 quedan fuera del ajuste para que el replay de evaluación sea fuera de muestra (verificado: `datos/market_params.npz` trae `dias_usados` = 0-89, del 2026-01-01 al 2026-03-31, y `market_process.py` lo reajusta si no coincide con `TRAIN_DAYS`). El código no lleva índices de día escritos a mano: el número de días sale de la forma de las matrices y las fechas salen de `FECHA_INICIO` (1 de enero de 2026) más el índice del día. `DIAS_EXCLUIDOS`, una lista de fechas vacía por defecto, permite dejar fuera días que la fuente confirme como erróneos.
 
 **Construcción**
 
 - Universo de lanes: las lanes (origen, destino) con al menos una carga en el histórico.
 - Conteos: `loads_stack` tal cual, con los ceros.
-- Tarifas: `rate_stack` de cada lane en todos los días del histórico, con o sin cargas. En los datos la tarifa es positiva en todos los lane-días y casi no cambia cuando la lane no tiene cargas (0,7 % menos).
+- Tarifas: `rate_stack` de cada lane en todos los días de ajuste, con o sin cargas. En los datos la tarifa es positiva en todos los lane-días y casi no cambia cuando la lane no tiene cargas (0,7 % menos).
 - Día de la semana: se calcula desde `FECHA_INICIO` (jueves 1 de enero de 2026). Con esa fecha equivale a `dow = (día + 3) % 7`, con lunes igual a 0.
 - Se estiman los parámetros con las matrices completas de 194 nodos y se recortan a `num_nodes` al cargarlos, igual que `load_matrices`.
 
-**Entregable:** las matrices de ajuste con todos los días y la fecha de cada día.
+**Entregable:** las matrices de ajuste (días 0-89) y la fecha de cada día.
 
 ## Fase 2. Cuántas cargas hay en cada lane
 
@@ -129,7 +129,7 @@ El número de cargas de la lane (i, j) en el día d se sortea de una binomial ne
 N_{ij,t} \sim \text{NegBin}\left(\mu_{ij} \cdot s_d,\ \phi_{h(ij)}\right)
 ```
 
-La media es m = mu_ij × s_d y la varianza es m + m² / phi. Se usa binomial negativa y no Poisson porque los conteos tienen sobredispersión: dentro de cada lane y día de la semana, la varianza es entre 1,8 y 10,2 veces la media (mediana por grupo de volumen, con los 120 días), cuando una Poisson daría 1. Parte de esa sobredispersión viene de la variación diaria común a todo el mercado, que la binomial negativa absorbe como variabilidad extra.
+La media es m = mu_ij × s_d y la varianza es m + m² / phi. Se usa binomial negativa y no Poisson porque los conteos tienen sobredispersión: dentro de cada lane y día de la semana, la varianza es entre 1,8 y 10,2 veces la media (mediana por grupo de volumen, calculada con los 120 días; no recalculada con los 90 de ajuste), cuando una Poisson daría 1. Parte de esa sobredispersión viene de la variación diaria común a todo el mercado, que la binomial negativa absorbe como variabilidad extra.
 
 ### Parámetros
 
@@ -163,9 +163,9 @@ Con 1.000 simulaciones del panel, la media de cargas por lane y día y la propor
 
 ## Fase 3. Tarifa por milla de la lane
 
-Cada día, la tarifa por milla de la lane se remuestrea, con reemplazo, de las tarifas históricas de esa misma lane en todos los días del histórico, con o sin cargas. Es una distribución empírica por lane, sin forma funcional supuesta, y produce una sola tarifa por lane y día, igual que `rate_stack`.
+Cada día, la tarifa por milla de la lane se remuestrea, con reemplazo, de las tarifas históricas de esa misma lane en todos los días de ajuste, con o sin cargas. Es una distribución empírica por lane, sin forma funcional supuesta, y produce una sola tarifa por lane y día, igual que `rate_stack`.
 
-**Evidencia y límites.** Con el archivo de tarifas, el día de la semana no mueve la tarifa (diferencia entre días menor de 1 %, frente a una variación normal de cerca de 10 % dentro de la lane; ANOVA p = 0,98) y el número de cargas casi tampoco (correlación mediana dentro de la lane entre 0,03 y 0,06; los días sin cargas tienen una tarifa 0,7 % menor). Por eso remuestrear sin condicionar es razonable. Hay dos límites. Primero, la tendencia: frente al promedio de enero a marzo, la tarifa media es -2,6 % en enero, +0,9 % en febrero, +2,6 % en marzo y +6,3 % en abril. Remuestrear sobre todos los días mezcla esos niveles, así que el simulador reproduce el nivel promedio del periodo. Segundo, la persistencia: la tarifa de una lane se parece a la del día anterior (autocorrelación mediana 0,61), mientras el remuestreo sortea cada día por separado. Ambas se declaran como limitaciones y no se corrigen.
+**Evidencia y límites.** Con el archivo de tarifas, el día de la semana no mueve la tarifa (diferencia entre días menor de 1 %, frente a una variación normal de cerca de 10 % dentro de la lane; ANOVA p = 0,98) y el número de cargas casi tampoco (correlación mediana dentro de la lane entre 0,03 y 0,06; los días sin cargas tienen una tarifa 0,7 % menor). Por eso remuestrear sin condicionar es razonable. Hay dos límites. Primero, la tendencia: frente al promedio de enero a marzo, la tarifa media es -2,6 % en enero, +0,9 % en febrero, +2,6 % en marzo y +6,3 % en abril. Remuestrear sobre los días de ajuste (enero a marzo) mezcla esos niveles, así que el simulador reproduce el nivel promedio de ese periodo; abril queda fuera del ajuste, de modo que el replay encuentra tarifas en promedio más altas que el simulador, lo que afecta a todos los métodos y debe tenerse en cuenta al comparar niveles de margen entre simulador y replay. Segundo, la persistencia: la tarifa de una lane se parece a la del día anterior (autocorrelación mediana 0,61), mientras el remuestreo sortea cada día por separado. Ambas se declaran como limitaciones y no se corrigen.
 
 ### Prueba de implementación
 
@@ -209,27 +209,27 @@ Los conteos y las tarifas se sortean cada vez que el agente llega a un nodo. El 
 - En entrenamiento, sortear en cada llegada con `sample_arrivals`. El día de inicio de cada episodio solo aporta el día de la semana.
 - En evaluación, generar M mundos completos con `sample_world` y semillas fijas, y usar los mismos mundos para el DRL y todos los baselines.
 - Usar semillas distintas en entrenamiento y en evaluación, y fijar la semilla de cada episodio para poder reproducir los resultados.
-- Mantener también la evaluación por replay de los días reales. Como los parámetros se estiman con todos los días, no es una prueba independiente del simulador: se reporta como referencia descriptiva.
+- Mantener también la evaluación por replay de los días reales 90-119. Como los parámetros se estiman solo con los días 0-89, es una prueba fuera de muestra del simulador y de la política, con las salvedades de régimen de abril descritas en la fase 1 (es una sola ventana de 30 días).
 
-**Alcance actual.** Los puntos de evaluación de esta fase se implementan con el Paso 6, que está aplazado. Por ahora solo se implementa la parte de entrenamiento y `sample_world`, para que los baselines puedan usarlo después sin cambios.
+**Alcance actual.** Los puntos de evaluación de esta fase están implementados con el Paso 6 (`evaluation.py`, `stats_analysis.py`, `excel_report.py`).
 
 **Entregable:** la configuración de semillas, el valor de M y la prueba de reproducibilidad de la Fase 4.
 
 ## Fase 6. Validación del simulador
 
-Como los parámetros se estiman con todos los días, la validación es dentro de muestra: se simulan 1.000 réplicas del periodo completo y se comparan con el histórico en tres comparaciones, de las cuales la de política queda aplazada hasta reformular los baselines:
+Como los parámetros se estiman con los días de ajuste (0-89), esta validación es dentro de muestra: se simulan 1.000 réplicas del periodo de ajuste y se comparan con ese histórico en tres comparaciones. La de política se hace en el arnés de evaluación (no en `validate_market_process.py`) y es la prueba fuera de muestra:
 
 | Comparación | Qué se compara | Cómo se lee |
 | --- | --- | --- |
 | Cargas por lane | Media diaria y proporción de días en cero de cada lane, agrupadas por grupo de volumen h | El valor real cae dentro del intervalo del 90 % de las réplicas simuladas |
-| Tarifas | Cuantiles 10, 50 y 90 de la tarifa por milla por grupo de distancia (cuartiles), con QQ-plot | Los cuantiles reales caen dentro del intervalo del 90 % simulado en el periodo completo. Se reporta también la tarifa media real y la simulada por mes, que muestra la tendencia |
-| Política (aplazada) | Rentabilidad por ruta de la política entrenada, en mundos simulados y en el replay de los días reales | Se reporta la diferencia; si la política rinde parecido en ambos, el simulador es suficiente para evaluarla |
+| Tarifas | Cuantiles 10, 50 y 90 de la tarifa por milla por grupo de distancia (cuartiles), con QQ-plot | Los cuantiles reales caen dentro del intervalo del 90 % simulado en el periodo de ajuste. Se reporta también la tarifa media real y la simulada por mes, que muestra la tendencia |
+| Política (en `evaluation.py`) | Rentabilidad por ruta de la política entrenada, en mundos simulados y en el replay fuera de muestra de los días 90-119 | Se reporta la diferencia; si la política rinde parecido en ambos, el simulador es suficiente para evaluarla |
 
 **Entregable:** un script que produce la tabla resumen y los gráficos de las tres comparaciones.
 
 ## Instrucciones para Claude Code
 
-Este bloque está escrito para Claude Code, en el repositorio AM-PPO. Implementa las fases 1 a 6 de este documento en el orden indicado, excepto lo marcado como **aplazado** (Paso 6 y la comparación de política de la fase 6), que no debes implementar todavía.
+Este bloque está escrito para Claude Code, en el repositorio AM-PPO. Implementa las fases 1 a 6 de este documento en el orden indicado, (el Paso 6 y la comparación de política de la fase 6 ya están implementados; el texto de esos pasos queda como referencia histórica).
 
 ### Antes de empezar
 
@@ -246,15 +246,15 @@ Lee `routing_env.py` (RoutingEnv y VectorRoutingEnv), `problem_data.py` (`load_m
 ### Pasos
 
 1. **Configuración (`config.py`).** Agrega `FECHA_INICIO` (2026-01-01), `DIAS_EXCLUIDOS` (lista de fechas, vacía por defecto), el tope `phi_max = 1000`, la ruta de `datos/market_params.npz` y el número M de mundos de evaluación. No escribas índices de día a mano: el número de días sale de la forma de `loads_stack` y `rate_stack`, de modo que al actualizar el archivo el ajuste incluya los días nuevos.
-2. **Estimación (`fit_market_process.py`, fases 1 a 3).** Con `loads_stack` y `rate_stack` de los 194 nodos y todos los días (menos `DIAS_EXCLUIDOS`, vacía por defecto), estima s_d, mu_ij y phi_h como describe la fase 2, y reúne las tarifas históricas de cada lane como describe la fase 3. Guarda todo en `datos/market_params.npz`, indexable por [origen, destino]. Imprime s_d y phi_h.
+2. **Estimación (`fit_market_process.py`, fases 1 a 3).** Con `loads_stack` y `rate_stack` de los 194 nodos y los primeros `TRAIN_DAYS` días (menos `DIAS_EXCLUIDOS`, vacía por defecto), estima s_d, mu_ij y phi_h como describe la fase 2, y reúne las tarifas históricas de cada lane como describe la fase 3. Guarda todo en `datos/market_params.npz`, indexable por [origen, destino]. Imprime s_d y phi_h.
 3. **Muestreo (`market_process.py`, fase 4).** Crea la clase `MarketProcess`. Carga `market_params.npz` y recorta a `num_nodes`, igual que `load_matrices`. Implementa `sample_arrivals(nodos, días, rng)`, que devuelve `loads` (B, N) y `rates` (B, N) sin ciclos sobre B, y `sample_world(semilla, num_días, día_inicial)`, que devuelve `loads_sim` y `rate_sim` con forma [D, N, N] y es determinista dada la semilla. El día de la semana sale de `FECHA_INICIO` más el índice del día (para el archivo actual equivale a `dow = (día + 3) % 7`). `rate` se sortea en todas las lanes y el entorno la usa solo donde `loads` es mayor que cero.
 4. **Entorno (`routing_env.py`).** En RoutingEnv y VectorRoutingEnv agrega el parámetro opcional `market_process`, con valor por defecto `None`. Si se pasa, al hacer reset y al llegar a cada nodo obtén `loads_row` y `rate_row` con el proceso en lugar de `draw_lane_availability`. La máscara usa `loads_row` mayor que 0 con las mismas reglas de hoy, incluida la excepción del nodo de inicio. La recompensa del paso desde el nodo actual usa las filas sorteadas al llegar a ese nodo, con la fórmula compartida: ingreso igual a tarifa por distancia solo si hay carga, menos costo, redondeado. En este modo no uses `rm_pen_stack`. Con `market_process=None` los resultados deben ser idénticos a los actuales.
 
 ### Pasos de integración y pruebas
 
 - **Paso 5. Entrenamiento (`main.py`, `am_training.py`).** Al iniciar, si `datos/market_params.npz` no existe, corre el ajuste. Crea el `MarketProcess` con `num_nodes` y pásaselo a los entornos de entrenamiento. El día de inicio de cada episodio se muestrea como hoy, pero solo aporta el día de la semana. Agrega un interruptor `USE_MARKET_PROCESS` en `main.py`. No cambies nada más del loop de PPO.
-- **Paso 6. Evaluación (`evaluation.py`, `Solvers.py`, `stats_analysis.py`). APLAZADO: no lo implementes ahora.** Se hará cuando se reformulen los baselines, y no debes tocar esos tres archivos. Queda descrito para referencia. Agrega un modo de escenarios: genera M mundos con `sample_world` y semillas fijas, y evalúa el DRL y todos los solvers sobre los mismos mundos, pasando `loads_sim` y `rate_sim` donde hoy van `loads_stack` y `rate_stack`. Mantén la evaluación por replay con la partición `TRAIN_DAYS` actual, e indica en el reporte que no es independiente del simulador. Reporta los dos resultados por separado y haz que `stats_analysis.py` compare de forma pareada por escenario.
-- **Paso 7. Validación (`validate_market_process.py`, fase 6).** Simula 1.000 réplicas del periodo completo con los parámetros estimados y produce la tabla y los gráficos de las tres comparaciones. La comparación de política (tercera fila de la tabla de la fase 6) queda aplazada hasta que exista el modo de escenarios del Paso 6: por ahora el script produce solo las comparaciones de cargas por lane y de tarifas.
+- **Paso 6. Evaluación (`evaluation.py`, `Solvers.py`, `stats_analysis.py`). IMPLEMENTADO** con la reformulación de baselines; el texto queda como referencia histórica. Agrega un modo de escenarios: genera M mundos con `sample_world` y semillas fijas, y evalúa el DRL y todos los solvers sobre los mismos mundos, pasando `loads_sim` y `rate_sim` donde hoy van `loads_stack` y `rate_stack`. Mantén la evaluación por replay con la partición `TRAIN_DAYS` actual, y etiquétala en el reporte como "replay, fuera de muestra (días 90-119)". Reporta los dos resultados por separado y haz que `stats_analysis.py` compare de forma pareada por escenario.
+- **Paso 7. Validación (`validate_market_process.py`, fase 6).** Simula 1.000 réplicas del periodo de ajuste con los parámetros estimados y produce la tabla y los gráficos de cargas por lane y de tarifas. La comparación de política (tercera fila de la tabla de la fase 6) se hace en `evaluation.py`, no en este script.
 - **Paso 8. Pruebas (carpeta `tests/`).** Misma semilla y mismos parámetros dan la misma salida. La salida no cambia con las acciones del agente. Formas y tipos son los esperados, y rate es positiva en todas las lanes. Con `market_process=None`, una ruta fija da las mismas recompensas que antes. La función compartida de recompensa, aplicada a una fila real, coincide con `rm_pen_stack`. La media y la proporción de ceros simuladas se parecen a las del histórico en cada grupo h. Otra prueba verifica que, con `DIAS_EXCLUIDOS` vacía, el ajuste usa todos los días de la matriz.
 - **Paso 9. Documentación.** Actualiza `README.md` con los archivos nuevos y el flujo de trabajo.
 
@@ -262,7 +262,7 @@ Lee `routing_env.py` (RoutingEnv y VectorRoutingEnv), `problem_data.py` (`load_m
 
 - Todas las pruebas pasan.
 - Con `USE_MARKET_PROCESS = False`, `main.py` reproduce los resultados actuales.
-- Con `USE_MARKET_PROCESS = True`, entrena sin errores al menos con 10 y con 35 nodos (la evaluación queda aplazada).
+- Con `USE_MARKET_PROCESS = True`, entrena sin errores al menos con 10 y con 35 nodos (la evaluación se implementó después, en el Paso 6).
 - Reporta el tiempo por paso de VectorRoutingEnv antes y después, para confirmar que el muestreo no es el cuello de botella.
 - `validate_market_process.py` corre completo y genera las comparaciones de cargas por lane y de tarifas.
 

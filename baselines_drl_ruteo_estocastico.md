@@ -9,7 +9,7 @@ Compararía el DRL contra dos cotas superiores y tres políticas, todas evaluada
 | UB-PI | Ruta óptima con el mundo completo conocido | Relajación de información | Sí | Techo laxo; mide el valor de la información perfecta |
 | UB-DP | DP en (nodo, hora, K) permitiendo revisitar | Relajación de restricción | No | Techo ajustado; gap de optimalidad |
 | B1 | Greedy miope | PFA | No | Benchmark miope estándar |
-| B2 | Reoptimización determinista con valores esperados (solo K = 5) | CFA / lookahead determinista | No | Lo que haría un planificador con pronóstico puntual |
+| B2 | Reoptimización determinista con valores esperados (K = 5 y libre) | CFA / lookahead determinista | No | Lo que haría un planificador con pronóstico puntual |
 | B3 | Política de la DP relajada | VFA (tabla) | No | ADP clásica; el rival más fuerte esperado |
 
 B1, B2 y B3 son no anticipativas: deciden con lo que ve el camión en el nodo actual y con los parámetros del proceso, nunca con la realización del mundo. Las dos cotas no son políticas implementables y se reportan como techos.
@@ -75,7 +75,7 @@ En cada nodo, resuelve de forma exacta la mejor ruta restante reemplazando el fu
 \mathbb{E}[r_{jl}] \;=\; P(N_{jl} \ge 1)\,\bar{q}_{jl}\,\text{dist}_{jl} \;-\; c_{jl}, \qquad P(N_{jl} \ge 1) = 1 - \Big(\frac{\phi}{\phi + m_{jl}}\Big)^{\phi}
 ```
 
-con m = mu_jl × s_d y q la tarifa media histórica de la lane. El arco actual usa la fila real observada. Con K = 5 la búsqueda exacta es pequeña y reutiliza tu label-setting; en el caso libre las rutas son más largas y reoptimizar en cada paso se vuelve caro, así que B2 se evalúa solo con K = 5. Es el horizonte rodante que la literatura de ruteo dinámico llama miope en información: replanifica con un pronóstico puntual e ignora la varianza. Su debilidad conocida es planear a través de nodos que en promedio lucen bien pero a menudo están vacíos, y el DRL debería ganarle justo ahí.
+con m = mu_jl × s_d y q la tarifa media histórica de la lane. El arco actual usa la fila real observada. Con K = 5 la búsqueda exacta es pequeña y reutiliza tu label-setting. En el caso libre las rutas son más largas, pero la enumeración sigue siendo viable hasta unos 35-50 nodos (primera decisión desde casa, medida: menos de 40 ms hasta 35 nodos, 0,1 a 1,2 s a 50, más de 40 s a 75 y 100), así que B2 se evalúa con K = 5 y con K libre; a partir de ~75 nodos la versión exacta deja de ser práctica y ese es un resultado por sí mismo. Es el horizonte rodante que la literatura de ruteo dinámico llama miope en información: replanifica con un pronóstico puntual e ignora la varianza. Su debilidad conocida es planear a través de nodos que en promedio lucen bien pero a menudo están vacíos, y el DRL debería ganarle justo ahí.
 
 ### B3. Política de la DP relajada (VFA de tabla)
 
@@ -101,7 +101,7 @@ La comparación es pareada por mundo: todas las políticas corren sobre el mismo
 2. **Tamaño de M.** Hoy `MARKET_M_EVAL_WORLDS = 100`. Corre con ese valor, mide la desviación estándar de las diferencias pareadas DRL menos baseline y sube M solo si la semiamplitud del intervalo del 95 % es mayor que la mitad de la diferencia que quieres detectar.
 3. **Arnés único.** Evalúa todas las políticas paso a paso en `RoutingEnv(market_process=...)` con `reset(options={"start_node": s, "start_day_idx": d, "k_max": K, "world_seed": w})`. En cada nodo la política lee solo la máscara, `current_loads_row` y `current_rate_row`. El mismo `world_seed` da números aleatorios comunes y la no anticipatividad queda garantizada por construcción. `sample_world` se usa solo para UB-PI, y los sorteos de UB-DP usan `sample_arrivals` con un Generator propio.
 4. **Semillas de entrenamiento.** Entrena el DRL con 3 semillas en el tamaño principal de la tesis y reporta la dispersión entre ellas; los demás tamaños pueden ir con una. Henderson et al. (2018) mostraron que una sola semilla puede invertir conclusiones en DRL.
-5. **Replay real.** Mantén los días 90 a 119 como evaluación descriptiva, con la advertencia de que el proceso se ajustó con los 120 días y no es independiente del simulador. La curva de `_evaluate_greedy` que imprime el entrenamiento también es replay, así que no se reporta como resultado.
+5. **Replay real.** Mantén los días 90 a 119 como evaluación fuera de muestra: ni el entrenamiento ni el ajuste del proceso usan esos días (`dias_usados` = 0-89). Es una sola ventana de 30 días y abril, con sus tarifas más altas y su caída de volumen del 1 al 6, no se parece al periodo de ajuste. La curva de `_evaluate_greedy` que imprime el entrenamiento también es replay, así que no se reporta como resultado.
 
 ### Métricas por mundo
 
@@ -161,7 +161,7 @@ Este bloque está escrito para Claude Code, en el repositorio AM-PPO. Implementa
     - Calcula una tabla para K = 5 y otra para el caso libre (sin la dimensión k). Guárdalas en disco y recárgalas si ya existen.
     - Expón `ub_dp(nodo_inicio, dia_semana, K)` y la política B3: entre las acciones válidas de la máscara del entorno, elige el argmax de r_ij + V(j, t + τ_ij, k − 1); para el retorno a casa usa solo r_ij.
 4. **B1 (greedy).** Entre las acciones válidas, elige el arco con mayor `lane_reward` según la fila observada. Desempata por el índice menor.
-5. **B2 (reoptimización con valores esperados), solo K = 5.** En cada nodo:
+5. **B2 (reoptimización con valores esperados), K = 5 y libre.** En cada nodo:
     - El arco actual usa la recompensa real de la fila observada.
     - Los arcos futuros usan la recompensa esperada de la sección B2, con P(N ≥ 1) de la binomial negativa con el s_d del día de llegada estimado y la tarifa media histórica de la lane.
     - Resuelve de forma exacta la mejor ruta restante (sin revisitar, retorno dentro de `MAX_DURATION`, respetando k) y ejecuta solo el primer arco. Reutiliza la lógica de búsqueda de `solve_label_setting_oracle` si se adapta sin cambiarla.
@@ -169,10 +169,10 @@ Este bloque está escrito para Claude Code, en el repositorio AM-PPO. Implementa
 7. **Arnés de evaluación (`evaluation.py`).** Reemplaza `run_solver_comparison` y `run_solver_comparison_by_k`.
     - Para cada K en {5, libre}, genera M mundos con semillas derivadas de `MARKET_SEED_EVAL`.
     - Asigna a cada mundo un nodo de inicio y un día de la semana de forma balanceada: cada nodo aparece ⌊M/N⌋ o ⌈M/N⌉ veces y cada día de la semana ⌊M/7⌋ o ⌈M/7⌉ veces, sin que el día quede atado al nodo. Usa como `start_day_idx` un día del histórico con ese día de la semana.
-    - En cada mundo corre DRL, B1, B3 y, si K = 5, B2, todos con el mismo `world_seed`. Agrega UB-PI y el valor UB-DP de su (nodo, día, K).
+    - En cada mundo corre DRL, B1, B2 y B3, todos con el mismo `world_seed`. Agrega UB-PI y el valor UB-DP de su (nodo, día, K).
     - Por mundo y método guarda: margen en USD, si hubo violación de tiempo, fracción de millas cargadas, número de cargas, duración y tiempo medio por decisión.
     - Mide los tiempos en CPU con un solo hilo, también para el DRL.
-8. **Replay.** Corre el mismo arnés con `market_process=None` sobre los días 90 a 119, con DRL, B1, B2, B3 y UB-PI resuelto sobre el histórico. Repórtalo aparte con la etiqueta "replay, no independiente del simulador".
+8. **Replay.** Corre el mismo arnés con `market_process=None` sobre los días 90 a 119, con DRL, B1, B2, B3 y UB-PI resuelto sobre el histórico. Repórtalo aparte con la etiqueta "replay, fuera de muestra (días 90-119)".
 9. **Estadística (`stats_analysis.py`).** Reemplaza los métodos por DRL, B1, B2 y B3. Para cada comparación DRL contra baseline: diferencia media pareada con intervalo del 95 % por bootstrap sobre mundos (10.000 remuestreos, semilla fija) y Wilcoxon pareado de una cola con corrección de Holm por las tres comparaciones. B2 solo sobre los mundos con K = 5. Agrega el gap de cada método contra UB-DP y contra UB-PI.
 10. **Reporte y `main.py`.** Actualiza `excel_report.py` y el resumen de `main.py` a las columnas nuevas. `main.py` corre la evaluación en mundos simulados y el replay. Quita `N_DAYS_PER_NODE` y todo lo que dependía de los solvers borrados.
 11. **Pruebas (`tests/`).**

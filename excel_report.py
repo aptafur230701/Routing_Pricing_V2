@@ -4,7 +4,7 @@ excel_report.py
 Libro de Excel con los resultados de la evaluación (baselines_drl_ruteo_estocastico.md):
   · Resumen            — por (K, método): margen medio, gaps contra UB-DP y UB-PI,
                          factibilidad y métricas operativas; mundos simulados y replay
-                         (etiquetado "replay, no independiente del simulador"); tiempos
+                         (días reales 90-119, fuera de muestra; etiquetado "replay, fuera de muestra (días 90-119)"); tiempos
                          fuera de línea.
   · Mundos simulados   — una fila por (K, mundo, método)
   · Replay             — ídem sobre los días reales de evaluación

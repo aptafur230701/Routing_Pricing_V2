@@ -33,7 +33,8 @@ import torch
 warnings.filterwarnings("ignore")
 
 from config import (
-    SEED, DEVICE, RUN_TAG,
+    SEED, DEVICE, RUN_TAG, K_TRAINING_LEVELS, configurar_k, MARKET_SEED_EVAL, MARKET_SEED_EVAL_FINAL,
+    HP_OVERRIDES, configurar_hp,
     get_episodes_per_node, TRAIN_DAYS,
     AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF,
 )
@@ -128,18 +129,37 @@ def _load_agent(checkpoint_dir: str, num_nodes: int, best: bool = False) -> tupl
     return agent, critic
 
 
+def _tiempo_entrenamiento_previo(output_dir: str) -> float:
+    """Tiempo de entrenamiento del DRL que ya trae el Excel de resultados (0.0 si no hay).
+
+    Con EVAL_ONLY no se entrena; sin esto el Excel regrabado perdería el tiempo de la corrida
+    que produjo el checkpoint."""
+    import openpyxl
+    path = os.path.join(output_dir, "DRL_Routing_Summary_AM.xlsx")
+    if not os.path.exists(path):
+        return 0.0
+    try:
+        for fila in openpyxl.load_workbook(path, read_only=True, data_only=True)["Resumen"].iter_rows(values_only=True):
+            if fila and fila[0] == "Entrenamiento del DRL (s)" and isinstance(fila[1], (int, float)):
+                return float(fila[1])
+    except Exception:
+        pass
+    return 0.0
+
+
 def _evaluate_and_report(
     agent, NUM_NODES, time_matrix, rate_stack, loads_stack,
     distance_arr, diesel_arr, ep_rewards, ep_losses,
     train_time, summary_rows, cwd, label,
     ltr_stack=None, trucks_stack=None,
     avail_expected_arr=None, reward_global_p95=1.0, market_process=None,
+    semilla_eval=MARKET_SEED_EVAL, sufijo_cache="",
 ):
     """Evaluación en mundos simulados y replay + resumen + guardado de archivos.
 
-    Mundos simulados: DRL, B1, B2 (K finito) y B3 sobre M mundos por nivel de K, con UB-PI y
+    Mundos simulados: DRL, B1, B2 y B3 sobre M mundos por nivel de K, con UB-PI y
     UB-DP. Replay: el mismo arnés sobre los días reales de evaluación (TRAIN_DAYS en adelante),
-    descriptivo y no independiente del simulador.
+    fuera de muestra: ni el entrenamiento ni el ajuste del proceso exógeno usaron esos días.
     """
     tabla = cargar_o_calcular_tabla(market_process, time_matrix, distance_arr, diesel_arr)
     # B1, B2, B3, UB-PI y UB-DP no dependen del DRL: se calculan una vez por nº de nodos y se reusan
@@ -151,13 +171,16 @@ def _evaluate_and_report(
         agent, market_process, tabla, time_matrix,
         rate_stack[:TRAIN_DAYS], loads_stack[:TRAIN_DAYS], distance_arr, diesel_arr, NUM_NODES,
         ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95,
-        cache_path=os.path.join(cache_dir, f"baselines_simulado_{NUM_NODES}nodos.pkl"),
+        k_levels=tuple(K_TRAINING_LEVELS),
+        cache_path=os.path.join(cache_dir, f"baselines_simulado_{NUM_NODES}nodos{sufijo_cache}.pkl"),
+        semilla_eval=semilla_eval,
     )
     print("\n--- Replay de los días reales de evaluación ---")
     replay_df = evaluar_replay(
         agent, market_process, tabla, time_matrix,
         rate_stack[TRAIN_DAYS:], loads_stack[TRAIN_DAYS:], distance_arr, diesel_arr, NUM_NODES,
         ltr_stack[:, TRAIN_DAYS:], trucks_stack[:, TRAIN_DAYS:], avail_expected_arr, reward_global_p95,
+        k_levels=tuple(K_TRAINING_LEVELS),
         cache_path=os.path.join(cache_dir, f"baselines_replay_{NUM_NODES}nodos.pkl"),
     )
 
@@ -191,28 +214,43 @@ def _evaluate_and_report(
 
 
 def main():
-    NUM_NODES       = 35     # opciones: 10 · 20 · 35 · 50 · 75 · 100
-    EVAL_ONLY       = False   # True: carga checkpoint y salta entrenamiento
+    NUM_NODES       = int(os.environ.get("NUM_NODES", 35))   # opciones: 10 · 20 · 35 · 50 · 75 · 100
+    EVAL_ONLY       = os.environ.get("EVAL_ONLY", "0") == "1"   # True: carga checkpoint y salta entrenamiento
+                                                                 # (NUM_NODES y EVAL_ONLY se pueden fijar por variable de entorno)
     USE_TRANSFER    = True   # True: warm-start desde el checkpoint del tamaño anterior en
                               # NODE_SEQUENCE (requiere mismo AM_D_H/AM_N_LAYERS que la fuente).
                               # False: entrena desde pesos aleatorios con la arquitectura de config.py.
-    EVAL_BEST_CHECKPOINT = True  # True: evalúa el update con mejor margen en los mundos de validación
-                                 # (checkpoints/am_checkpoint_<N>nodes_best.pt, solo si se entrenó con el
-                                 # proceso exógeno); False: evalúa el último update. El checkpoint
-                                 # am_checkpoint_<N>nodes.pt (último) se guarda siempre, y es el que usa
-                                 # el transfer learning.
+    EVAL_BEST_CHECKPOINT = False  # False (por defecto): evalúa el último update, el modelo que dejó el
+                                 # entrenamiento ya con el LR decaído. True: evalúa el update con mejor
+                                 # margen en los mundos de validación (checkpoints/am_checkpoint_<N>nodes_best.pt,
+                                 # solo si se entrenó con el proceso exógeno). Se dejó en False porque elegir
+                                 # el máximo entre ~80 validaciones de 200 mundos sobreajusta esa validación:
+                                 # en 10, 20 y 35 nodos el último update rindió igual o mejor en los mundos
+                                 # de test (8-32 USD). El checkpoint am_checkpoint_<N>nodes.pt (último) se
+                                 # guarda siempre, y es el que usa el transfer learning.
     USE_MARKET_PROCESS = True  # True: el entrenamiento sortea cargas y tarifas del proceso exógeno
                                 # (proceso_exogeno_cargas_tarifas.md) en vez de reproducir días del
                                 # histórico. False: entrena con días reales. La evaluación siempre
                                 # usa el proceso (mundos simulados) y además el replay de los días
                                 # de eval. Si datos/market_params.npz no existe, corre el ajuste.
+    EVAL_SET = os.environ.get("EVAL_SET", "dev")   # "dev": mundos de MARKET_SEED_EVAL (desarrollo, resultados de siempre).
+                                                    # "final": mundos de MARKET_SEED_EVAL_FINAL (test final, un solo uso con
+                                                    # la configuración congelada); escribe DRL_Routing_Summary_AM_final.xlsx.
+    K_RESTRINGIDO = False      # True: entrena, valida y evalúa con K libre y K = K_MAX (5).
+                                # False: solo K libre (sin presupuesto de cardinalidad). Sirve para
+                                # pulir el método contra los baselines antes de añadir la restricción.
     # ──────────────────────────────────────────────────────────────────────────
 
-    cwd          = os.path.dirname(os.path.abspath(__file__))
+    configurar_k(K_RESTRINGIDO)    # antes de entrenar/evaluar: fija K_TRAINING_LEVELS en el sitio
+    configurar_hp(NUM_NODES)       # hiperparámetros del tamaño (config.HP_POR_NODOS)
+
+    cwd         = os.path.dirname(os.path.abspath(__file__))
     summary_rows = []
 
     print(f"\n{'='*60}")
     print(f"  AM — {NUM_NODES} nodes")
+    print(f"  Niveles de K: {['libre' if k is None else k for k in K_TRAINING_LEVELS]}")
+    print(f"  Hiperparámetros propios de este tamaño: {dict(HP_OVERRIDES) or 'ninguno (los de config.py)'}")
     print(f"{'='*60}")
 
     set_seeds(SEED)
@@ -243,7 +281,7 @@ def main():
     if EVAL_ONLY:
         usar_best = EVAL_BEST_CHECKPOINT and os.path.exists(_checkpoint_path(checkpoint_dir, NUM_NODES, True))
         agent_am, critic  = _load_agent(checkpoint_dir, NUM_NODES, best=usar_best)
-        ep_r, ep_l, t, training_log = [], [], 0.0, []
+        ep_r, ep_l, t, training_log = [], [], _tiempo_entrenamiento_previo(output_dir), []
     else:
         agent_pretrained, critic_pretrained = build_agent_for_training(
             checkpoint_dir, NUM_NODES, use_transfer=USE_TRANSFER,
@@ -282,11 +320,13 @@ def main():
     _evaluate_and_report(
         agent_am, NUM_NODES, time_matrix, rate_stack, loads_stack,
         distance_arr, diesel_arr, ep_r, ep_l, t,
-        summary_rows, output_dir, label="AM",
+        summary_rows, output_dir, label="AM" if EVAL_SET == "dev" else "AM_final",
         ltr_stack=ltr_stack, trucks_stack=trucks_stack,
         avail_expected_arr=avail_expected_arr,
         reward_global_p95=reward_global_p95,
         market_process=market_process,
+        semilla_eval=MARKET_SEED_EVAL if EVAL_SET == "dev" else MARKET_SEED_EVAL_FINAL,
+        sufijo_cache="" if EVAL_SET == "dev" else "_final",
     )
 
     print(f"\nDone! Checkpoint guardado en: checkpoints/am_checkpoint_{NUM_NODES}nodes.pt")

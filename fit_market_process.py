@@ -14,7 +14,7 @@ proceso_exogeno_cargas_tarifas.md).
              · phi_h: dispersión por grupo de volumen (cuartiles de mu_ij), por
                       máxima verosimilitud conjunta; tope MARKET_PHI_MAX
   Fase 3 — tarifas: se guarda el histórico de tarifa por milla de cada lane
-           (todos los días, con o sin cargas) para remuestrearlo con reemplazo.
+           (todos los días de ajuste, con o sin cargas) para remuestrearlo con reemplazo.
 
 Uso
 ---
@@ -70,7 +70,7 @@ def cargar_matrices_completas(max_dias: int = None) -> tuple:
 def seleccionar_dias(num_dias: int, fecha_inicio: str, dias_excluidos) -> tuple:
     """Índices de los días de ajuste y su fecha (np.datetime64[D]).
 
-    Usa todos los días salvo los de `dias_excluidos`. Una fecha excluida fuera
+    Usa todos los días que recibe (main pasa los primeros TRAIN_DAYS) salvo los de `dias_excluidos`. Una fecha excluida fuera
     del rango del archivo es un error (probablemente una fecha mal escrita).
     """
     fechas = np.datetime64(fecha_inicio, "D") + np.arange(num_dias)

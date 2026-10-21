@@ -361,17 +361,32 @@ def _firma_cache(ctx, *partes) -> str:
     return h.hexdigest()
 
 
-def _filas_con_cache(cache_path, firma, calcular, verbose=True) -> pd.DataFrame:
+def _faltantes(df: pd.DataFrame, k_levels) -> set:
+    """Pares (K, método) de B1, B2, B3 que `df` no trae para los niveles de K pedidos."""
+    hay = set(zip(df["K"], df["metodo"]))
+    return {(K, nombre) for K in k_levels for nombre in _METODOS[1:] if (_etiqueta_k(K), nombre) not in hay}
+
+
+def _filas_con_cache(cache_path, firma, calcular, verbose=True, completar=None) -> pd.DataFrame:
     """Filas de B1, B2, B3 y cotas (no dependen del DRL): se calculan una vez y se reusan.
 
-    cache_path None ⇒ sin caché. Un caché con otra firma se recalcula y se sobrescribe."""
+    cache_path None ⇒ sin caché. Un caché con otra firma se recalcula y se sobrescribe.
+    completar : función df → df que añade lo que le falte al caché vigente (p. ej. B2 con K libre,
+        que un caché anterior no traía) sin recalcular las cotas ni los demás baselines."""
     if cache_path and os.path.exists(cache_path):
         with open(cache_path, "rb") as f:
             c = pickle.load(f)
         if c.get("firma") == firma:
+            df = c["df"]
+            if completar is not None:
+                df_nuevo = completar(df)
+                if len(df_nuevo) != len(df):
+                    with open(cache_path, "wb") as f:
+                        pickle.dump({"firma": firma, "df": df_nuevo}, f)
+                    df = df_nuevo
             if verbose:
                 print(f"  baselines y cotas: reutilizados de {cache_path}")
-            return c["df"]
+            return df
     df = calcular()
     if cache_path:
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
@@ -393,38 +408,45 @@ def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, load
                              distance_arr, diesel_arr, num_nodes, ltr_stack, trucks_stack,
                              avail_expected_arr, reward_global_p95,
                              M=MARKET_M_EVAL_WORLDS, k_levels=(K_MAX, None), verbose=True,
-                             cache_path=None) -> pd.DataFrame:
-    """DRL, B1, B2 (solo K finito) y B3 sobre los mismos M mundos simulados, por nivel de K.
+                             cache_path=None, semilla_eval=MARKET_SEED_EVAL) -> pd.DataFrame:
+    """DRL, B1, B2 y B3 sobre los mismos M mundos simulados, por nivel de K.
 
     Los mismos mundos (nodo, día, world_seed) se usan en todos los niveles de K. Devuelve un
     DataFrame largo: una fila por (K, mundo, método) con el margen en USD, la factibilidad,
     las métricas operativas y las cotas ub_dp / ub_pi del mundo.
 
+    semilla_eval : semilla del diseño de los M mundos (MARKET_SEED_EVAL = conjunto de desarrollo;
+        MARKET_SEED_EVAL_FINAL = conjunto B, test final). Usar un cache_path distinto por semilla.
     cache_path : B1, B2, B3, UB-PI y UB-DP no dependen del DRL, así que con una ruta se calculan una
         sola vez y se reusan entre corridas (mientras no cambie el proceso, la tabla V ni el diseño).
     """
     ctx = ContextoEval(agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
                        ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95)
     env = make_sim_env(time_matrix, rate_train, loads_train, distance_arr, diesel_arr, num_nodes, market)
-    dis = disenar_mundos(num_nodes, M, market, num_dias=rate_train.shape[0])
+    dis = disenar_mundos(num_nodes, M, market, num_dias=rate_train.shape[0], semilla=semilla_eval)
 
     def cotas(m, nodo, dow, K, mundo_pi):
         pi, _ = ub_pi(market, time_matrix, distance_arr, diesel_arr, num_nodes, nodo, K, mundo_pi)
         dp = tabla.ub_dp(nodo, dow, K) if (K is None or 2 <= K <= tabla.K) else float("nan")
         return dp, pi
 
-    def baselines():
+    def baselines(faltan=None, cota_previa=None):
+        """faltan None: todo (cotas y baselines). Con un conjunto de (K, método): solo esos
+        baselines, con las cotas ya calculadas (`cota_previa`)."""
         filas = []
         with _UnHilo():
             for m in range(M):
                 nodo, dow = int(dis["nodo"][m]), int(dis["dow"][m])
                 dia, ws = int(dis["start_day"][m]), int(dis["world_seed"][m])
-                mundo_pi = market.sample_world(ws, _DIAS_SIMULADOS_UB_PI, dia)    # solo para UB-PI
+                mundo_pi = market.sample_world(ws, _DIAS_SIMULADOS_UB_PI, dia) if faltan is None else None
                 for K in k_levels:
-                    dp, pi = cotas(m, nodo, dow, K, mundo_pi)
+                    if faltan is None:
+                        dp, pi = cotas(m, nodo, dow, K, mundo_pi)
+                    else:
+                        dp, pi = cota_previa.loc[(_etiqueta_k(K), m)]
                     for nombre in _METODOS[1:]:
-                        if nombre == "B2" and K is None:
-                            continue                                       # B2 solo con K finito
+                        if faltan is not None and (K, nombre) not in faltan:
+                            continue
                         res = ejecutar_politica(ctx.politicas[nombre], env, nodo, dia, K, ws,
                                                 distance_arr, diesel_arr, dow)
                         filas.append(_fila("simulado", K, m, nodo, dia, dia, ws, dow, nombre, res, dp, pi))
@@ -432,8 +454,16 @@ def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, load
                     print(f"  mundos simulados (baselines y cotas): {m + 1}/{M}", flush=True)
         return pd.DataFrame(filas)
 
-    firma = _firma_cache(ctx, "simulado", num_nodes, M, MARKET_SEED_EVAL, tuple(k_levels), rate_train.shape[0])
-    base = _filas_con_cache(cache_path, firma, baselines, verbose)
+    def completar(df):
+        faltan = _faltantes(df, k_levels)
+        if not faltan:
+            return df
+        print(f"  completando el caché con {sorted(faltan, key=str)}", flush=True)
+        extra = baselines(faltan, df.groupby(["K", "mundo"])[["ub_dp", "ub_pi"]].first())
+        return pd.concat([df, extra], ignore_index=True)
+
+    firma = _firma_cache(ctx, "simulado", num_nodes, M, semilla_eval, tuple(k_levels), rate_train.shape[0])
+    base = _filas_con_cache(cache_path, firma, baselines, verbose, completar)
     cota = base.groupby(["K", "mundo"])[["ub_dp", "ub_pi"]].first()
 
     filas = []
@@ -485,17 +515,20 @@ def evaluar_replay(agent, market, tabla, time_matrix, rate_eval, loads_eval,
                           day_offset=TRAIN_DAYS)
     nodos, dias = casos_replay(num_nodes, rate_eval.shape[0], max_casos)
 
-    def baselines():
+    def baselines(faltan=None, cota_previa=None):
         filas = []
         with _UnHilo():
             for c, (nodo, dia) in enumerate(zip(nodos, dias)):
                 nodo, dia = int(nodo), int(dia)
                 dow = int(market.dia_semana(TRAIN_DAYS + dia))
                 for K in k_levels:
-                    pi, _ = ub_pi(market, time_matrix, distance_arr, diesel_arr, num_nodes, nodo, K,
-                                  (loads_eval, rate_eval), start_day_idx=dia)
+                    if faltan is None:
+                        pi, _ = ub_pi(market, time_matrix, distance_arr, diesel_arr, num_nodes, nodo, K,
+                                      (loads_eval, rate_eval), start_day_idx=dia)
+                    else:
+                        pi = cota_previa.loc[(_etiqueta_k(K), c), "ub_pi"]
                     for nombre in _METODOS[1:]:
-                        if nombre == "B2" and K is None:
+                        if faltan is not None and (K, nombre) not in faltan:
                             continue
                         res = ejecutar_politica(ctx.politicas[nombre], env, nodo, dia, K, None,
                                                 distance_arr, diesel_arr, dow, loads_eval, rate_eval)
@@ -505,9 +538,17 @@ def evaluar_replay(agent, market, tabla, time_matrix, rate_eval, loads_eval,
                     print(f"  replay (baselines y cotas): {c + 1}/{len(nodos)}", flush=True)
         return pd.DataFrame(filas)
 
+    def completar(df):
+        faltan = _faltantes(df, k_levels)
+        if not faltan:
+            return df
+        print(f"  completando el caché con {sorted(faltan, key=str)}", flush=True)
+        extra = baselines(faltan, df.groupby(["K", "mundo"])[["ub_dp", "ub_pi"]].first())
+        return pd.concat([df, extra], ignore_index=True)
+
     firma = _firma_cache(ctx, "replay", num_nodes, max_casos, tuple(k_levels), rate_eval.shape[0],
                          loads_eval.shape, float(loads_eval.sum()), float(rate_eval.sum()))
-    base = _filas_con_cache(cache_path, firma, baselines, verbose)
+    base = _filas_con_cache(cache_path, firma, baselines, verbose, completar)
     cota = base.groupby(["K", "mundo"])[["ub_dp", "ub_pi"]].first()
 
     filas = []

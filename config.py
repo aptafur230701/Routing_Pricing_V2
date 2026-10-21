@@ -99,6 +99,20 @@ K_NORM = K_MAX  # normalizador GLOBAL de k_remaining_norm: va de 1.0 (presupuest
 K_LEVELS          = [K_MAX]              # un solo nivel restringido — la constraint real
 K_TRAINING_LEVELS = K_LEVELS + [None]    # + caso libre (None) — 2 niveles en total
 
+
+def configurar_k(restringido: bool) -> None:
+    """Fija los niveles de K del entrenamiento, la validación y la evaluación.
+
+    restringido=True : K_TRAINING_LEVELS = [K_MAX, None] (restringido + libre).
+    restringido=False: K_TRAINING_LEVELS = [None] (solo caso libre; K_LEVELS queda vacío).
+
+    Muta las listas en el sitio, así que los módulos que ya hicieron
+    `from config import K_TRAINING_LEVELS` ven el cambio. Llamar desde main() antes de
+    entrenar o evaluar. K_NORM no cambia (el modelo conserva la misma arquitectura/features).
+    """
+    K_LEVELS[:] = [K_MAX] if restringido else []
+    K_TRAINING_LEVELS[:] = K_LEVELS + [None]
+
 # ── Features de continuación por nodo ────────────────────────
 USE_CONTINUATION_FEATURES = True   # True: 4 features extra por nodo j (N_NODE_FEATURES = 12) con la
                                    # información de qué pasa después de j (tiempo y holgura de regreso a
@@ -122,13 +136,17 @@ SEED = int(os.environ.get("SEED", 42))   # torch/numpy del entrenamiento; variab
 # fechas salen de FECHA_INICIO + índice del día.
 FECHA_INICIO         = "2026-01-01"   # fecha del día 0 del histórico (jueves)
 DIAS_EXCLUIDOS       = []             # fechas ("AAAA-MM-DD") a dejar fuera del ajuste, solo si
-                                      # la fuente confirma que son erróneas. Vacía = usa todos los días.
+                                      # la fuente confirma que son erróneas. Vacía = usa todos los días de ajuste.
 MARKET_PHI_MAX       = 1000.0         # tope de la dispersión phi (phi → ∞ equivale a Poisson)
 MARKET_N_GRUPOS      = 4              # grupos de volumen h (cuartiles de mu_ij) para estimar phi_h
 MARKET_PARAMS_PATH   = "datos/market_params.npz"   # relativo a la raíz del proyecto
 MARKET_SEED_TRAIN    = int(os.environ.get("MARKET_SEED_TRAIN", 20260))   # semilla de los mundos de entrenamiento
                                                                           # (variable de entorno para variarla por corrida)
 MARKET_SEED_EVAL     = 777001  # semilla base de los mundos de evaluación (distinta de la de entrenamiento)
+MARKET_SEED_EVAL_FINAL = 777003  # semilla de un segundo conjunto de mundos de evaluación (conjunto B, test final):
+                                  # distinta de entrenamiento, validación y MARKET_SEED_EVAL. MARKET_SEED_EVAL es el
+                                  # conjunto de desarrollo (con él se decidieron cosas, p. ej. el checkpoint); el B se
+                                  # usa UNA vez, con la configuración congelada. main.py: EVAL_SET=final.
 MARKET_M_EVAL_WORLDS = 1000    # M: nº de mundos de evaluación simulados por nivel de K (eran 100). Con
                                 # MARKET_SEED_EVAL fija, todas las corridas y baselines ven los MISMOS mundos.
 
@@ -161,12 +179,36 @@ BOOTSTRAP_SEED  = 20261019
 # results/<N>nodes_abl_a y checkpoints/abl_a, para correr ablaciones sin pisar otras corridas.
 RUN_TAG = os.environ.get("RUN_TAG", "")
 
+# ── Hiperparámetros por tamaño de grafo ──────────────────────
+# Lo que se escriba aquí para un tamaño pisa el valor global de este archivo; {} = los de siempre.
+# Claves admitidas: PPO_LR, PPO_N_EPISODES_PER_UPDATE, PPO_ENTROPY_COEF_START, PPO_ENTROPY_COEF_END,
+# LR_FINAL_FRAC y EPISODES_PER_NODE (reemplaza a get_episodes_per_node).
+HP_POR_NODOS = {
+    10: {},
+    20: {"PPO_ENTROPY_COEF_START": 0.10, "PPO_ENTROPY_COEF_END": 0.04},   # más exploración al final
+    35: {"EPISODES_PER_NODE": 60000, "LR_FINAL_FRAC": 0.30},              # el doble de episodios, piso de LR más alto
+}
+HP_OVERRIDES = {}   # se llena en configurar_hp()
+
+
+def configurar_hp(num_nodes: int) -> None:
+    """Carga HP_POR_NODOS[num_nodes] en HP_OVERRIDES (en el sitio). Llamar desde main()."""
+    HP_OVERRIDES.clear()
+    HP_OVERRIDES.update(HP_POR_NODOS.get(num_nodes, {}))
+
+
+def hp(nombre: str, default):
+    """Valor de la variante activa para `nombre`, o `default` si la variante no lo cambia."""
+    return HP_OVERRIDES.get(nombre, default)
+
 # ── Device ───────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def get_episodes_per_node(num_nodes: int) -> int:
     """Episodes per start-node for the full training run."""
+    if "EPISODES_PER_NODE" in HP_OVERRIDES:      # hiperparámetros propios del tamaño (HP_POR_NODOS)
+        return HP_OVERRIDES["EPISODES_PER_NODE"]
     if num_nodes <= 10:  return 20000  # subido de 5000: a 5000 (71 updates) reward/entropy
                                         # no se aplanaban; 20000 da ~285 updates de margen
     if num_nodes <= 20:  return 25000

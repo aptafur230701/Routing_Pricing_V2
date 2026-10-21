@@ -80,7 +80,7 @@ class PoliticaB1:
 
 
 class PoliticaB2:
-    """B2, reoptimización determinista con valores esperados (CFA); se evalúa solo con K = 5.
+    """B2, reoptimización determinista con valores esperados (CFA); con K = 5 y con K libre.
 
     En cada nodo resuelve de forma exacta la mejor ruta restante y ejecuta solo el primer
     arco. El arco actual usa la recompensa real de la fila observada; los arcos futuros
@@ -92,6 +92,10 @@ class PoliticaB2:
     La búsqueda es una enumeración exacta de rutas sin revisitar, con retorno dentro de
     MAX_DURATION y respetando k (con los tiempos de viaje reales de los datos las rutas
     factibles son pocas, así que no hace falta podar por dominancia).
+
+    Con k_restante None (caso libre) no hay tope de cardinalidad y la profundidad solo la acota
+    MAX_DURATION. La enumeración sigue siendo exacta, pero su costo crece muy rápido con el
+    número de nodos (medido: < 40 ms por decisión hasta 35 nodos, ~1 s a 50, > 40 s desde 75).
     """
     nombre = "B2"
 
@@ -115,7 +119,7 @@ class PoliticaB2:
                 vis[a] = True
                 v = float(ra) + self._continuacion(
                     int(a), obs.tiempo + self._T[i, a], vis,
-                    obs.k_restante - 1, h, obs.dia_semana_salida,
+                    None if obs.k_restante is None else obs.k_restante - 1, h, obs.dia_semana_salida,
                 )
                 vis[a] = False
             if v > mejor:
@@ -123,17 +127,18 @@ class PoliticaB2:
         return mejor_a
 
     def _continuacion(self, j, t, vis, k_rest, h, dow0) -> float:
-        """Mejor valor esperado de seguir desde j (llegada en t, k_rest arcos restantes).
+        """Mejor valor esperado de seguir desde j (llegada en t, k_rest arcos restantes; None = libre).
 
         `vis` (N,) bool se modifica y se restaura durante la recursión.
         """
         ev = self._ev[(dow0 + int(t // _DIA_HORAS)) % 7]
         mejor = ev[j, h]                                                  # cerrar el ciclo desde j
-        if k_rest >= 2:
+        if k_rest is None or k_rest >= 2:
             cand = np.flatnonzero((self._T[j] + t + self._T[:, h] <= self._max) & ~vis)
             for l in cand:
                 vis[l] = True
-                v = ev[j, l] + self._continuacion(int(l), t + self._T[j, l], vis, k_rest - 1, h, dow0)
+                v = ev[j, l] + self._continuacion(int(l), t + self._T[j, l], vis,
+                                                  None if k_rest is None else k_rest - 1, h, dow0)
                 vis[l] = False
                 if v > mejor:
                     mejor = v
