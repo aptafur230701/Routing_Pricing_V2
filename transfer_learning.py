@@ -12,7 +12,7 @@ que dependan de num_nodes. El Transformer opera sobre conjuntos de
 embeddings de tamaño variable — lo que cambia entre tamaños es el
 número de nodos en runtime, no los pesos del modelo.
 
-  encoder.input_proj   : N_NODE_FEATURES (8, o 12 con USE_CONTINUATION_FEATURES) → d_h  (independiente de N)
+  encoder.input_proj   : N_NODE_FEATURES (7, o 11 con USE_CONTINUATION_FEATURES) → d_h  (independiente de N)
   encoder.layers[i]    : d_h → d_h        (independiente de N)
   context_net.proj     : 2·d_h+3+n_market+n_budget → d_h  (independiente de N)
   decoder.glimpse      : d_h → d_h        (independiente de N)
@@ -61,15 +61,22 @@ def _reconcile_state_dict(target_sd: dict, source_sd: dict) -> tuple:
       2. Caso especial de expansión de entrada: mismo out_features y
          in_features del checkpoint < in_features del destino (ej.
          context_net.proj.0.weight al añadir el bloque de budget features, o
-         encoder.input_proj.proj.weight al pasar de 8 a 12 features de nodo con
-         USE_CONTINUATION_FEATURES: copia las 8 columnas viejas y deja las 4 nuevas en cero) →
+         encoder.input_proj.proj.weight al pasar de 7 a 11 features de nodo con
+         USE_CONTINUATION_FEATURES: copia las 7 columnas viejas y deja las 4 nuevas en cero) →
          se conserva el tensor destino (ya inicializado) pero se ponen TODAS
          sus columnas en cero y se copian las columnas viejas en las primeras
          posiciones. Con las columnas nuevas en cero, la contribución de las
          features añadidas es nula hasta que el fine-tuning las active, así
          que el forward pass es idéntico al del checkpoint original.
-      3. Cualquier otro mismatch de forma o clave ausente → se omite (el
-         tensor destino queda con su inicialización aleatoria).
+      3. Clave del checkpoint ausente en el destino → se omite (skipped).
+      4. Clave presente en ambos con una forma incompatible que no es una
+         expansión válida (p. ej. input_proj de un checkpoint con más
+         features de nodo que el modelo actual, o una capa con otra
+         dimensión) → ValueError: el checkpoint no corresponde a la
+         arquitectura actual y omitir la capa en silencio dejaría el
+         modelo con esa capa aleatoria sin aviso.
+      Las claves del destino que el checkpoint no trae conservan su
+      inicialización.
 
     Retorna (merged_sd, transferred: list[str], skipped: list[str]).
     """
@@ -97,7 +104,12 @@ def _reconcile_state_dict(target_sd: dict, source_sd: dict) -> tuple:
             merged[k] = new_w
             transferred.append(f"{k} (expandido, columnas nuevas en cero)")
         else:
-            skipped.append(k)
+            raise ValueError(
+                f"Checkpoint incompatible con la arquitectura actual: '{k}' tiene forma "
+                f"{tuple(v.shape)} en el checkpoint y {tuple(target_shape)} en el modelo "
+                f"(no es una expansión de columnas de entrada). Reentrena desde cero o "
+                f"usa un checkpoint de esta arquitectura."
+            )
 
     return merged, transferred, skipped
 

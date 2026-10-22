@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 from config import MAX_DURATION, DEVICE
+from routing_env import max_pasos
 from attention_encoder import (
     build_node_features_batch,
     build_temporal_features_batch,
@@ -98,7 +99,7 @@ def greedy_rollout(
     agent.eval()
     try:
         with torch.no_grad():
-            for _ in range(num_nodes):   # techo defensivo: cada paso visita un nodo nuevo o cierra
+            for _ in range(max_pasos(time_matrix_arr, max_duration)):   # techo defensivo (ver max_pasos)
                 if not active.any():
                     break
 
@@ -106,7 +107,7 @@ def greedy_rollout(
                 day_idx   = env.current_day_idx
 
                 node_feats = build_node_features_batch(
-                    cur_nodes, start_nodes, env.visited_mask,
+                    cur_nodes, start_nodes,
                     None, time_matrix_arr, distance_arr,
                     day_idx, num_nodes, max_duration,
                     trucks_stack_raw=trucks_stack,

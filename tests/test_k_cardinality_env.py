@@ -16,7 +16,7 @@ import pytest
 
 from config import MAX_DURATION, K_LEVELS, K_TRAINING_LEVELS
 from problem_data import load_matrices, build_rm_pen_stack
-from routing_env import RoutingEnv, VectorRoutingEnv
+from routing_env import RoutingEnv, VectorRoutingEnv, max_pasos
 
 NUM_NODES = 10
 N_TRIALS_PER_LEVEL = 60   # episodios por nivel de K en el test escalar
@@ -66,7 +66,7 @@ def test_scalar_env_random_policy_respects_k(data):
 
             n_arcs = 0
             terminated = False
-            for _ in range(NUM_NODES + 2):   # techo defensivo
+            for _ in range(max_pasos(data["time_matrix"], MAX_DURATION)):   # techo defensivo
                 action = _random_valid_action(info["action_mask"], rng)
                 obs, reward, terminated, truncated, info = env.step(action)
                 n_arcs += 1
@@ -135,7 +135,7 @@ def test_vector_env_random_policy_respects_k(data):
     masks = vec_env.reset(start_nodes, start_days, k_max_arr=k_max_arr)
     active = np.ones(B, dtype=bool)
 
-    for _ in range(NUM_NODES + 2):
+    for _ in range(vec_env.max_steps):
         if not active.any():
             break
         actions = np.zeros(B, dtype=np.int64)

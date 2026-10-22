@@ -28,12 +28,13 @@ Condiciones de terminación (exclusivamente):
   truncated siempre es False (no hay límite de pasos).
 
 La máscara de acciones (info["action_mask"]) excluye:
-  · self-loops
-  · nodos intermedios ya visitados
+  · self-loops (no existe la acción de esperar)
   · nodos desde los que no es posible regresar al depot dentro de max_duration
   · lanes salientes que no existen según la disponibilidad histórica del día
   start_node siempre permanece válido (la violación de tiempo al regresar la
   detecta _check_termination, no la máscara).
+El camión puede volver a pasar por un nodo intermedio dentro del tour: no se
+lleva registro de nodos visitados.
 
 Modo market_process (opcional, por defecto desactivado)
 -------------------------------------------------------
@@ -81,6 +82,18 @@ from config import (
 )
 from fit_market_process import dia_de_semana
 from problem_data import build_day_matrices, draw_lane_availability, lane_reward
+
+
+def max_pasos(time_matrix, max_duration: float = MAX_DURATION) -> int:
+    """Cota del número de pasos (arcos) de un episodio.
+
+    Sin self-loop, cada arco consume al menos el menor tiempo de viaje fuera de la diagonal;
+    el arco que excede `max_duration` termina el episodio, así que como mucho caben
+    floor(max_duration / T_min) arcos más ese último. Sirve de techo defensivo en los rollouts.
+    """
+    T = np.asarray(time_matrix, dtype=float)
+    t_min = T[~np.eye(T.shape[0], dtype=bool)].min()
+    return int(max_duration // t_min) + 1
 
 
 class RoutingEnv(gym.Env):
@@ -134,7 +147,6 @@ class RoutingEnv(gym.Env):
         self._start_node:         int      = None
         self._current_node:       int      = None
         self._time_elapsed:       float    = None
-        self._visited_set:        set      = None
         self._step_count:         int      = None
         self._start_day_idx:      int      = None
         self._current_lane_exists: np.ndarray = None
@@ -170,7 +182,6 @@ class RoutingEnv(gym.Env):
 
         self._current_node = self._start_node
         self._time_elapsed = 0.0
-        self._visited_set  = {self._start_node}
         self._step_count   = 0
 
         k_max = None
@@ -224,7 +235,6 @@ class RoutingEnv(gym.Env):
         reward = self._compute_reward(next_node, next_time, terminated)
 
         # 4. Actualizar estado interno
-        self._visited_set  = self._visited_set | {next_node}
         self._current_node = next_node
         self._time_elapsed = next_time
         self._step_count  += 1
@@ -316,11 +326,11 @@ class RoutingEnv(gym.Env):
             if next_node == self._start_node:
                 if next_time <= self.max_duration:
                     if USE_REWARD_SHAPING:
-                        n_intermediate = len(self._visited_set) - 1
+                        n_arcs_before_return = self._step_count   # aún sin contar el arco de retorno
                         time_util = next_time / self.max_duration
                         terminal_reward = (
                             RETURN_SUCCESS_BONUS
-                            + (RETURN_SUCCESS_BONUS * 0.5) * (n_intermediate / (self.num_nodes - 1))
+                            + (RETURN_SUCCESS_BONUS * 0.5) * (n_arcs_before_return / (self.num_nodes - 1))
                             + (RETURN_SUCCESS_BONUS * 0.3) * time_util
                         )
                 else:
@@ -346,7 +356,6 @@ class RoutingEnv(gym.Env):
 
         Reglas (en orden de aplicación):
         · 0 para self-loop (nodo actual).
-        · 0 para nodos intermedios ya visitados.
         · 0 para nodos intermedios desde los que no se puede regresar al depot
           dentro de max_duration (lookahead temporal).
         · 0 para lanes salientes que no existen según la disponibilidad histórica de
@@ -358,11 +367,6 @@ class RoutingEnv(gym.Env):
 
         # Self-loop
         mask[self._current_node] = 0
-
-        # Intermedios visitados (vectorizado — start_node siempre se omite)
-        visited_inter = [v for v in self._visited_set if v != self._start_node]
-        if visited_inter:
-            mask[visited_inter] = 0
 
         # Lookahead temporal (vectorizado): excluir intermedios que agoten el presupuesto.
         # start_node queda exento — su retorno es siempre válido en la máscara.
@@ -404,10 +408,6 @@ class RoutingEnv(gym.Env):
         return self._time_elapsed
 
     @property
-    def visited_set(self) -> frozenset:
-        return frozenset(self._visited_set)
-
-    @property
     def current_day_idx(self) -> int:
         return self._get_current_day_idx()
 
@@ -439,7 +439,7 @@ class VectorRoutingEnv:
     """
     Vectorized version of RoutingEnv: runs B episodes in parallel as a single batch.
 
-    State is stored as numpy arrays of shape (B, ...) instead of scalars/sets.
+    State is stored as numpy arrays of shape (B, ...) instead of scalars.
     Used exclusively by the PPO collection phase in am_training.py.
     Does NOT implement the Gymnasium API — it has a simpler custom interface.
 
@@ -504,8 +504,7 @@ class VectorRoutingEnv:
         self._start_node:          np.ndarray = None   # (B,) int64
         self._current_node:        np.ndarray = None   # (B,) int64
         self._time_elapsed:        np.ndarray = None   # (B,) float32
-        self._visited_mask:        np.ndarray = None   # (B, N) bool
-        self._step_count:          np.ndarray = None   # (B,) int64
+        self._step_count:         np.ndarray = None   # (B,) int64
         self._start_day_idx:       np.ndarray = None   # (B,) int64
         self._current_lane_exists: np.ndarray = None   # (B, N) int8
         self._active:              np.ndarray = None   # (B,) bool
@@ -539,8 +538,6 @@ class VectorRoutingEnv:
         self._start_node    = np.asarray(start_nodes,    dtype=np.int64)
         self._current_node  = self._start_node.copy()
         self._time_elapsed  = np.zeros(B, dtype=np.float32)
-        self._visited_mask  = np.zeros((B, N), dtype=bool)
-        self._visited_mask[np.arange(B), self._start_node] = True
         self._step_count    = np.zeros(B, dtype=np.int64)
         self._start_day_idx = np.asarray(start_day_idxs, dtype=np.int64)
         self._active        = np.ones(B, dtype=bool)
@@ -625,9 +622,9 @@ class VectorRoutingEnv:
         # Recompensa de la lane en unidades originales (sin escala ni bonos), 0 en filas inactivas.
         self._last_raw_reward = np.where(self._active, raw_reward, 0.0).astype(np.float32)
 
-        # Terminal reward components (using visited_mask BEFORE the state update)
-        n_intermediate = self._visited_mask.sum(axis=1).astype(np.float32) - 1   # (B,)
-        time_util      = next_time / self.max_duration
+        # Terminal reward components (using step_count BEFORE the state update: arcs before the return)
+        n_arcs_before_return = self._step_count.astype(np.float32)   # (B,)
+        time_util            = next_time / self.max_duration
 
         success   = self._active & (actions == self._start_node) & (next_time <= self.max_duration)
         time_fail = self._active & cond_a & ~success
@@ -639,7 +636,7 @@ class VectorRoutingEnv:
             denom = max(N - 1, 1)
             terminal_reward[success] = (
                 RETURN_SUCCESS_BONUS
-                + (RETURN_SUCCESS_BONUS * 0.5) * (n_intermediate[success] / denom)
+                + (RETURN_SUCCESS_BONUS * 0.5) * (n_arcs_before_return[success] / denom)
                 + (RETURN_SUCCESS_BONUS * 0.3) * time_util[success]
             )
         if time_fail.any():
@@ -652,7 +649,6 @@ class VectorRoutingEnv:
         ).astype(np.float32)
 
         # ── State update (all active rows, including those terminating by cond A) ─
-        self._visited_mask[np.arange(B), actions] |= self._active
         self._current_node = np.where(self._active, actions, self._current_node).astype(np.int64)
         self._time_elapsed  = np.where(self._active, next_time, self._time_elapsed)
         self._step_count    = np.where(self._active, self._step_count + 1, self._step_count)
@@ -729,11 +725,6 @@ class VectorRoutingEnv:
         # non-depot indicator per (b, j) pair
         non_depot = np.arange(N)[None, :] != self._start_node[:, None]   # (B, N)
 
-        # Visited intermediates
-        mask[self._visited_mask & non_depot] = 0
-        # Depot always valid (will be re-confirmed after each rule)
-        mask[np.arange(B), self._start_node] = 1
-
         # Temporal lookahead
         t_to_j     = self._time_matrix_arr[self._current_node, :]         # (B, N)
         t_j_to_dep = self._time_matrix_arr[:, self._start_node].T         # (B, N)
@@ -785,8 +776,9 @@ class VectorRoutingEnv:
         return self._step_count
 
     @property
-    def visited_mask(self) -> np.ndarray:
-        return self._visited_mask
+    def max_steps(self) -> int:
+        """Cota del número de pasos de un episodio (ver max_pasos)."""
+        return max_pasos(self._time_matrix_arr, self.max_duration)
 
     @property
     def current_day_idx(self) -> np.ndarray:

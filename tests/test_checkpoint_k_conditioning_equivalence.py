@@ -17,7 +17,7 @@ Ahora el test mide lo que realmente importa y no caduca con un reentrenamiento:
    arquitectura/state_dict, incluidas las columnas de presupuesto K).
 2. En el caso libre (k_max=None), con el rollout greedy paso a paso en el
    entorno (argmax por nodo, sin beam search), el DRL se compara contra el óptimo con el
-   día conocido (label-setting oráculo sobre el replay, UB-PI) en los días de evaluación:
+   día conocido (DP hacia atrás de UB-PI sobre el replay) en los días de evaluación:
    nunca lo supera (validez del evaluador) y lo alcanza con una frecuencia y un reward
    medio mínimos.
 
@@ -33,13 +33,12 @@ import pytest
 
 import numpy as np
 
-from config import MAX_DURATION, TRAIN_DAYS
+from config import TRAIN_DAYS
 from baselines import calcular_ev_esperado
-from evaluation import make_replay_env, rollout_drl_env
+from evaluation import make_replay_env, rollout_drl_env, ub_pi
 from market_process import MarketProcess, asegurar_parametros
 from transfer_learning import load_checkpoint_compatible
 from problem_data import load_matrices
-from Solvers import solve_label_setting_oracle
 
 NUM_NODES = 10
 CHECKPOINT_PATH = os.path.join(
@@ -96,10 +95,9 @@ def test_free_case_rollout_quality_vs_exact_optimum(loaded):
             assert route[0] == start_node and route[-1] == start_node, (
                 f"start_node={start_node} day={day}: ruta {route} no cierra el ciclo"
             )
-            _, _, opt_reward, _ = solve_label_setting_oracle(
-                start_node, time_matrix_np, rate_stack, loads_stack,
-                distance_arr, diesel_arr, MAX_DURATION, NUM_NODES,
-                start_day_idx=day, dominancia=False,
+            opt_reward, _ = ub_pi(
+                None, time_matrix_np, distance_arr, diesel_arr, NUM_NODES, start_node, None,
+                (loads_stack, rate_stack), start_day_idx=day,
             )
             # El óptimo con el día conocido es una cota superior: si el DRL la supera, el
             # evaluador del agente y el del solver están desalineados.

@@ -46,7 +46,7 @@ from config import (
     CKPT_SELECTION, CKPT_WINDOW, USE_LR_COSINE, LR_FINAL_FRAC, hp,
     USE_POST_HEAD, POST_COEF,
 )
-from routing_env import VectorRoutingEnv
+from routing_env import VectorRoutingEnv, max_pasos
 from greedy_rollout import greedy_rollout
 from problem_data import build_rm_pen_stack
 from attention_encoder import (
@@ -697,7 +697,7 @@ def run_am_training(
         active = np.ones(B, dtype=bool)
 
         with torch.no_grad():
-            for step_i in range(num_nodes):   # defensive ceiling
+            for step_i in range(max_pasos(time_matrix_arr, MAX_DURATION)):   # defensive ceiling
                 if not active.any():
                     break
 
@@ -708,7 +708,7 @@ def run_am_training(
 
                 # Feature construction — no Python loops over N or B
                 node_feats = build_node_features_batch(
-                    cur_nodes, start_nodes_arr, vec_env.visited_mask,
+                    cur_nodes, start_nodes_arr,
                     rm_pen_stack, time_matrix_arr, distance_arr,
                     day_idx, num_nodes, MAX_DURATION,
                     trucks_stack_raw=trucks_stack,
@@ -766,11 +766,12 @@ def run_am_training(
                 active = active & ~terminated
                 masks  = next_masks
 
-        # num_nodes pasos bastan para cerrar cualquier ciclo (cada paso visita un
-        # nodo nuevo o regresa al depot): un episodio activo aquí sería un bug.
+        # max_pasos bastan para cerrar cualquier ciclo (cada arco consume al menos el menor tiempo de
+        # viaje y el que excede MAX_DURATION termina el episodio): un episodio activo aquí sería un bug.
         if active.any():
             raise RuntimeError(
-                f"{int(active.sum())} episodios no terminaron dentro de num_nodes={num_nodes} pasos"
+                f"{int(active.sum())} episodios no terminaron dentro de max_pasos="
+                f"{max_pasos(time_matrix_arr, MAX_DURATION)} pasos"
             )
 
         # ── Self-critical baseline: rollout greedy vectorizado ──────

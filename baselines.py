@@ -2,11 +2,11 @@
 baselines.py
 ============
 Políticas baseline no anticipativas B1 y B2 (baselines_drl_ruteo_estocastico.md).
-B3 (política de la DP relajada) vive en dp_relajada.py.
+B3 (política sobre la tabla V de la DP) vive en dp_relajada.py.
 
 Todas se ejecutan paso a paso en el entorno con la misma interfaz que el DRL: en cada
 nodo reciben una `Observacion` con la máscara, la fila observada de cargas y tarifas, el
-nodo actual, la hora, k restante y los visitados. Los parámetros del proceso (mu, s_d,
+nodo actual, la hora y k restante. Los parámetros del proceso (mu, s_d,
 phi y las tarifas históricas) se pasan al construir la política. Ninguna recibe la
 semilla del mundo evaluado ni llama a `sample_world`.
 """
@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from config import MAX_DURATION, MPG, MARGINAL_COST_SIN_DIESEL
+from config import MAX_DURATION, MPG, MARGINAL_COST_SIN_DIESEL, UBDP_DT_HORAS
 from problem_data import lane_reward
 
 _DIA_HORAS = 14.0   # un día de mercado = 14 h (igual que RoutingEnv)
@@ -28,7 +28,6 @@ class Observacion:
     nodo, casa        : nodo actual y nodo de inicio (donde se cierra el ciclo).
     tiempo            : horas transcurridas desde la salida.
     k_restante        : arcos restantes incluido el retorno (None = caso libre).
-    visitados         : (N,) bool, incluye el nodo de casa.
     mascara           : (N,) int8, acciones válidas del entorno.
     loads_row, rate_row : (N,) cargas y tarifa por milla observadas al llegar al nodo.
     dia_semana_salida : día de la semana (lunes = 0) del día de salida.
@@ -37,7 +36,6 @@ class Observacion:
     casa: int
     tiempo: float
     k_restante: object
-    visitados: np.ndarray
     mascara: np.ndarray
     loads_row: np.ndarray
     rate_row: np.ndarray
@@ -89,57 +87,65 @@ class PoliticaB2:
         E[r_jl] = P(N_jl ≥ 1) · q̄_jl · dist_jl − c_jl,   P(N ≥ 1) = 1 − (φ / (φ + m_jl))^φ
 
     con m = mu_jl · s_d del día de llegada estimado y q̄ la tarifa media histórica de la lane.
-    La búsqueda es una enumeración exacta de rutas sin revisitar, con retorno dentro de
-    MAX_DURATION y respetando k (con los tiempos de viaje reales de los datos las rutas
-    factibles son pocas, así que no hace falta podar por dominancia).
 
-    Con k_restante None (caso libre) no hay tope de cardinalidad y la profundidad solo la acota
-    MAX_DURATION. La enumeración sigue siendo exacta, pero su costo crece muy rápido con el
-    número de nodos (medido: < 40 ms por decisión hasta 35 nodos, ~1 s a 50, > 40 s desde 75).
+    El camión puede volver a pasar por un nodo, así que el estado del futuro es (j, franja de
+    tiempo, k restante) y la mejor continuación es una recursión memoizada por (casa, día de
+    salida). Las franjas son de UBDP_DT_HORAS y los tiempos de viaje se redondean hacia abajo, como
+    en dp_relajada.py; la regla de retorno factible es la de la máscara (volver a casa dentro de
+    MAX_DURATION). Con k_restante None (caso libre) no hay dimensión k y la profundidad solo la
+    acota MAX_DURATION. Como ev no depende del mundo, el memo se reutiliza entre decisiones y mundos.
     """
     nombre = "B2"
 
-    def __init__(self, market, time_matrix, distance_arr, diesel_arr, max_duration=MAX_DURATION):
+    def __init__(self, market, time_matrix, distance_arr, diesel_arr, max_duration=MAX_DURATION,
+                 dt=UBDP_DT_HORAS):
         self._T = np.asarray(time_matrix, dtype=float)
         self._dist, self._diesel = distance_arr, diesel_arr
         self._max = float(max_duration)
+        self._dt = float(dt)
         self.N = self._T.shape[0]
         self._ev = calcular_ev_esperado(market, distance_arr, diesel_arr)   # (7, N, N)
+        self._f = np.floor(self._T / self._dt + 1e-9).astype(np.int64)      # franjas de viaje, redondeo hacia abajo
+        if self._f[~np.eye(self.N, dtype=bool)].min() < 1:
+            raise ValueError("Hay tiempos de viaje menores a una franja: la recursión del caso libre "
+                             "no estaría bien fundada. Reduce dt.")
+        self._smax = int(np.floor(self._max / self._dt + 1e-9))
+        self._nodos = np.arange(self.N)
+        self._memo = {}                                                     # (casa, dow0) → {(j, s, k): valor}
 
     def actuar(self, obs: Observacion) -> int:
-        i, h = obs.nodo, obs.casa
+        i, h, dow0 = obs.nodo, obs.casa, obs.dia_semana_salida
         acts = np.flatnonzero(obs.mascara)
         r = lane_reward(obs.rate_row[acts], obs.loads_row[acts], self._dist[i, acts], self._diesel[i, acts])
-        vis = np.asarray(obs.visitados, dtype=bool).copy()
+        memo = self._memo.setdefault((h, dow0), {})
+        k_sig = None if obs.k_restante is None else obs.k_restante - 1
         mejor, mejor_a = -np.inf, -1
         for a, ra in zip(acts, r):
             if a == h:
                 v = float(ra)                                             # cerrar el ciclo ahora
             else:
-                vis[a] = True
-                v = float(ra) + self._continuacion(
-                    int(a), obs.tiempo + self._T[i, a], vis,
-                    None if obs.k_restante is None else obs.k_restante - 1, h, obs.dia_semana_salida,
-                )
-                vis[a] = False
+                s_a = min(int(np.floor((obs.tiempo + self._T[i, a]) / self._dt + 1e-9)), self._smax)
+                v = float(ra) + self._valor(h, dow0, int(a), s_a, k_sig, memo)
             if v > mejor:
                 mejor, mejor_a = v, int(a)
         return mejor_a
 
-    def _continuacion(self, j, t, vis, k_rest, h, dow0) -> float:
-        """Mejor valor esperado de seguir desde j (llegada en t, k_rest arcos restantes; None = libre).
-
-        `vis` (N,) bool se modifica y se restaura durante la recursión.
-        """
-        ev = self._ev[(dow0 + int(t // _DIA_HORAS)) % 7]
+    def _valor(self, h, dow0, j, s, k, memo) -> float:
+        """Mejor valor esperado de seguir desde j (llegada en la franja s, k arcos restantes; None = libre)."""
+        clave = (j, s, k)
+        if clave in memo:
+            return memo[clave]
+        ev = self._ev[(dow0 + int(s * self._dt / _DIA_HORAS + 1e-9)) % 7]
         mejor = ev[j, h]                                                  # cerrar el ciclo desde j
-        if k_rest is None or k_rest >= 2:
-            cand = np.flatnonzero((self._T[j] + t + self._T[:, h] <= self._max) & ~vis)
+        if k is None or k >= 2:
+            f = self._f
+            cand = np.flatnonzero(
+                (s + f[j] + f[:, h] <= self._smax) & (self._nodos != j) & (self._nodos != h)
+            )
             for l in cand:
-                vis[l] = True
-                v = ev[j, l] + self._continuacion(int(l), t + self._T[j, l], vis,
-                                                  None if k_rest is None else k_rest - 1, h, dow0)
-                vis[l] = False
+                v = ev[j, l] + self._valor(h, dow0, int(l), s + int(f[j, l]),
+                                           None if k is None else k - 1, memo)
                 if v > mejor:
                     mejor = v
-        return float(mejor)
+        memo[clave] = float(mejor)
+        return memo[clave]

@@ -208,13 +208,15 @@ def test_dia_de_semana_desde_fecha_inicio():
 # Entorno: market_process=None reproduce lo de siempre
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Recompensas capturadas del entorno ANTES del cambio (commit 2041437) con la
-# política fija indicada, NUM_NODES=10: (start_node, start_day_idx, k_max, acciones, recompensas).
+# Recompensas capturadas del entorno ANTES de eliminar la regla de no revisitar (git tag pre-revisit),
+# con los tiempos de viaje actuales de datos/duration.csv, la política fija indicada y
+# NUM_NODES=10: (start_node, start_day_idx, k_max, acciones, recompensas). Si datos/duration.csv
+# cambia, hay que recapturarlas con ese entorno.
 RUTAS_REFERENCIA = [
-    (3, 7,  None, [4, 3],       [6.02, 6.780314665726757]),
-    (0, 0,  5,    [1, 0],       [-0.93, 18.159410411377465]),
-    (8, 40, None, [1, 6, 8],    [-16.41, 16.26, 5.829027930721375]),
-    (5, 89, 5,    [3, 5],       [-2.88, 15.366317596641899]),
+    (3, 7,  None, [4, 3],       [6.02, 6.9361588215709125]),
+    (0, 0,  5,    [1, 0],       [-0.93, 18.315254567221622]),
+    (8, 40, None, [1, 8],       [-16.41, 15.652876498008624]),
+    (5, 89, 5,    [3, 5],       [-2.88, 15.142161752486055]),
 ]
 
 

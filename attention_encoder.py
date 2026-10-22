@@ -22,23 +22,22 @@ Features por nodo j (desde la posición actual del camión):
   [1] time_norm     — tiempo de viaje actual→j, normalizado por max_duration
   [2] dist_norm     — distancia actual→j, normalizada por máximo
   [3] is_depot      — 1.0 si j es el nodo de inicio del episodio, 0.0 si no
-  [4] visited       — 1.0 si j ya fue visitado en el episodio, 0.0 si no
-  [5] trucks_norm   — camiones disponibles en j para el delta correspondiente
-  [6] avail_prior   — E[loads] histórico (train) del arco actual→j, normalizado por
+  [4] trucks_norm   — camiones disponibles en j para el delta correspondiente
+  [5] avail_prior   — E[loads] histórico (train) del arco actual→j, normalizado por
                       LOADS_EXPECTED_CLIP y clipeado a [0, 1]. Preserva la magnitud
                       real (avail_expected_arr) en vez de colapsarla a una
                       probabilidad de existencia; es puramente descriptivo.
-  [7] reward_abs    — reward crudo / REWARD_GLOBAL_P95, clipeado a [0, 1]; 0 si negativo
+  [6] reward_abs    — reward crudo / REWARD_GLOBAL_P95, clipeado a [0, 1]; 0 si negativo
 
 Features de continuación (solo con USE_CONTINUATION_FEATURES; i = nodo actual, h = casa,
 t = tiempo transcurrido, ev = calcular_ev_esperado(...) de baselines.py):
-  [8]  home_time    — T[j, h] / MAX_DURATION (tiempo de j a casa)
-  [9]  slack_after  — clip((MAX − (t + T[i,j]) − T[j,h]) / MAX, 0, 1) (holgura después de j)
-  [10] ev_home      — clip(ev[dow_j, j, h] / p95, −1, 1): valor esperado de volver a casa desde j
-  [11] ev_2hop      — clip(max(ev[dow_j,j,h], max_l ev[dow_j,j,l] + ev[dow_l,l,h]) / p95, −1, 1):
-                      continuación esperada a 2 saltos, l ∉ {i, j, h} no visitado y con retorno factible
+  [7]  home_time    — T[j, h] / MAX_DURATION (tiempo de j a casa)
+  [8]  slack_after  — clip((MAX − (t + T[i,j]) − T[j,h]) / MAX, 0, 1) (holgura después de j)
+  [9]  ev_home      — clip(ev[dow_j, j, h] / p95, −1, 1): valor esperado de volver a casa desde j
+  [10] ev_2hop      — clip(max(ev[dow_j,j,h], max_l ev[dow_j,j,l] + ev[dow_l,l,h]) / p95, −1, 1):
+                      continuación esperada a 2 saltos, l ∉ {i, j, h} y con retorno factible
   Con dow_j = (dow0 + (t + T[i,j]) // 14) % 7. Para j == i las cuatro valen 0; para j == h,
-  f8 = f10 = f11 = 0 y f9 es la holgura del retorno directo.
+  f7 = f9 = f10 = 0 y f8 es la holgura del retorno directo.
 
 Condicionamiento en presupuesto de cardinalidad K:
   ContextNetwork recibe, además del bloque temporal y de mercado, un bloque
@@ -59,7 +58,7 @@ import torch.nn.functional as F
 from config import LTR_CLIP, TRUCKS_CLIP, LOADS_EXPECTED_CLIP, K_NORM, USE_CONTINUATION_FEATURES
 
 # Número de features por nodo — debe coincidir con build_node_features()
-N_BASE_NODE_FEATURES = 8
+N_BASE_NODE_FEATURES = 7
 N_CONT_FEATURES      = 4
 N_NODE_FEATURES = N_BASE_NODE_FEATURES + (N_CONT_FEATURES if USE_CONTINUATION_FEATURES else 0)
 
@@ -75,25 +74,24 @@ N_DOW_FEATURES = 7
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Features de continuación (f8–f11)
+# Features de continuación (f7–f10)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_continuation_features_batch(
     current_node:      np.ndarray,   # (B,) int64 — i
     start_node:        np.ndarray,   # (B,) int64 — casa h
-    visited_mask:      np.ndarray,   # (B, N) bool, incluye casa y nodo actual
     time_elapsed:      np.ndarray,   # (B,) horas transcurridas t
     dow0:              np.ndarray,   # (B,) día de la semana (lunes = 0) del día de salida
     time_matrix_arr:   np.ndarray,   # (N, N) T
     ev:                np.ndarray,   # (7, N, N) calcular_ev_esperado
     max_duration:      float,
     reward_global_p95: float,
-) -> np.ndarray:                     # (B, N, 4) float32: f8, f9, f10, f11
+) -> np.ndarray:                     # (B, N, 4) float32: f7, f8, f9, f10
     """Features de continuación por nodo j (ver docstring del módulo), sin loops sobre B ni N.
 
-    f11 se calcula con un tensor (B, N, N) indexado por (episodio, j, l).
+    f10 se calcula con un tensor (B, N, N) indexado por (episodio, j, l).
     """
-    B, N = visited_mask.shape
+    N    = np.asarray(time_matrix_arr).shape[0]
     T    = np.asarray(time_matrix_arr, dtype=np.float64)
     i    = np.asarray(current_node, dtype=np.int64)
     h    = np.asarray(start_node, dtype=np.int64)
@@ -109,19 +107,18 @@ def build_continuation_features_batch(
     is_i = jj[None, :] == i[:, None]                         # (B, N)
     T_jh = np.where(is_h, 0.0, T_jh)                         # casa → casa: sin tiempo
 
-    f8 = T_jh / MAX
-    f9 = np.clip((MAX - t_j - T_jh) / MAX, 0.0, 1.0)
+    f7 = T_jh / MAX
+    f8 = np.clip((MAX - t_j - T_jh) / MAX, 0.0, 1.0)
 
     dow_j = (dow0[:, None] + (t_j // 14.0).astype(np.int64)) % 7          # (B, N)
     ev_jh = ev[dow_j, jj[None, :], h[:, None]]                            # (B, N) ev[dow_j, j, h]
-    f10 = np.clip(ev_jh / p95, -1.0, 1.0)
+    f9 = np.clip(ev_jh / p95, -1.0, 1.0)
 
-    # Continuación a 2 saltos: j → l → casa, con l no visitado, l ∉ {i, j, h}, retorno factible.
+    # Continuación a 2 saltos: j → l → casa, con l ∉ {i, j, h} y retorno factible.
     t_l    = t_j[:, :, None] + T[None, :, :]                              # (B, N, N) llegada a l desde j
     T_lh   = T[:, h].T[:, None, :]                                        # (B, 1, N) T[l, h]
     valid  = (
-        ~visited_mask[:, None, :]
-        & (jj[None, None, :] != jj[None, :, None])                        # l ≠ j
+        (jj[None, None, :] != jj[None, :, None])                          # l ≠ j
         & (jj[None, None, :] != i[:, None, None])                         # l ≠ i
         & (jj[None, None, :] != h[:, None, None])                         # l ≠ h
         & (t_l + T_lh <= max_duration)
@@ -130,17 +127,17 @@ def build_continuation_features_batch(
     ev_jl = ev[dow_j[:, :, None], jj[None, :, None], jj[None, None, :]]   # (B, N, N) ev[dow_j, j, l]
     ev_lh = ev[dow_l, jj[None, None, :], h[:, None, None]]                # (B, N, N) ev[dow_l, l, h]
     dos   = np.where(valid, ev_jl + ev_lh, -np.inf).max(axis=2)           # (B, N); -inf si no hay l
-    f11 = np.clip(np.maximum(ev_jh, dos) / p95, -1.0, 1.0)
+    f10 = np.clip(np.maximum(ev_jh, dos) / p95, -1.0, 1.0)
 
-    # Casos especiales: j == h → f8 = f10 = f11 = 0 (f9 = holgura del retorno directo);
+    # Casos especiales: j == h → f7 = f9 = f10 = 0 (f8 = holgura del retorno directo);
     # j == i (self-loop) → las cuatro en 0 (tiene precedencia si i == h).
-    f8[is_h] = 0.0
+    f7[is_h] = 0.0
+    f9[is_h] = 0.0
     f10[is_h] = 0.0
-    f11[is_h] = 0.0
-    for f in (f8, f9, f10, f11):
+    for f in (f7, f8, f9, f10):
         f[is_i] = 0.0
 
-    return np.stack([f8, f9, f10, f11], axis=-1).astype(np.float32)
+    return np.stack([f7, f8, f9, f10], axis=-1).astype(np.float32)
 
 
 def _check_node_features(feats: np.ndarray, B: int, N: int) -> None:
@@ -155,7 +152,6 @@ def _check_node_features(feats: np.ndarray, B: int, N: int) -> None:
 def build_node_features(
     current_node:           int,
     start_node:             int,
-    visited_set:            set,
     reward_matrix_penalized: np.ndarray,  # (N×N)
     time_matrix:             np.ndarray,  # (N×N)
     distance_arr:            np.ndarray,  # (N×N)
@@ -163,16 +159,16 @@ def build_node_features(
     max_duration:            float,
     trucks_stack:            np.ndarray = None,  # (N, 3) — camiones por nodo×delta
     reward_global_p95:       float      = 1.0,
-    avail_expected_arr:      np.ndarray = None,  # (N, N) — E[loads] histórico (train), usado en feature [6]
-    ev:                      np.ndarray = None,  # (7, N, N) calcular_ev_esperado — features [8-11]
-    time_elapsed:            float      = 0.0,   # horas transcurridas — features [8-11]
-    dow0:                    int        = 0,     # día de la semana (lunes = 0) de salida — features [8-11]
+    avail_expected_arr:      np.ndarray = None,  # (N, N) — E[loads] histórico (train), usado en feature [5]
+    ev:                      np.ndarray = None,  # (7, N, N) calcular_ev_esperado — features [7-10]
+    time_elapsed:            float      = 0.0,   # horas transcurridas — features [7-10]
+    dow0:                    int        = 0,     # día de la semana (lunes = 0) de salida — features [7-10]
 ) -> np.ndarray:
     """
     Construye la matriz de features de nodos para el encoder (vectorizada).
 
     Cada fila j contiene las features del nodo j vistas desde current_node:
-      [reward_norm, time_norm, dist_norm, is_depot, visited, trucks_norm,
+      [reward_norm, time_norm, dist_norm, is_depot, trucks_norm,
        avail_prior, reward_abs] (+ 4 de continuación si USE_CONTINUATION_FEATURES; requieren
        ev, time_elapsed y dow0)
 
@@ -193,26 +189,22 @@ def build_node_features(
     # Column 3: is_depot
     feats[start_node, 3] = 1.0
 
-    # Column 4: visited (vectorized — includes start_node since it's always in visited_set)
-    if visited_set:
-        feats[list(visited_set), 4] = 1.0
-
-    # Column 5: trucks_norm (vectorized delta_idx via fancy indexing)
+    # Column 4: trucks_norm (vectorized delta_idx via fancy indexing)
     if trucks_stack is not None:
         travel_hours = time_matrix[current_node]                                  # (N,)
         delta_idx = np.clip(
             np.ceil(travel_hours / 14.0).astype(np.int32) - 1, 0, 2
         )                                                                      # (N,) int32
         trucks_vals = trucks_stack[np.arange(num_nodes), delta_idx]           # (N,)
-        feats[:, 5] = np.minimum(trucks_vals, TRUCKS_CLIP) / TRUCKS_CLIP
+        feats[:, 4] = np.minimum(trucks_vals, TRUCKS_CLIP) / TRUCKS_CLIP
 
-    # Column 6: avail_prior — E[loads] histórico (train), no P(existe).
+    # Column 5: avail_prior — E[loads] histórico (train), no P(existe).
     if avail_expected_arr is not None:
-        feats[:, 6] = np.minimum(avail_expected_arr[current_node], LOADS_EXPECTED_CLIP) / LOADS_EXPECTED_CLIP
+        feats[:, 5] = np.minimum(avail_expected_arr[current_node], LOADS_EXPECTED_CLIP) / LOADS_EXPECTED_CLIP
 
     # Recortar reward para evitar BIG_M_PENALTY (-1e9) en la diagonal
     feats[:, 0] = np.clip(feats[:, 0], -1e4, 1e4)
-    # Copia antes de normalizar: preserva la escala absoluta para feature [7]
+    # Copia antes de normalizar: preserva la escala absoluta para feature [6]
     raw_rewards = feats[:, 0].copy()
 
     # reward y distancia:
@@ -236,21 +228,18 @@ def build_node_features(
     # Se aplica UNA sola vez para preservar la escala temporal real.
     feats[:, 1] = np.clip(feats[:, 1] / max(max_duration, 1e-6), 0.0, 1.0)
 
-    # Feature [7]: reward absoluto normalizado por el P95 global del entrenamiento.
+    # Feature [6]: reward absoluto normalizado por el P95 global del entrenamiento.
     # Complementa la feature [0] (ranking local) con información de escala absoluta.
     # Valores negativos (arcos con costo neto) quedan en 0.0.
     _denom = max(reward_global_p95, 1e-6)
-    feat7 = np.clip(raw_rewards / _denom, 0.0, 1.0)
-    feat7[raw_rewards < 0] = 0.0
-    feats[:, 7] = feat7
+    feat6 = np.clip(raw_rewards / _denom, 0.0, 1.0)
+    feat6[raw_rewards < 0] = 0.0
+    feats[:, 6] = feat6
 
-    # Columnas 8-11: continuación (misma función que la versión batcheada, con B = 1)
+    # Columnas 7-10: continuación (misma función que la versión batcheada, con B = 1)
     if USE_CONTINUATION_FEATURES:
-        visited_mask = np.zeros((1, num_nodes), dtype=bool)
-        if visited_set:
-            visited_mask[0, list(visited_set)] = True
         feats[:, N_BASE_NODE_FEATURES:] = build_continuation_features_batch(
-            np.array([current_node]), np.array([start_node]), visited_mask,
+            np.array([current_node]), np.array([start_node]),
             np.array([time_elapsed]), np.array([dow0]), time_matrix, ev,
             max_duration, reward_global_p95,
         )[0]
@@ -366,7 +355,7 @@ class AttentionEncoder(nn.Module):
 
     Parámetros
     ----------
-    d_input  : int — features por nodo (N_NODE_FEATURES: 8, o 12 con USE_CONTINUATION_FEATURES).
+    d_input  : int — features por nodo (N_NODE_FEATURES: 7, o 11 con USE_CONTINUATION_FEATURES).
     d_h      : int — dimensión del embedding (ej. 128).
     n_heads  : int — cabezas de atención (ej. 8, debe dividir d_h).
     n_layers : int — capas del encoder (ej. 3).
@@ -550,7 +539,6 @@ def build_budget_features_batch(
 def build_node_features_batch(
     current_node:      np.ndarray,   # (B,) int64
     start_node:        np.ndarray,   # (B,) int64
-    visited_mask:      np.ndarray,   # (B, N) bool
     rm_pen_stack:      np.ndarray,   # (num_train_days, N, N)
     time_matrix_arr:   np.ndarray,   # (N, N)
     distance_arr:      np.ndarray,   # (N, N)
@@ -559,11 +547,11 @@ def build_node_features_batch(
     max_duration:      float,
     trucks_stack_raw:  np.ndarray = None,   # (N, num_days_ltr, 3)
     reward_global_p95: float      = 1.0,
-    avail_expected_arr: np.ndarray = None,  # (N, N) — E[loads] histórico (train), usado en feature [6]
+    avail_expected_arr: np.ndarray = None,  # (N, N) — E[loads] histórico (train), usado en feature [5]
     reward_rows:       np.ndarray = None,   # (B, N) — recompensa de las lanes salientes ya observada
                                             # al llegar al nodo actual (modo market_process). Si se
                                             # pasa, reemplaza la lectura de rm_pen_stack (que puede ser None).
-    ev:                np.ndarray = None,   # (7, N, N) calcular_ev_esperado — features de continuación [8-11]
+    ev:                np.ndarray = None,   # (7, N, N) calcular_ev_esperado — features de continuación [7-10]
     time_elapsed:      np.ndarray = None,   # (B,) horas transcurridas — idem
     dow0:              np.ndarray = None,   # (B,) día de la semana (lunes = 0) de salida — idem
 ) -> np.ndarray:                            # (B, N, N_NODE_FEATURES) float32
@@ -599,10 +587,7 @@ def build_node_features_batch(
     # ── f3: is_depot — 1.0 if j == start_node[b] ─────────────────────────────
     feats[:, :, 3] = (np.arange(N)[None, :] == start_node[:, None]).astype(np.float32)
 
-    # ── f4: visited — 1.0 if j in visited_mask[b] ────────────────────────────
-    feats[:, :, 4] = visited_mask.astype(np.float32)
-
-    # ── f5: trucks availability ───────────────────────────────────────────────
+    # ── f4: trucks availability ───────────────────────────────────────────────
     if trucks_stack_raw is not None:
         travel_hours = time_matrix_arr[current_node, :]                 # (B, N)
         delta_idx = np.clip(
@@ -616,18 +601,18 @@ def build_node_features_batch(
             day_idx_t[:, None],       # (B, 1) → (B, N)
             delta_idx,                # (B, N)
         ]                                                                # (B, N)
-        feats[:, :, 5] = np.minimum(trucks_val, TRUCKS_CLIP) / TRUCKS_CLIP
+        feats[:, :, 4] = np.minimum(trucks_val, TRUCKS_CLIP) / TRUCKS_CLIP
 
-    # ── f6: lane availability prior — E[loads] histórico (train), no P(existe) ─
+    # ── f5: lane availability prior — E[loads] histórico (train), no P(existe) ─
     if avail_expected_arr is not None:
-        feats[:, :, 6] = (
+        feats[:, :, 5] = (
             np.minimum(avail_expected_arr[current_node, :], LOADS_EXPECTED_CLIP)
             / LOADS_EXPECTED_CLIP
         )       # (B, N)
 
     # ── Clip reward before normalization (avoids BIG_M_PENALTY overflow) ─────
     feats[:, :, 0] = np.clip(feats[:, :, 0], -1e4, 1e4)
-    raw_rewards = feats[:, :, 0].copy()   # (B, N) — before normalization for f7
+    raw_rewards = feats[:, :, 0].copy()   # (B, N) — before normalization for f6
 
     # ── Row-wise min-max normalization for f0 (reward) and f2 (distance) ─────
     for col in (0, 2):
@@ -643,16 +628,16 @@ def build_node_features_batch(
     # ── Absolute normalization for f1 (time) ─────────────────────────────────
     feats[:, :, 1] = np.clip(feats[:, :, 1] / max(max_duration, 1e-6), 0.0, 1.0)
 
-    # ── f7: absolute reward normalized by global P95 ──────────────────────────
+    # ── f6: absolute reward normalized by global P95 ──────────────────────────
     _denom = max(reward_global_p95, 1e-6)
-    feat7 = np.clip(raw_rewards / _denom, 0.0, 1.0)
-    feat7[raw_rewards < 0] = 0.0
-    feats[:, :, 7] = feat7
+    feat6 = np.clip(raw_rewards / _denom, 0.0, 1.0)
+    feat6[raw_rewards < 0] = 0.0
+    feats[:, :, 6] = feat6
 
-    # ── f8–f11: continuación (tiempo/holgura de regreso, valor esperado a 1 y 2 saltos) ──
+    # ── f7–f10: continuación (tiempo/holgura de regreso, valor esperado a 1 y 2 saltos) ──
     if USE_CONTINUATION_FEATURES:
         feats[:, :, N_BASE_NODE_FEATURES:] = build_continuation_features_batch(
-            current_node, start_node, visited_mask, time_elapsed, dow0,
+            current_node, start_node, time_elapsed, dow0,
             time_matrix_arr, ev, max_duration, reward_global_p95,
         )
 

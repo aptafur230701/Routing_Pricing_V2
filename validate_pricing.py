@@ -91,7 +91,7 @@ class Escenario:
         """(h_t, embeddings, mask_t) del estado actual de `env`; mismas features que greedy_rollout."""
         B, cur, dev = len(env.current_node), env.current_node, self.device
         nf = build_node_features_batch(
-            cur, env.start_node, env.visited_mask, None, self.T, self.dist, env.current_day_idx,
+            cur, env.start_node, None, self.T, self.dist, env.current_day_idx,
             self.N, MAX_DURATION, trucks_stack_raw=self.trucks, reward_global_p95=self.p95,
             avail_expected_arr=self.avail, reward_rows=env.reward_rows, ev=self.ev,
             time_elapsed=env.time_elapsed, dow0=env.start_dow,
@@ -129,7 +129,7 @@ class Escenario:
         masks = env.reset(dis["nodo"], dis["start_day"], k_max_arr=k_arr, world_seeds=dis["world_seed"])
         active = np.ones(B, dtype=bool)
         recs = []
-        for _ in range(self.N):
+        for _ in range(env.max_steps):
             if not active.any():
                 break
             h_t, emb, mask_t = self.encode(env, masks)
@@ -143,7 +143,7 @@ class Escenario:
                     start=int(env.start_node[b]), start_day=int(dis["start_day"][b]), k=k_arr[b],
                     t=float(env.time_elapsed[b]), mask=masks[b].copy(), v=v[b].copy(),
                     rate=env.current_rate_row[b].astype(np.float64), loads=env.current_loads_row[b].copy(),
-                    visited=env.visited_mask[b].copy(), k_rem=int(env.k_remaining[b]),
+                    k_rem=int(env.k_remaining[b]),
                     dow=int(env.current_dow[b]), term=False,
                 ))
             _, term, masks = env.step(actions)
@@ -171,8 +171,8 @@ class Escenario:
     def mc_valores(self, estados, R, rng, chunk_rows=3000, sample=True) -> tuple:
         """Media y error estándar del retorno escalado (1/S) que sigue a llegar a j.
 
-        estados : list[(rec, j)]. Cada uno se reanuda en el nodo j, en t + t_ij, con los mismos
-        visitados y presupuesto K, y R mundos nuevos: el tablero de j se vuelve a sortear.
+        estados : list[(rec, j)]. Cada uno se reanuda en el nodo j, en t + t_ij, con el mismo
+        presupuesto K, y R mundos nuevos: el tablero de j se vuelve a sortear.
         """
         medias, ses = [], []
         por_chunk = max(1, chunk_rows // R)
@@ -198,9 +198,6 @@ class Escenario:
         env._current_node = j
         env._time_elapsed = (rep([r["t"] for r, _ in sub]).astype(np.float32)
                              + self.T[i, j].astype(np.float32))
-        vis = rep([r["visited"] for r, _ in sub]).copy()
-        vis[np.arange(B), j] = True
-        env._visited_mask = vis
         env._step_count = rep([r["step"] + 1 for r, _ in sub]).astype(np.int64)
         env._k_remaining = rep([r["k_rem"] - 1 for r, _ in sub]).astype(np.int64)
         env._active = np.ones(B, dtype=bool)
@@ -209,7 +206,7 @@ class Escenario:
 
         ret = np.zeros(B, dtype=np.float64)
         active = np.ones(B, dtype=bool)
-        for _ in range(self.N):
+        for _ in range(env.max_steps):
             if not active.any():
                 break
             h_t, emb, mask_t = self.encode(env, masks)
@@ -240,7 +237,7 @@ class Escenario:
         n_aceptadas = np.zeros(B)
         n_arcos = np.zeros(B, dtype=int)
         valido = np.zeros(B, dtype=bool)
-        for _ in range(self.N):
+        for _ in range(env.max_steps):
             if not active.any():
                 break
             h_t, emb, mask_t = self.encode(env, masks)

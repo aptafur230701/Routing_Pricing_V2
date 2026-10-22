@@ -2,15 +2,15 @@
 
 ## Resumen
 
-Compararía el DRL contra dos cotas superiores y tres políticas, todas evaluadas sobre los mismos mundos simulados. La pieza central es UB-DP, una programación dinámica sobre (nodo, hora, cargas restantes) que relaja la regla de no revisitar. Con el proceso exógeno nuevo es barata de calcular, da un gap de optimalidad casi certificado y su política, B3, es el rival más fuerte.
+Compararía el DRL contra dos cotas superiores y tres políticas, todas evaluadas sobre los mismos mundos simulados. La pieza central es UB-DP, una programación dinámica sobre (nodo, hora, arcos restantes). El camión puede volver a pasar por un nodo intermedio, así que el estado no necesita el conjunto de visitados y la DP resuelve el problema, no una relajación de él. Con el proceso exógeno nuevo es barata de calcular, da un gap de optimalidad casi certificado (salvo la discretización de 15 min y el muestreo) y su política, B3, es el rival más fuerte.
 
 | Id | Baseline | Clase (Powell) | Usa información futura | Rol en la tesis |
 | --- | --- | --- | --- | --- |
-| UB-PI | Ruta óptima con el mundo completo conocido | Relajación de información | Sí | Techo laxo; mide el valor de la información perfecta |
-| UB-DP | DP en (nodo, hora, K) permitiendo revisitar | Relajación de restricción | No | Techo ajustado; gap de optimalidad |
+| UB-PI | Ruta óptima con el mundo completo conocido (DP hacia atrás, franjas de 1 min) | Relajación de información | Sí | Techo laxo; mide el valor de la información perfecta |
+| UB-DP | DP en (nodo, hora, K) | Óptimo aproximado de la política no anticipativa | No | Referencia ajustada; gap de optimalidad |
 | B1 | Greedy miope | PFA | No | Benchmark miope estándar |
 | B2 | Reoptimización determinista con valores esperados (K = 5 y libre) | CFA / lookahead determinista | No | Lo que haría un planificador con pronóstico puntual |
-| B3 | Política de la DP relajada | VFA (tabla) | No | ADP clásica; el rival más fuerte esperado |
+| B3 | Política sobre la tabla V de la DP | VFA (tabla) | No | ADP clásica; el rival más fuerte esperado |
 
 B1, B2 y B3 son no anticipativas: deciden con lo que ve el camión en el nodo actual y con los parámetros del proceso, nunca con la realización del mundo. Las dos cotas no son políticas implementables y se reportan como techos.
 
@@ -18,7 +18,7 @@ B1, B2 y B3 son no anticipativas: deciden con lo que ve el camión en el nodo ac
 
 Tu problema es un ruteo estocástico de un solo vehículo donde la información de cada nodo se revela al llegar. En la literatura cae en la intersección de tres familias, y cada una aporta un tipo de baseline.
 
-- **Canadian Traveller Problem estocástico.** El estado de los arcos que salen de un nodo se conoce solo al llegar a él. Es tu máscara de lanes. La versión con arcos independientes es #P-difícil ([Canadian traveller problem](https://en.wikipedia.org/wiki/Canadian_traveller_problem); Papadimitriou y Yannakakis, 1989). Esto justifica no buscar el óptimo exacto con el conjunto de visitados en el estado y comparar contra cotas.
+- **Canadian Traveller Problem estocástico.** El estado de los arcos que salen de un nodo se conoce solo al llegar a él. Es tu máscara de lanes. La versión con arcos independientes es #P-difícil ([Canadian traveller problem](https://en.wikipedia.org/wiki/Canadian_traveller_problem); Papadimitriou y Yannakakis, 1989). Esto justifica no buscar el óptimo exacto con el estado completo de información y comparar contra una DP con filas independientes por llegada y contra el clarividente.
 - **Ruteo dinámico y estocástico (SDVRP).** Ulmer et al. (2020) y Hildebrandt, Thomas y Ulmer clasifican las soluciones en enfoques miopes de horizonte rodante, PFA, CFA, lookahead con escenarios y VFA ([survey](https://ar5iv.labs.arxiv.org/html/2103.00507)). Los trabajos de DRL en esta familia se comparan contra miope, aproximación de valor y escenarios; Joe y Lau (2020) usan exactamente AVI, MSA y miope ([ICAPS](https://ojs.aaai.org/index.php/ICAPS/article/view/6685)).
 - **Gestión de flota truckload.** La línea de Powell modela las cargas como información exógena que llega después de decidir y resuelve con ADP sobre tablas de valor (Simao et al., 2009). Es el origen de B3.
 
@@ -30,17 +30,17 @@ Hay una asimetría que conviene declarar. B1 a B3 usan los parámetros verdadero
 
 ## Las dos cotas superiores
 
-Reportaría el DRL contra un techo laxo y uno ajustado. El laxo dice cuánto vale saber el futuro; el ajustado dice cuánto le falta al DRL para el óptimo alcanzable sin saberlo.
+Reportaría el DRL contra un techo laxo (UB-PI) y una referencia ajustada (UB-DP). El laxo dice cuánto vale saber el futuro; el ajustado dice cuánto le falta al DRL para el óptimo alcanzable sin saberlo. Debe cumplirse UB-PI ≥ UB-DP.
 
 ### UB-PI: información perfecta
 
-Para cada mundo de `sample_world`, resuelve la mejor ruta con todo el mundo conocido: qué cargas habrá en cada nodo y día. Es la relajación de no anticipatividad sin penalidad de Brown, Smith y Sun (2010), que acotan el valor óptimo relajando la regla de decidir solo con lo ya observado ([Operations Research](https://pubsonline.informs.org/doi/10.1287/opre.1090.0796)). Genera el mundo con `sample_world(semilla, 6, día de inicio)`: 77 horas son 5,5 días de mercado, así que 6 días cubren cualquier ruta. Ese mundo es exactamente el que ve `RoutingEnv` con la misma semilla, porque ambos sortean cada fila en función de (semilla, nodo, día). El label-setting oráculo que ya tenías sirve para resolverlo.
+Para cada mundo de `sample_world`, resuelve la mejor ruta con todo el mundo conocido: qué cargas habrá en cada nodo y día. Es la relajación de no anticipatividad sin penalidad de Brown, Smith y Sun (2010), que acotan el valor óptimo relajando la regla de decidir solo con lo ya observado ([Operations Research](https://pubsonline.informs.org/doi/10.1287/opre.1090.0796)). Genera el mundo con `sample_world(semilla, 6, día de inicio)`: 77 horas son 5,5 días de mercado, así que 6 días cubren cualquier ruta. Ese mundo es exactamente el que ve `RoutingEnv` con la misma semilla, porque ambos sortean cada fila en función de (semilla, nodo, día). Se resuelve con una DP hacia atrás sobre el mundo conocido, con estado (nodo, franja de tiempo, k) y franjas de 1 minuto (`UBPI_DT_HORAS`); la recompensa de salir del nodo i en la franja s usa la fila del día `día de inicio + floor(s · dt / 14)` de ese mundo. Como el camión puede revisitar nodos, no hace falta el conjunto de visitados ni poda por dominancia.
 
 Es un techo laxo. En un problema donde la información llega al llegar, el clarividente evita siempre los nodos vacíos, y ninguna política real puede hacerlo. Un gap grande contra UB-PI no prueba que el DRL sea malo. La diferencia UB-PI menos UB-DP es el valor esperado de la información perfecta (EVPI) y responde una pregunta de negocio: cuánto valdría saber las cargas antes de moverse.
 
-### UB-DP: programación dinámica sin la regla de no revisitar
+### UB-DP: programación dinámica sobre (nodo, hora, k)
 
-El estado exacto incluye el conjunto de nodos visitados, y eso lo vuelve intratable. Si se permite revisitar nodos intermedios, el estado se reduce a (nodo i, hora t, arcos restantes k) y el día de la semana de salida. Con el proceso nuevo, las filas de cada llegada son independientes y dependen solo del nodo y del día de la semana, así que la ecuación de Bellman es exacta:
+El camión puede volver a pasar por un nodo intermedio, así que el estado es (nodo i, hora t, arcos restantes k) y el día de la semana de salida; no incluye nodos visitados. Con el proceso nuevo, las filas de cada llegada son independientes y dependen solo del nodo y del día de la semana, así que la ecuación de Bellman es exacta:
 
 ```latex
 V(i,t,k) \;=\; \mathbb{E}_{\omega \sim P(\cdot \mid i,\, d(t))}\Big[\max_{j \in A(i,t,k,\omega)} \big\{ r_{ij}(\omega) + V(j,\, t+\tau_{ij},\, k-1) \big\}\Big]
@@ -48,20 +48,20 @@ V(i,t,k) \;=\; \mathbb{E}_{\omega \sim P(\cdot \mid i,\, d(t))}\Big[\max_{j \in 
 
 Aquí ω es la pareja (loads_row, rate_row) que sortea `MarketProcess` en el nodo i, d(t) es el día de la semana de llegada, A son los destinos factibles (lane con carga, retorno a casa posible dentro de 77 horas, k mayor que cero) y r es la recompensa de la fórmula compartida. Al volver a casa el valor terminal es cero. La esperanza se estima con S sorteos por estado (S = 500).
 
-Como el conjunto de políticas que nunca revisitan está contenido en el de las que sí pueden, V(casa, 0, K) es una cota superior del valor de la mejor política no anticipativa. Dos cuidados para que siga siendo cota:
+V(casa, 0, K) es, por tanto, el valor óptimo aproximado de la mejor política no anticipativa, no una cota por relajación. Dos fuentes de aproximación:
 
-- Discretiza el tiempo en franjas de 15 minutos redondeando los tiempos de viaje hacia abajo. Redondear hacia arriba eliminaría rutas factibles. Redondear hacia abajo puede adelantar una llegada al día anterior y cambiar su día de la semana; con franjas de 15 minutos el efecto es mínimo, pero en rigor la cota es aproximada y así debe declararse.
-- Usa S = 500 sorteos por estado. El error de muestreo dentro del máximo sesga V hacia arriba, lo cual es conservador para una cota.
+- Discretiza el tiempo en franjas de 15 minutos redondeando los tiempos de viaje hacia abajo. Redondear hacia arriba eliminaría rutas factibles. Redondear hacia abajo puede adelantar una llegada al día anterior y cambiar su día de la semana; con franjas de 15 minutos el efecto es mínimo, pero el valor es aproximado y así debe declararse.
+- Usa S = 500 sorteos por estado. El error de muestreo dentro del máximo sesga V ligeramente hacia arriba.
 
-En tu código cada fila es fija dentro de un mundo para cada par (nodo, día), mientras que la DP sortea de nuevo en cada llegada. Eso no rompe la cota: una ruta que no revisita nunca pasa dos veces por el mismo nodo intermedio, así que para esas rutas ambos modelos dan exactamente la misma distribución, y la DP solo agrega rutas que el problema real no permite.
+Una diferencia menor con el entorno: en tu código cada fila es fija dentro de un mundo para cada par (nodo, día), así que volver al mismo nodo el mismo día ve la misma fila, mientras que la DP sortea de nuevo en cada llegada. Solo afecta a rutas que revisitan un nodo el mismo día de mercado (con tiempos de viaje de decenas de horas es raro).
 
-El tamaño es manejable. Con 35 nodos, unas 310 franjas de 15 minutos, 6 valores de k y 7 días de salida hay cerca de 460.000 estados. Los sorteos dependen solo del nodo y del día de la semana, así que se generan una vez por par (nodo, día) y se reutilizan en todos los estados. Con numpy vectorizado son minutos. Para el caso libre sin K, el límite de 77 horas acota la profundidad y basta quitar k del estado.
+El tamaño es manejable. Con 35 nodos, unas 310 franjas de 15 minutos, 6 valores de k y 7 días de salida hay cerca de 460.000 estados. Los sorteos dependen solo del nodo y del día de la semana, así que se generan una vez por par (nodo, día) y se reutilizan en todos los estados. Con numpy vectorizado son minutos. Para el caso libre sin K, el límite de 77 horas acota la profundidad y basta quitar k del estado (cada arco consume al menos una franja, así que la recursión es hacia atrás en el tiempo).
 
-El gap DRL contra UB-DP es el número central de la evaluación: si el DRL queda a 3 % de UB-DP, está a lo sumo a cerca de 3 % del óptimo. Esa afirmación es mucho más fuerte que cualquier comparación contra heurísticas.
+El gap DRL contra UB-DP es el número central de la evaluación: si el DRL queda a 3 % de UB-DP, está a cerca de 3 % del óptimo. Esa afirmación es mucho más fuerte que cualquier comparación contra heurísticas.
 
 ## Las políticas baseline
 
-Cada política recibe lo mismo que el DRL en cada nodo: la máscara, la fila actual de cargas y tarifas, la hora, k restante, los visitados y los parámetros del proceso. Todas respetan las mismas reglas de máscara, incluida la excepción del primer movimiento desde casa.
+Cada política recibe lo mismo que el DRL en cada nodo: la máscara, la fila actual de cargas y tarifas, la hora, k restante y los parámetros del proceso. Todas respetan las mismas reglas de máscara, incluida la excepción del primer movimiento desde casa.
 
 ### B1. Greedy miope (PFA)
 
@@ -75,21 +75,21 @@ En cada nodo, resuelve de forma exacta la mejor ruta restante reemplazando el fu
 \mathbb{E}[r_{jl}] \;=\; P(N_{jl} \ge 1)\,\bar{q}_{jl}\,\text{dist}_{jl} \;-\; c_{jl}, \qquad P(N_{jl} \ge 1) = 1 - \Big(\frac{\phi}{\phi + m_{jl}}\Big)^{\phi}
 ```
 
-con m = mu_jl × s_d y q la tarifa media histórica de la lane. El arco actual usa la fila real observada. Con K = 5 la búsqueda exacta es pequeña y reutiliza tu label-setting. En el caso libre las rutas son más largas, pero la enumeración sigue siendo viable hasta unos 35-50 nodos (primera decisión desde casa, medida: menos de 40 ms hasta 35 nodos, 0,1 a 1,2 s a 50, más de 40 s a 75 y 100), así que B2 se evalúa con K = 5 y con K libre; a partir de ~75 nodos la versión exacta deja de ser práctica y ese es un resultado por sí mismo. Es el horizonte rodante que la literatura de ruteo dinámico llama miope en información: replanifica con un pronóstico puntual e ignora la varianza. Su debilidad conocida es planear a través de nodos que en promedio lucen bien pero a menudo están vacíos, y el DRL debería ganarle justo ahí.
+con m = mu_jl × s_d y q la tarifa media histórica de la lane. El arco actual usa la fila real observada. Como el camión puede revisitar nodos, la mejor continuación es una recursión memoizada sobre (nodo, franja de 15 minutos, k restante) para cada (casa, día de salida), con los tiempos redondeados hacia abajo como en UB-DP y la misma regla de retorno factible dentro de `MAX_DURATION`; en el caso libre no hay dimensión k. El valor esperado no depende del mundo, así que el memo se reutiliza entre decisiones y mundos. B2 se evalúa con K = 5 y con K libre. Es el horizonte rodante que la literatura de ruteo dinámico llama miope en información: replanifica con un pronóstico puntual e ignora la varianza. Su debilidad conocida es planear a través de nodos que en promedio lucen bien pero a menudo están vacíos, y el DRL debería ganarle justo ahí.
 
-### B3. Política de la DP relajada (VFA de tabla)
+### B3. Política sobre la tabla V de la DP (VFA de tabla)
 
 Usa la tabla V de UB-DP como función de valor y decide en línea:
 
 ```latex
-a = \arg\max_{j \in A,\; j \notin \text{visitados}} \; r_{ij} + V(j,\, t+\tau_{ij},\, k-1)
+a = \arg\max_{j \in A} \; r_{ij} + V(j,\, t+\tau_{ij},\, k-1)
 ```
 
-Es ADP de tabla en el sentido de Simao et al. y Powell: una función de valor calculada fuera de línea y una decisión de un paso en línea. La regla de no revisitar se aplica en la ejecución, así que V es optimista sobre nodos ya visitados; aun así espero que sea muy fuerte, porque la estructura del proceso es exactamente la que asume la DP. Si B3 le gana al DRL, es un hallazgo que la tesis debe reportar, no esconder: el argumento del DRL pasaría a ser la escala y la transferencia entre tamaños de grafo, no la calidad por instancia.
+Es ADP de tabla en el sentido de Simao et al. y Powell: una función de valor calculada fuera de línea y una decisión de un paso en línea. Como la DP y la ejecución comparten las mismas reglas, B3 es la política óptima salvo la discretización y el muestreo; espero que sea muy fuerte, porque la estructura del proceso es exactamente la que asume la DP. Si B3 le gana al DRL, es un hallazgo que la tesis debe reportar, no esconder: el argumento del DRL pasaría a ser la escala y la transferencia entre tamaños de grafo, no la calidad por instancia.
 
 ### El DRL
 
-El DRL se evalúa con su política greedy: en cada nodo elige el argmax de la red, ejecutado paso a paso en `RoutingEnv`. No se usa beam search; con un ancho mayor que 1 compararía rutas usando cargas de nodos aún no visitados y dejaría de ser una política válida para este problema.
+El DRL se evalúa con su política greedy: en cada nodo elige el argmax de la red, ejecutado paso a paso en `RoutingEnv`. No se usa beam search; con un ancho mayor que 1 compararía rutas usando cargas de nodos aún no observados y dejaría de ser una política válida para este problema.
 
 ## Protocolo experimental
 
@@ -138,23 +138,23 @@ Este bloque está escrito para Claude Code, en el repositorio AM-PPO. Implementa
 1. Lee este documento completo y `proceso_exogeno_cargas_tarifas.md`.
 2. Lee `routing_env.py`, `market_process.py`, `problem_data.py` (`lane_reward`), `config.py`, `evaluation.py`, `Solvers.py`, `stats_analysis.py`, `excel_report.py`, `main.py`, `run_k_comparison.py`, `inference.py` y `am_agent.py`.
 3. Confirma cómo se evalúa hoy el DRL. El beam search ya fue eliminado y el DRL se evalúa con un rollout greedy en el entorno; ubica esa función y úsala tal cual. Si encuentras restos de beam search, repórtalos antes de seguir.
-4. Confirma que `solve_label_setting_oracle` calcula el día de llegada igual que `RoutingEnv` (día de inicio más la parte entera de horas / 14) y aplica las mismas reglas de máscara, incluida la excepción del primer movimiento desde el nodo de inicio. Si no coincide, repórtalo antes de seguir.
+4. Confirma que `solve_ub_pi` calcula el día de la fila igual que `RoutingEnv` (día de inicio más la parte entera de horas / 14, salvo el redondeo de franjas) y aplica las mismas reglas de máscara, incluida la excepción del primer movimiento desde el nodo de inicio. Si no coincide, repórtalo antes de seguir.
 
 ### Reglas generales
 
 - No cambies el encoder, el decoder, el crítico, los hiperparámetros de PPO, el loop de entrenamiento, `MarketProcess` ni la dinámica de `RoutingEnv`.
-- Todas las políticas (DRL, B1, B2, B3) se ejecutan paso a paso en `RoutingEnv` con la misma interfaz. Una política solo puede leer la máscara, `current_loads_row`, `current_rate_row`, el nodo actual, la hora, `k_remaining`, los visitados y los parámetros del proceso. Ninguna política puede llamar a `sample_world` ni usar la semilla del mundo evaluado.
+- Todas las políticas (DRL, B1, B2, B3) se ejecutan paso a paso en `RoutingEnv` con la misma interfaz. Una política solo puede leer la máscara, `current_loads_row`, `current_rate_row`, el nodo actual, la hora, `k_remaining` y los parámetros del proceso. Ninguna política puede llamar a `sample_world` ni usar la semilla del mundo evaluado.
 - El margen de una ruta es la suma de `lane_reward` de cada arco recorrido, calculada con la fila observada en el nodo de salida. No uses la recompensa que devuelve el entorno, que trae bono, penalidad y escala.
 - Todo el muestreo propio (UB-DP) usa un `numpy.random.Generator` con semilla fija, nunca el estado global.
 - No agregues dependencias. Comentarios y docstrings en español, como el resto del repositorio.
 
 ### Pasos
 
-1. **Borrar los baselines viejos.** En `Solvers.py` elimina `solve_HGA_LNS_metaheuristic`, `solve_label_setting_exact`, las cuatro variantes `solve_heuristic_rolling_horizon*`, `solve_mc_rollout_stochastic` y los auxiliares que solo usaban ellas. Conserva `solve_label_setting_oracle` y lo que necesite. Elimina también el modo DRL Det. Busca cada nombre borrado en todo el repositorio (`evaluation.py`, `stats_analysis.py`, `excel_report.py`, `main.py`, `run_k_comparison.py`, `inference.py`, `hpo_optuna.py`) y quita o actualiza cada referencia.
+1. **Borrar los baselines viejos.** En `Solvers.py` elimina `solve_HGA_LNS_metaheuristic`, `solve_label_setting_exact`, las cuatro variantes `solve_heuristic_rolling_horizon*`, `solve_mc_rollout_stochastic` y los auxiliares que solo usaban ellas. Conserva solo la resolución de UB-PI (`solve_ub_pi`). Elimina también el modo DRL Det. Busca cada nombre borrado en todo el repositorio (`evaluation.py`, `stats_analysis.py`, `excel_report.py`, `main.py`, `run_k_comparison.py`, `inference.py`, `hpo_optuna.py`) y quita o actualiza cada referencia.
 2. **Configuración (`config.py`).** Agrega el paso de tiempo de UB-DP (`UBDP_DT_HORAS = 0.25`), el número de sorteos (`UBDP_S = 500`), su semilla y la ruta donde se guarda la tabla V. Mantén `MARKET_M_EVAL_WORLDS = 100` y `MARKET_SEED_EVAL`.
-3. **UB-DP y B3 (`dp_relajada.py`).** Calcula V(día de la semana de salida, nodo, franja de tiempo, k) con la ecuación de Bellman de la sección UB-DP, sin la regla de no revisitar.
+3. **UB-DP y B3 (`dp_relajada.py`).** Calcula V(día de la semana de salida, nodo, franja de tiempo, k) con la ecuación de Bellman de la sección UB-DP (el camión puede revisitar).
     - Los tiempos de viaje se redondean hacia abajo a la franja; el día de llegada es el día de salida más la parte entera de horas / 14.
-    - Las acciones factibles siguen las reglas de la máscara del entorno, salvo los visitados: lane con carga en la fila sorteada, retorno a casa posible dentro de `MAX_DURATION`, retorno forzado cuando queda un arco, y la excepción del primer movimiento desde casa.
+    - Las acciones factibles siguen las reglas de la máscara del entorno: lane con carga en la fila sorteada, retorno a casa posible dentro de `MAX_DURATION`, retorno forzado cuando queda un arco, y la excepción del primer movimiento desde casa.
     - Volver a casa da la recompensa del arco y termina con valor cero.
     - Las filas se sortean con `MarketProcess.sample_arrivals` y un Generator propio: S filas por cada par (nodo, día de la semana), generadas una vez y reutilizadas en todos los estados.
     - La recompensa es `lane_reward`, sin shaping.
@@ -164,8 +164,8 @@ Este bloque está escrito para Claude Code, en el repositorio AM-PPO. Implementa
 5. **B2 (reoptimización con valores esperados), K = 5 y libre.** En cada nodo:
     - El arco actual usa la recompensa real de la fila observada.
     - Los arcos futuros usan la recompensa esperada de la sección B2, con P(N ≥ 1) de la binomial negativa con el s_d del día de llegada estimado y la tarifa media histórica de la lane.
-    - Resuelve de forma exacta la mejor ruta restante (sin revisitar, retorno dentro de `MAX_DURATION`, respetando k) y ejecuta solo el primer arco. Reutiliza la lógica de búsqueda de `solve_label_setting_oracle` si se adapta sin cambiarla.
-6. **UB-PI.** Para cada mundo evaluado, genera `sample_world(semilla, 6, dia_inicio)` y resuélvelo con `solve_label_setting_oracle`, pasando ese mundo con día de inicio 0.
+    - Resuelve de forma exacta la mejor ruta restante (con revisitas, retorno dentro de `MAX_DURATION`, respetando k) mediante una recursión memoizada sobre (nodo, franja de `UBDP_DT_HORAS`, k restante), con tiempos redondeados hacia abajo, y ejecuta solo el primer arco.
+6. **UB-PI.** Para cada mundo evaluado, genera `sample_world(semilla, 6, dia_inicio)` y resuélvelo con `solve_ub_pi` (DP hacia atrás con franjas de `UBPI_DT_HORAS`), pasando ese mundo con día de inicio 0.
 7. **Arnés de evaluación (`evaluation.py`).** Reemplaza `run_solver_comparison` y `run_solver_comparison_by_k`.
     - Para cada K en {5, libre}, genera M mundos con semillas derivadas de `MARKET_SEED_EVAL`.
     - Asigna a cada mundo un nodo de inicio y un día de la semana de forma balanceada: cada nodo aparece ⌊M/N⌋ o ⌈M/N⌉ veces y cada día de la semana ⌊M/7⌋ o ⌈M/7⌉ veces, sin que el día quede atado al nodo. Usa como `start_day_idx` un día del histórico con ese día de la semana.

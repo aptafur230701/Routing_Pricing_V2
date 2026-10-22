@@ -1,9 +1,9 @@
 """
 test_solvers_k_cardinality.py
 ===============================
-Criterio de aceptación: el label-setting oráculo (único solver que conserva Solvers.py)
+Criterio de aceptación: la DP hacia atrás de UB-PI (único solver que conserva Solvers.py)
 honra el presupuesto de cardinalidad K (≤ K arcos, incluido el retorno) por construcción
-— filtro de expansión en el DP —, con y sin poda por dominancia.
+— la dimensión k del estado —.
 
 Usa un escenario sintético (no datos reales de 10 nodos) con tiempos de viaje
 pequeños y max_duration holgado, para que K sea la restricción BINDING — con
@@ -16,10 +16,9 @@ import numpy as np
 import pytest
 
 from config import K_LEVELS
-from Solvers import solve_label_setting_oracle
+from Solvers import solve_ub_pi
 
-N = 9   # > max(K_LEVELS): un ciclo puede alcanzar hasta N arcos, así que todos
-        # los niveles de K_LEVELS son físicamente alcanzables.
+N = 9   # el camión puede revisitar nodos, así que K puede ser binding con cualquier N.
 
 
 @pytest.fixture(scope="module")
@@ -43,15 +42,15 @@ def _n_arcs(route):
     return None if route is None else len(route) - 1
 
 
-@pytest.mark.parametrize("dominancia", [True, False])
-def test_label_setting_oracle_respects_k(synthetic_data, dominancia):
+def test_ub_pi_respects_k(synthetic_data):
     d = synthetic_data
     time_matrix_np = np.asarray(d["time_matrix"], dtype=float)
     for k in K_LEVELS:
-        status, route, reward, duration = solve_label_setting_oracle(
+        valor, route = solve_ub_pi(
             0, time_matrix_np, d["rate_stack"], d["loads_stack"],
-            d["distance_arr"], d["diesel_arr"], d["max_duration"], N,
-            start_day_idx=0, time_limit_seconds=30, k_max=k, dominancia=dominancia,
+            d["distance_arr"], d["diesel_arr"], d["max_duration"],
+            start_day_idx=0, k_max=k,
         )
         n = _n_arcs(route)
-        assert n == k, f"LS-Oracle K={k}: solución óptima debería usar exactamente K arcos (n_arcos={n})"
+        assert n == k, f"UB-PI K={k}: solución óptima debería usar exactamente K arcos (n_arcos={n})"
+        assert route[0] == route[-1] == 0

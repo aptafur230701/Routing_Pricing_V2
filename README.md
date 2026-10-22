@@ -56,6 +56,12 @@ problem_data.py ──► matrices (tiempo, tarifa, carga, distancia, diesel, LT
                 results/<N>nodes/  (Excel + gráficos + training log)
 ```
 
+**Reglas del entorno**: el camión puede volver a pasar por un nodo intermedio dentro del tour (no hay
+registro de visitados). La máscara solo excluye el self-loop (no hay acción de esperar), los nodos desde
+los que no se alcanza a volver a casa dentro de `MAX_DURATION` y las lanes sin carga (salvo en el primer
+movimiento desde casa); volver a casa termina el episodio y con K activo el último arco es el retorno
+forzado. Las features por nodo son 7 base + 4 de continuación = 11.
+
 **Por qué el modelo escala sin reentrenar desde cero**: ninguna capa de
 `AMRoutingAgent` ni de `CriticHead` depende de `num_nodes` — el Transformer
 opera sobre conjuntos de tamaño variable. Esto es lo que permite el transfer
@@ -82,7 +88,7 @@ nodos, ver `NODE_SEQUENCE`).
 | [greedy_rollout.py](greedy_rollout.py) | Rollout greedy (argmax por nodo) sobre `VectorRoutingEnv`: evaluación del DRL en replay de días reales o en mundos simulados, baseline self-critical y monitor de entrenamiento. |
 | [debug_utils.py](debug_utils.py) | `check_tensor`: verificación de NaN/Inf en el forward pass (falla rápido en vez de silenciar con `nan_to_num`). Usado en producción por el encoder/decoder/training, no es un script de debug puntual. |
 | [transfer_learning.py](transfer_learning.py) | Warm-start de pesos entre tamaños de grafo (`NODE_SEQUENCE`). |
-| [Solvers.py](Solvers.py) | Label-setting oráculo (`solve_label_setting_oracle`), único solver que se conserva: resuelve UB-PI. |
+| [Solvers.py](Solvers.py) | DP hacia atrás de UB-PI (`solve_ub_pi`), único solver que se conserva: mejor ruta con el mundo completo conocido, estado (nodo, franja de 1 min, k). |
 | [inference.py](inference.py) | Inferencia standalone: carga un checkpoint y genera una ruta greedy desde un nodo dado. |
 
 ### Proceso exógeno de cargas y tarifas (opcional)
@@ -113,20 +119,21 @@ los mismos mundos simulados (mismo `world_seed`), paso a paso en `VectorRoutingE
 | Id | Baseline | Archivo |
 |---|---|---|
 | B1 | Greedy miope: arco válido de mayor `lane_reward` de la fila observada (PFA). | [baselines.py](baselines.py) |
-| B2 | Reoptimización determinista con valores esperados de los arcos futuros; ejecuta solo el primer arco. Con K = 5 y con K libre (CFA); con K libre la enumeración exacta solo es viable hasta ~50 nodos. | [baselines.py](baselines.py) |
-| B3 | Política de un paso sobre la tabla V de la DP relajada (VFA de tabla). | [dp_relajada.py](dp_relajada.py) |
-| UB-DP | Cota ajustada: DP en (hogar, día de salida, nodo, franja de 15 min, k) permitiendo revisitar. Tabla en `datos/ubdp_tabla_<N>nodos.npz`, se recarga si coincide con los datos. | [dp_relajada.py](dp_relajada.py) |
-| UB-PI | Cota laxa: mejor ruta con el mundo completo conocido (`sample_world` + label-setting oráculo sin poda por dominancia). | [evaluation.py](evaluation.py), [Solvers.py](Solvers.py) |
+| B2 | Reoptimización determinista con valores esperados de los arcos futuros; ejecuta solo el primer arco. Con K = 5 y con K libre (CFA). Recursión memoizada sobre (nodo, franja de 15 min, k restante) por (casa, día de salida); el camión puede revisitar nodos. | [baselines.py](baselines.py) |
+| B3 | Política de un paso sobre la tabla V de la DP de UB-DP (VFA de tabla). | [dp_relajada.py](dp_relajada.py) |
+| UB-DP | Valor óptimo aproximado de la política no anticipativa: DP en (hogar, día de salida, nodo, franja de 15 min, k), con revisitas permitidas (salvo la discretización y el muestreo con S = 500). Tabla en `datos/ubdp_tabla_<N>nodos.npz`, se recarga si coincide con los datos. | [dp_relajada.py](dp_relajada.py) |
+| UB-PI | Cota con información perfecta: mejor ruta con el mundo completo conocido (`sample_world` + DP hacia atrás con franjas de 1 min). Debe quedar por encima de UB-DP. | [evaluation.py](evaluation.py), [Solvers.py](Solvers.py) |
 
 | Archivo | Rol |
 |---|---|
 | [evaluation.py](evaluation.py) | Arnés único (`ejecutar_politica`), `evaluar_mundos_simulados` (M mundos por K ∈ {5, libre}, nodo y día de la semana balanceados), `evaluar_replay` (días reales 90-119, fuera de muestra: "replay, fuera de muestra (días 90-119)"), `resumen_metodos`, diagnósticos. |
 | [excel_report.py](excel_report.py) | Excel de resultados: hojas Resumen, Mundos simulados y Replay. |
 | [stats_analysis.py](stats_analysis.py) | Diferencia pareada DRL − baseline con IC 95 % por bootstrap, Wilcoxon pareado de una cola con Holm, y gaps contra UB-DP y UB-PI. |
-| [tests/test_baselines.py](tests/test_baselines.py) | Tabla V vs recursión ingenua, máscara, determinismo, UB-PI ≥ políticas, B3 ≤ UB-DP, margen = Σ `lane_reward`, oráculo vs enumeración, y limpieza de nombres borrados. |
+| [tests/test_baselines.py](tests/test_baselines.py) | Tabla V vs recursión ingenua, máscara, determinismo, UB-PI ≥ políticas, B3 ≤ UB-DP ≤ UB-PI, margen = Σ `lane_reward`, UB-PI alineado con el entorno, y limpieza de nombres borrados. |
+| [tests/test_revisit.py](tests/test_revisit.py) | Revisitas: la máscara de `RoutingEnv` y `VectorRoutingEnv` permite un intermedio ya recorrido, `max_pasos`, UB-PI vs fuerza bruta y B2 memoizado vs enumeración ingenua. |
 
 Las políticas solo leen la máscara, la fila observada (`current_loads_row`, `current_rate_row`),
-el nodo, la hora, `k_remaining` y los visitados, más los parámetros del proceso; ninguna ve la
+el nodo, la hora y `k_remaining`, más los parámetros del proceso; ninguna ve la
 semilla del mundo. El margen es la suma de `lane_reward` de los arcos recorridos (USD), no la
 recompensa del entorno. Los tiempos por decisión se miden en CPU con un solo hilo, también para
 el DRL.

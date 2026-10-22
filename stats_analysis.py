@@ -34,10 +34,11 @@ def etiqueta_modo(modo: str) -> str:
 
 NOTA_UB_DP_FLOJA = "UB-DP floja (> UB-PI)"
 NOTA_UB_DP_FLOJA_LARGA = (
-    "En este K la media de UB-DP supera a la de UB-PI: al permitir revisitar nodos la DP se aflojó "
-    "(p. ej. ping-pong entre nodos cercanos). UB-DP y UB-PI son cotas independientes (relajan "
-    "factibilidad e información, respectivamente); la cota DP no debe leerse como referencia "
-    "principal en este K."
+    "En este K la media de UB-DP supera a la de UB-PI. UB-DP es el valor óptimo aproximado de la "
+    "política no anticipativa y UB-PI el de información perfecta, así que UB-PI ≥ UB-DP debe "
+    "cumplirse: la diferencia indica sesgo de muestreo de la DP (máximo sobre S sorteos), la "
+    "discretización de franjas o un desajuste entre la DP y el entorno. No leer UB-DP como "
+    "referencia principal en este K."
 )
 
 

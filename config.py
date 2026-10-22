@@ -24,8 +24,8 @@ REWARD_SCALE_FACTOR    = 100.0
 RETURN_SUCCESS_BONUS   =  500.0 / REWARD_SCALE_FACTOR
 TIME_VIOLATION_PENALTY =  -3000.0 / REWARD_SCALE_FACTOR
 BIG_M_PENALTY          = -1e9
-USE_REWARD_SHAPING     = False   # True: el retorno exitoso suma RETURN_SUCCESS_BONUS + bonos por n_intermediate
-                                 # y time_util (shaping que no es margen). False: terminal_reward = 0 en el
+USE_REWARD_SHAPING     = False   # True: el retorno exitoso suma RETURN_SUCCESS_BONUS + bonos por arcos antes del
+                                 # retorno (step_count) y time_util (shaping que no es margen). False: terminal_reward = 0 en el
                                  # retorno exitoso, así que el reward del episodio es margen / REWARD_SCALE_FACTOR.
                                  # TIME_VIOLATION_PENALTY se aplica en ambos casos. Ablacionable.
 
@@ -124,10 +124,10 @@ def configurar_k(restringido: bool) -> None:
     K_TRAINING_LEVELS[:] = K_LEVELS + [None]
 
 # ── Features de continuación por nodo ────────────────────────
-USE_CONTINUATION_FEATURES = True   # True: 4 features extra por nodo j (N_NODE_FEATURES = 12) con la
+USE_CONTINUATION_FEATURES = True   # True: 4 features extra por nodo j (N_NODE_FEATURES = 11) con la
                                    # información de qué pasa después de j (tiempo y holgura de regreso a
                                    # casa, valor esperado de volver a casa y de seguir un salto más; ver
-                                   # attention_encoder.py). False: las 8 features de siempre. Ablacionable.
+                                   # attention_encoder.py). False: las 7 features base. Ablacionable.
 
 # ── Train / eval split ───────────────────────────────────────
 TRAIN_DAYS = 90   # días usados para entrenamiento; el resto (días 90-119) queda para evaluación
@@ -174,9 +174,12 @@ def get_val_worlds(num_nodes: int) -> int:
 
 
 # ── Baselines (baselines_drl_ruteo_estocastico.md) ───────────
-# UB-DP / B3: programación dinámica sobre (hogar, día de salida, nodo, franja, k) sin la regla
-# de no revisitar. La tabla V se guarda en disco y se recarga si ya existe y coincide.
-UBDP_DT_HORAS   = 0.25    # paso de tiempo de la DP (franjas de 15 min; tiempos de viaje redondeados hacia abajo)
+# UB-DP / B3: programación dinámica sobre (hogar, día de salida, nodo, franja, k). El camión puede
+# revisitar nodos, así que el estado no lleva visitados. La tabla V se guarda en disco y se recarga
+# si ya existe y coincide.
+UBDP_DT_HORAS   = 0.25    # paso de tiempo de la DP (franjas de 15 min; tiempos de viaje redondeados hacia abajo);
+                          # también lo usa B2
+UBPI_DT_HORAS   = 1.0 / 60.0   # paso de tiempo de la DP hacia atrás de UB-PI (franjas de 1 min; redondeo hacia abajo)
 UBDP_S          = 500     # sorteos de filas por par (nodo, día de la semana)
 UBDP_SEED       = 20261018   # semilla del Generator propio de la DP
 UBDP_TABLA_PATH = "datos/ubdp_tabla_{n}nodos.npz"   # relativo a la raíz del proyecto; {n} = nº de nodos

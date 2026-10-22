@@ -1,291 +1,135 @@
 """
 Solvers.py
 ==========
-Único solver que se conserva: el label-setting oráculo, que resuelve la mejor
-ruta con el mundo completo conocido (UB-PI, ver dp_relajada.py y evaluation.py).
-Los demás baselines viven en baselines.py y dp_relajada.py.
+UB-PI (ver dp_relajada.py y evaluation.py): cota con información perfecta. Resuelve la mejor ruta
+con el mundo completo conocido mediante una DP hacia atrás. Los demás baselines viven en
+baselines.py y dp_relajada.py.
 """
 
 import numpy as np
-from collections import namedtuple
+
+from config import UBPI_DT_HORAS
+from problem_data import lane_reward
+from routing_env import max_pasos
 
 # ── Constantes de dominio ─────────────────────────────────────────────────────
 DAYS_PER_PERIOD = 14            # día de mercado:  day_idx = start + int(t // 14)
 
-# ── Tipos de resultado (namedtuple: soportan desempaquetado por tupla) ────────
-RewardResult = namedtuple("RewardResult", "reward duration")
 
-
-def _day_index(start_day_idx, time_elapsed, max_day):
-    """Índice de día de mercado para un tiempo transcurrido."""
-    return min(start_day_idx + int(time_elapsed // DAYS_PER_PERIOD), max_day)
-
-
-def _make_rm_cache(rate_stack, loads_stack, distance_arr, diesel_arr,
-                   start_day_idx, max_day, as_numpy=True):
-    """Devuelve un closure get_rm(t) que construye y cachea (por llamada) la
-    matriz de reward del día correspondiente a `t`.
-
-    as_numpy=True  → np.ndarray float64 (copia explícita).
-    as_numpy=False → np.ndarray directo de build_day_matrices (sin copia).
-    """
-    from problem_data import build_day_matrices
-    cache = {}
-
-    def get_rm(time_elapsed):
-        day_idx = _day_index(start_day_idx, time_elapsed, max_day)
-        if day_idx not in cache:
-            _, rm_pen = build_day_matrices(
-                rate_stack[day_idx], loads_stack[day_idx], distance_arr, diesel_arr
-            )
-            cache[day_idx] = np.array(rm_pen, dtype=float) if as_numpy else rm_pen
-        return cache[day_idx]
-
-    return get_rm
-
-
-def simulate_route_reward(
-    route, start_node, start_day_idx,
-    time_matrix_np, rate_stack, loads_stack,
-    distance_arr, diesel_arr,
-    lane_filter=False,
+def solve_ub_pi(
+    start_node, time_matrix, rates, loads, distance_arr, diesel_arr, max_d,
+    start_day_idx=0, k_max=None, dt=UBPI_DT_HORAS,
 ):
-    """Compute the actual reward for a fixed route using sequential arrival days
-    and the same lane-availability filter as RoutingEnv.
+    """Mejor ruta con el mundo completo conocido (UB-PI): DP hacia atrás con estado (nodo, franja, k).
 
-    Replicates RoutingEnv exactly:
-    - day_idx = min(start_day_idx + int(time_elapsed // 14), max_day)
-    - draw_lane_availability(
-        i, day_idx, loads_stack,
-    )
-      applied on every arc except those departing from or arriving at start_node,
-      matching the skip-condition "current_node != start_node" in
-      RoutingEnv._get_action_mask.
-    - If a lane is blocked (lane_exists[j] == 0), that arc yields 0 reward
-      (no cargo to haul).
+    El camión puede volver a pasar por un nodo, así que el estado no lleva visitados. Las
+    reglas de factibilidad son las del entorno: lane con carga en la fila del día salvo en el
+    primer movimiento desde casa, retorno a casa posible dentro de `max_d`, retorno forzado
+    con k = 1, y valor terminal 0 al volver a casa. Es información perfecta, no una política:
+    ninguna política causal posee la disponibilidad de los nodos aún no visitados.
 
-    If lane_filter is False, no lane filtering is applied (deterministic world).
+    rates, loads : (D, N, N) del mundo (`sample_world`, día 0 = día de salida con start_day_idx = 0)
+        o del histórico completo con `start_day_idx`; los días posteriores al último se recortan
+        al último, como el entorno en el replay.
+    k_max : presupuesto de cardinalidad (nº de arcos, incluido el retorno); None = caso libre
+        (sin dimensión k; los tiempos de viaje son ≥ 1 franja, así que la recursión es hacia atrás en s).
+    dt : franja de tiempo en horas. Los tiempos de viaje se redondean hacia abajo a la franja
+        (nunca se pierde una ruta factible, pero una ruta puede caber en la DP y exceder
+        `max_d` en unos minutos); el día de una salida en la franja s es
+        start_day_idx + floor(s·dt / 14), recortado al último día del mundo.
+
+    La recompensa de salir de i en la franja s es `lane_reward` de la fila de ese día. El
+    redondeo acumula hasta una franja por arco, así que el tiempo real de una salida en la franja
+    s puede ser hasta max_pasos franjas mayor y caer en el día siguiente. Para que UB-PI siga
+    siendo cota con rutas largas, en las franjas que quedan a menos de max_pasos franjas antes de
+    una frontera de día la recompensa es el máximo elemento a elemento de las filas de los dos
+    días posibles y la lane existe si existe en alguno de los dos.
+
+    Retorna (valor, ruta) con ruta = [casa, ..., casa], o (nan, None) si no hay ruta factible.
     """
-    from problem_data import draw_lane_availability
+    T = np.asarray(time_matrix, dtype=float)
+    N = T.shape[0]
+    h = int(start_node)
+    if k_max is not None and k_max < 2:
+        return float("nan"), None
 
-    if route is None or len(route) < 2:
-        return RewardResult(-np.inf, np.inf)
+    f = np.floor(T / dt + 1e-9).astype(np.int64)             # franjas de viaje, redondeo hacia abajo
+    if f[~np.eye(N, dtype=bool)].min() < 1:
+        raise ValueError("Hay tiempos de viaje menores a una franja: la recursión del caso libre no "
+                         "estaría bien fundada. Reduce dt.")
+    smax = int(np.floor(max_d / dt + 1e-9))
+    Ns = smax + 1
 
-    max_day   = rate_stack.shape[0] - 1
-    num_nodes = distance_arr.shape[0]
-    # Caché compartido en modo DataFrame: simulate_route_reward indexa con
-    # rm.iloc[i, j], por lo que necesita el DataFrame (as_numpy=False).
-    _get_rm = _make_rm_cache(rate_stack, loads_stack, distance_arr, diesel_arr,
-                             start_day_idx, max_day, as_numpy=False)
+    rates = np.asarray(rates)
+    loads = np.asarray(loads)
+    D = loads.shape[0]
+    R = lane_reward(rates, loads, np.asarray(distance_arr, dtype=float)[None],
+                    np.asarray(diesel_arr, dtype=float)[None])             # (D, N, N)
+    A = loads > 0
+    def dia_de(franjas):
+        return np.minimum(start_day_idx + np.floor(franjas * dt / DAYS_PER_PERIOD + 1e-9).astype(np.int64), D - 1)
 
-    time_elapsed = 0.0
-    total_reward = 0.0
+    deriva = max_pasos(T, max_d)                                           # franjas que el redondeo puede acumular
+    dia = dia_de(np.arange(Ns))                                            # (Ns,) día de cada franja
+    dia_tarde = dia_de(np.arange(Ns) + deriva)                             # día si la llegada real se atrasó al máximo
+    por_dias = {}
 
-    for step in range(len(route) - 1):
-        i       = route[step]
-        j       = route[step + 1]
-        day_idx = _day_index(start_day_idx, time_elapsed, max_day)
-        rm      = _get_rm(time_elapsed)
-        arc_r   = float(rm[i, j])
+    def filas_de(s):
+        """(R, A) de la salida en la franja s: la fila del día, o la envolvente de los dos días posibles."""
+        d, e = int(dia[s]), int(dia_tarde[s])
+        if (d, e) not in por_dias:
+            por_dias[(d, e)] = (R[d], A[d]) if d == e else (np.maximum(R[d], R[e]), A[d] | A[e])
+        return por_dias[(d, e)]
 
-        # Mirror RoutingEnv: skip lane filtering when departing from or
-        # arriving at start_node (those arcs are always available).
-        if (lane_filter
-                and i != start_node
-                and j != start_node):
-            lane_exists = draw_lane_availability(
-                i, day_idx, loads_stack,
-            )
-            if lane_exists[j] == 0:
-                arc_r = 0.0
+    jj = np.arange(N)[None, :]
+    destino = ~np.eye(N, dtype=bool) & (np.arange(N)[None, :] != h)        # j ≠ i y j ≠ h (el retorno va aparte)
+    lim = smax - (f + f[:, h][None, :])                                    # (N, N): s + f_ij + f_jh ≤ smax ⇔ s ≤ lim
 
-        total_reward += arc_r
-        time_elapsed += float(time_matrix_np[i][j])
-
-    return RewardResult(total_reward, time_elapsed)
-
-
-def _label_setting_core_stochastic(
-    start_node, time_matrix_np, rate_stack, loads_stack,
-    distance_arr, diesel_arr, max_d, num_n, start_day_idx,
-    time_limit_seconds=None,
-    k_max=None,
-    dominancia=True,
-):
-    """Label Setting DP for the Orienteering Problem with lane filtering.
-
-    Filters arc expansions using draw_lane_availability (same lane availability
-    as RoutingEnv and simulate_route_reward). The return-to-depot closure is
-    never filtered.
-
-    State: (current_node, visited_bitmask, time_elapsed, reward).
-
-    k_max : presupuesto de cardinalidad (nº de arcos, incluido el retorno). Se aplica
-        filtrando la generación de labels: popcount(new_mask) es el total de arcos si se
-        cerrara desde el nuevo label, y solo crece con cada expansión.
-
-    dominancia : True (default) poda labels dominados en (tiempo, reward) dentro del mismo
-        (nodo, visitados). Esa poda solo es exacta si la recompensa de un arco no depende
-        del día de llegada; en un mundo simulado con filas distintas por día, un label más
-        temprano puede ver peores filas después y la poda puede descartar el óptimo (en 1 de
-        300 mundos de 35 nodos el oráculo con poda quedó 56 USD bajo el óptimo). Con
-        dominancia=False se enumeran todas las rutas sin revisitar: exacto en cualquier
-        mundo, y barato porque MAX_DURATION deja pocas rutas factibles.
-
-    Returns (route, reward, duration, timed_out).
-    """
-    import time as _time
-    from collections import deque
-    from problem_data import build_day_matrices, draw_lane_availability
-
-    max_day = rate_stack.shape[0] - 1
-    deadline = (_time.time() + time_limit_seconds) if time_limit_seconds is not None else None
-
-    _rm_cache = {}
-    def _get_rm(t_elapsed):
-        day_idx = min(start_day_idx + int(t_elapsed // DAYS_PER_PERIOD), max_day)
-        if day_idx not in _rm_cache:
-            _, rm_pen = build_day_matrices(
-                rate_stack[day_idx], loads_stack[day_idx], distance_arr, diesel_arr
-            )
-            _rm_cache[day_idx] = np.array(rm_pen, dtype=float)
-        return _rm_cache[day_idx]
-
-    start_mask = 1 << start_node
-    all_labels = [[start_node, start_mask, 0.0, 0.0, None]]
-    open_q = deque([0])
-    valid_ids = {0}
-
-    pareto = {(start_node, start_mask): [(0.0, 0.0, 0)]}
-
-    best_close = None
-    timed_out = False
-
-    while open_q:
-        if deadline is not None and _time.time() > deadline:
-            timed_out = True
-            break
-
-        idx = open_q.popleft()
-        if idx not in valid_ids:
+    # V[k, s, i]: valor de estar en i en la franja s con k arcos restantes (k = 1: solo retorno).
+    # Caso libre: una sola tabla W[s, i] sin k.
+    niveles = 1 if k_max is None else k_max - 1                            # tablas necesarias: k = 1..K-1
+    V = np.zeros((niveles + 1, Ns, N))
+    for s in range(smax, -1, -1):
+        Rd, Ad = filas_de(s)
+        ret = Rd[:, h]                                                     # volver a casa: siempre disponible
+        ok = Ad & destino & (s <= lim)
+        sn = np.minimum(s + f, smax)
+        if k_max is None:
+            V[1, s] = ret if not ok.any() else np.maximum(
+                ret, np.where(ok, Rd + V[1][sn, jj], -np.inf).max(axis=1))
             continue
+        V[1, s] = ret
+        if ok.any():
+            for k in range(2, niveles + 1):
+                V[k, s] = np.maximum(ret, np.where(ok, Rd + V[k - 1][sn, jj], -np.inf).max(axis=1))
+        else:
+            for k in range(2, niveles + 1):
+                V[k, s] = ret
 
-        cur_node, visited_mask, t_el, rew, _par = all_labels[idx]
-        rm_cur = _get_rm(t_el)
+    # Raíz: primer movimiento desde casa en la franja 0, sin máscara de lane.
+    k_sig = niveles                                                        # tabla de k − 1 arcos restantes
+    R0 = filas_de(0)[0][h]
+    ok0 = destino[h] & (f[h] + f[:, h] <= smax)
+    if not ok0.any():
+        return float("nan"), None
+    cand0 = np.where(ok0, R0 + V[k_sig][np.minimum(f[h], smax), np.arange(N)], -np.inf)
+    j = int(np.argmax(cand0))
+    valor = float(cand0[j])
 
-        arrival_day = _day_index(start_day_idx, t_el, max_day)
-        lane_exists = draw_lane_availability(
-            cur_node, arrival_day, loads_stack,
-        )
-
-        for next_node in range(num_n):
-            if (visited_mask >> next_node) & 1:
-                continue
-            if cur_node != start_node and lane_exists[next_node] != 1:
-                continue
-
-            travel = float(time_matrix_np[cur_node, next_node])
-            new_t  = t_el + travel
-            ret_t  = float(time_matrix_np[next_node, start_node])
-
-            if new_t + ret_t > max_d:
-                continue
-
-            new_mask = visited_mask | (1 << next_node)
-            if k_max is not None and bin(new_mask).count("1") > k_max:
-                continue   # excedería K arcos incluso cerrando de inmediato
-
-            arc_r    = rm_cur[cur_node, next_node]
-            new_r    = rew + arc_r
-            new_state = (next_node, new_mask)
-
-            front = pareto.get(new_state, []) if dominancia else []
-            dominated = False
-            for (et, er, _) in front:
-                if et <= new_t and er >= new_r and (et < new_t or er > new_r):
-                    dominated = True
-                    break
-            if dominated:
-                continue
-
-            surviving = []
-            for (et, er, eid) in front:
-                if new_t <= et and new_r >= er and (new_t < et or new_r > er):
-                    valid_ids.discard(eid)
-                else:
-                    surviving.append((et, er, eid))
-
-            new_idx = len(all_labels)
-            all_labels.append([next_node, new_mask, new_t, new_r, idx])
-            valid_ids.add(new_idx)
-            surviving.append((new_t, new_r, new_idx))
-            pareto[new_state] = surviving
-            open_q.append(new_idx)
-
-            # Return to depot is never filtered — always available.
-            rm_close = _get_rm(new_t)
-            close_r  = new_r + rm_close[next_node, start_node]
-            close_t  = new_t + ret_t
-            if best_close is None or close_r > best_close[0]:
-                best_close = (close_r, close_t, new_idx)
-
-    if best_close is None:
-        return None, -np.inf, np.inf, timed_out
-
-    close_r, close_t, last_idx = best_close
-    path = []
-    cur = last_idx
-    while cur is not None:
-        path.append(all_labels[cur][0])
-        cur = all_labels[cur][4]
-    path.reverse()
-    route = path + [start_node]
-
-    return route, close_r, close_t, timed_out
-
-
-def solve_label_setting_oracle(
-    start_node, time_matrix_np, rate_stack, loads_stack,
-    distance_arr, diesel_arr, max_d, num_n, start_day_idx,
-    time_limit_seconds=None,
-    k_max=None,
-    dominancia=True,
-):
-    """Cota superior clarividente (posterior bound) para el mundo estocástico.
-
-    Resuelve el Orienteering Problem de forma exacta vía Label Setting DP,
-    pero con la disponibilidad de cada arco ya revelada de antemano
-    (mismo criterio que RoutingEnv). Esto le da al solver información que ninguna
-    política causal real posee al momento de decidir — por lo tanto este valor
-    es un upper bound informacional, NO el óptimo de política (Bellman-óptimo)
-    del MDP estocástico. Sirve como techo de referencia para el Bloque 2.
-
-    k_max : int | None — presupuesto de cardinalidad (ver _label_setting_core_stochastic).
-        None (default) = caso libre.
-    dominancia : ver _label_setting_core_stochastic. UB-PI (evaluation.ub_pi) lo usa en
-        False para que la cota sea exacta con recompensas que dependen del día.
-
-    Returns (status, route, total_reward, total_duration).
-    status: "Optimal" | "Time-Limited" | "Infeasible".
-    """
-    route, _label_r, _label_d, timed_out = _label_setting_core_stochastic(
-        start_node, time_matrix_np, rate_stack, loads_stack,
-        distance_arr, diesel_arr, max_d, num_n, start_day_idx,
-        time_limit_seconds=time_limit_seconds,
-        k_max=k_max,
-        dominancia=dominancia,
-    )
-
-    if route is None:
-        return "Infeasible", None, -np.inf, np.inf
-
-    # Re-evaluar canónicamente con la MISMA semilla de disponibilidad,
-    # para paridad bit-exact con el entorno.
-    total_reward, total_duration = simulate_route_reward(
-        route, start_node, start_day_idx,
-        time_matrix_np, rate_stack, loads_stack, distance_arr, diesel_arr,
-        lane_filter=True,
-    )
-
-    status = "Time-Limited" if timed_out else "Optimal"
-    return status, route, total_reward, total_duration
+    # Traza hacia adelante: en cada estado se elige la opción que alcanza V (el retorno si empata).
+    ruta, s, k = [h, j], int(f[h, j]), k_sig
+    while k_max is None or k > 1:
+        Rd, Ad = filas_de(s)
+        ok = Ad[j] & destino[j] & (s <= lim[j])
+        if not ok.any():
+            break
+        sn = np.minimum(s + f[j], smax)
+        cand = np.where(ok, Rd[j] + V[1 if k_max is None else k - 1][sn, np.arange(N)], -np.inf)
+        l = int(np.argmax(cand))
+        if cand[l] <= Rd[j, h]:
+            break
+        ruta.append(l)
+        j, s = l, s + int(f[j, l])
+        k = k if k_max is None else k - 1
+    ruta.append(h)
+    return valor, ruta

@@ -10,7 +10,8 @@ y el arnés de evaluación en mundos simulados.
   · En cada mundo, UB-PI es mayor o igual que el margen de cada política.
   · El promedio de B3 no supera UB-DP más su error de Monte Carlo.
   · El margen coincide con la suma de lane_reward de la ruta (recalculada sobre sample_world).
-  · El oráculo está alineado con el entorno y, sin poda por dominancia, es exacto.
+  · UB-PI está alineado con el entorno: el entorno acepta su ruta y el arnés mide su margen.
+    (UB-PI contra fuerza bruta, B2 contra enumeración ingenua y la máscara con revisitas: test_revisit.py.)
   · Ningún nombre borrado sigue referenciado en el repositorio.
 """
 
@@ -32,7 +33,6 @@ from dp_relajada import calcular_tabla, _sortear_filas
 import evaluation as ev
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices, lane_reward
-from Solvers import solve_label_setting_oracle
 import stats_analysis as st
 
 RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -153,7 +153,7 @@ def test_b1_desempata_por_indice_menor(inst10):
     mascara = np.zeros(n, dtype=np.int8)
     mascara[[2, 5, 7]] = 1
     obs = Observacion(
-        nodo=0, casa=0, tiempo=0.0, k_restante=None, visitados=np.eye(n, dtype=bool)[0],
+        nodo=0, casa=0, tiempo=0.0, k_restante=None,
         mascara=mascara, loads_row=np.zeros(n), rate_row=np.zeros(n), dia_semana_salida=0,
     )
     # Sin cargas la recompensa es -costo; con distancias distintas gana la lane más barata.
@@ -172,13 +172,11 @@ def test_b2_libre_equivale_a_un_tope_de_cardinalidad_inalcanzable(inst10):
     pol = PoliticaB2(inst10.market, inst10.T, inst10.dist, inst10.diesel)
     rng = np.random.default_rng(3)
     for nodo in range(n):
-        vis = np.zeros(n, dtype=bool)
-        vis[nodo] = True
         mascara = np.ones(n, dtype=np.int8)
         mascara[nodo] = 0
         loads_row = rng.integers(0, 4, size=n).astype(float)
         rate_row = rng.uniform(1.5, 3.0, size=n)
-        kw = dict(nodo=nodo, casa=nodo, tiempo=0.0, visitados=vis, mascara=mascara,
+        kw = dict(nodo=nodo, casa=nodo, tiempo=0.0, mascara=mascara,
                   loads_row=loads_row, rate_row=rate_row, dia_semana_salida=2)
         libre = pol.actuar(Observacion(k_restante=None, **kw))
         grande = pol.actuar(Observacion(k_restante=n + 5, **kw))
@@ -220,14 +218,17 @@ def test_b3_no_supera_ub_dp_mas_error_monte_carlo(sim10):
         dif = (g["margen"] - g["ub_dp"]).to_numpy()
         se = dif.std(ddof=1) / np.sqrt(len(dif))
         assert dif.mean() <= 3.0 * se, f"K={k}: B3 − UB-DP = {dif.mean():.1f} > 3·{se:.1f}"
-        # La cota tampoco puede quedar por debajo del mejor baseline por una distancia grande.
+        # UB-DP no puede quedar por debajo del mejor baseline por una distancia grande.
         assert g["ub_dp"].mean() >= g["margen"].mean() - 3.0 * se
+        # La información perfecta rinde al menos lo que el óptimo no anticipativo (en promedio).
+        mundos = sim10[(sim10["K"] == k) & (sim10["metodo"] == "B3")]
+        assert mundos["ub_pi"].mean() >= mundos["ub_dp"].mean(), (
+            f"K={k}: UB-PI {mundos['ub_pi'].mean():.1f} < UB-DP {mundos['ub_dp'].mean():.1f}")
 
 
-def test_b3_alcanza_ub_dp_cuando_la_relajacion_es_exacta(inst35):
-    """Con K = 2 (casa → j → casa) no se puede revisitar nada: la relajación es exacta, así que
-    B3 es la política óptima y su promedio debe coincidir con UB-DP salvo error de muestreo.
-    (Con K ≥ 4 la DP puede hacer ping-pong entre dos nodos y UB-DP se afloja.)"""
+def test_b3_alcanza_ub_dp_con_k_2(inst35):
+    """Con K = 2 (casa → j → casa) la DP es exacta: B3 es la política óptima y su promedio debe
+    coincidir con UB-DP salvo error de muestreo (V es optimista: máximo sobre S sorteos)."""
     ctx = ev.ContextoEval(inst35.agent, inst35.market, inst35.tabla, inst35.tm, inst35.dist,
                           inst35.diesel, inst35.n, inst35.ltr, inst35.trucks, inst35.avail, inst35.p95)
     env = ev.make_sim_env(inst35.tm, inst35.rate[:TRAIN_DAYS], inst35.loads[:TRAIN_DAYS],
@@ -266,31 +267,13 @@ def test_margen_es_suma_de_lane_reward_de_la_ruta(inst10, sim10):
 # Oráculo: alineación con el entorno y exactitud
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _enumeracion_exacta(h, loads, rates, K, inst):
-    """Mejor margen sobre todas las rutas sin revisitar, con las reglas de la máscara del entorno."""
-    n, T = inst.n, inst.T
-    mejor = [-np.inf]
-
-    def rec(cur, el, vis, acc, arcs):
-        d = int(el // 14)
-        r = lane_reward(rates[d, cur], loads[d, cur], inst.dist[cur], inst.diesel[cur])
-        if cur != h and el + T[cur, h] <= MAX_DURATION:
-            mejor[0] = max(mejor[0], acc + r[h])
-        if K is not None and arcs + 1 >= K:
-            return
-        for j in range(n):
-            if vis >> j & 1 or (cur != h and loads[d, cur, j] <= 0):
-                continue
-            if el + T[cur, j] + T[j, h] > MAX_DURATION:
-                continue
-            rec(j, el + T[cur, j], vis | 1 << j, acc + r[j], arcs + 1)
-
-    rec(h, 0.0, 1 << h, 0.0, 0)
-    return mejor[0]
-
-
 @pytest.mark.parametrize("nombre", ["inst10", "inst35"])
-def test_oraculo_alineado_con_el_entorno_y_exacto(nombre, request):
+def test_ub_pi_alineado_con_el_entorno(nombre, request):
+    """El entorno acepta la ruta de UB-PI y su margen no supera el valor de UB-PI.
+
+    UB-PI redondea los tiempos hacia abajo (franjas de 1 min) y usa la envolvente de días cerca de
+    las fronteras, así que su ruta puede exceder MAX_DURATION en unos minutos (entonces el entorno
+    no la permite) y su valor puede ser mayor que el margen de la propia ruta; nunca menor."""
     inst = request.getfixturevalue(nombre)
     env = ev.make_sim_env(inst.tm, inst.rate[:TRAIN_DAYS], inst.loads[:TRAIN_DAYS],
                           inst.dist, inst.diesel, inst.n, inst.market)
@@ -300,18 +283,15 @@ def test_oraculo_alineado_con_el_entorno_y_exacto(nombre, request):
         dia, ws = int(dis["start_day"][m]), int(dis["world_seed"][m])
         loads, rates = inst.market.sample_world(ws, 6, dia)
         for K in (K_MAX, None):
-            _, ruta, rew, _ = solve_label_setting_oracle(
-                h, inst.T, rates, loads, inst.dist, inst.diesel, MAX_DURATION, inst.n,
-                start_day_idx=0, k_max=K, dominancia=False,
-            )
-            # Exacto: coincide con la enumeración de todas las rutas.
-            assert rew == pytest.approx(_enumeracion_exacta(h, loads, rates, K, inst), abs=1e-6)
-            # Alineado: el entorno acepta la ruta del oráculo (día de llegada y máscara) y
-            # el margen que mide el arnés es el del oráculo.
+            rew, ruta = ev.ub_pi(inst.market, inst.T, inst.dist, inst.diesel, inst.n, h, K, (loads, rates))
+            duracion = sum(inst.T[a, b] for a, b in zip(ruta[:-1], ruta[1:]))
+            if duracion > MAX_DURATION:
+                assert duracion - MAX_DURATION < (len(ruta) - 1) / 60.0       # a lo sumo una franja por arco
+                continue
             res = ev.ejecutar_politica(ev._PoliticaRuta(ruta), env, h, dia, K, ws,
                                        inst.dist, inst.diesel, dow)
             assert not res["violacion"] and res["ruta"] == ruta
-            assert res["margen"] == pytest.approx(rew, abs=1e-6)
+            assert res["margen"] <= rew + 1e-6
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -396,6 +376,8 @@ _NOMBRES_BORRADOS = [
     r"solve_HGA_LNS_metaheuristic", r"solve_label_setting_exact", r"solve_heuristic_rolling_horizon\w*",
     r"solve_mc_rollout_stochastic", r"run_solver_comparison\w*", r"N_DAYS_PER_NODE",
     r"solve_heuristic\b", r"_label_setting_core\b", r"_close_cycle_and_finalize", r"_rh_greedy_stoch_from_state",
+    r"solve_label_setting_oracle", r"_label_setting_core_stochastic", r"simulate_route_reward",
+    r"\bvisited_(set|mask)\b", r"_visited_(set|mask)\b",
     r"_repair_route_lns_best_position", r"_generate_route_nearest_neighbor", r"_generate_random_feasible_route",
     r"_crossover_routes", r"_apply_2opt_mutation", r"_apply_lns_mutation", r"\bRHResult\b", r"\bMetaResult\b",
     r"DRL Det\b", r"\bLS-Exact\b", r"\bHGA-LNS\b", r"\bMC-Rollout\b", r"RH-Greedy", r"RH-Lookahead",

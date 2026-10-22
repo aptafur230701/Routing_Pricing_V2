@@ -1,17 +1,24 @@
 """
 dp_relajada.py
 ==============
-UB-DP y B3 (baselines_drl_ruteo_estocastico.md): programación dinámica que permite
-revisitar nodos intermedios, de modo que el estado deja de incluir el conjunto de
-visitados.
+UB-DP y B3 (baselines_drl_ruteo_estocastico.md): programación dinámica sobre el estado
+(nodo, hora, k). El camión puede revisitar nodos intermedios, así que el estado no lleva el
+conjunto de visitados y la ecuación de Bellman es la del problema, no una relajación de él.
 
     V(i, t, k) = E_ω [ max_{j ∈ A(i,t,k,ω)}  r_ij(ω) + V(j, t + τ_ij, k − 1) ]
 
 ω = (loads_row, rate_row) que sortea `MarketProcess.sample_arrivals` al llegar a i;
-A son los destinos factibles según las reglas de la máscara del entorno, salvo los
-visitados: lane con carga, retorno a casa posible dentro de MAX_DURATION y retorno
-forzado cuando queda un arco. Volver a casa da la recompensa del arco y termina con
-valor cero. La recompensa es `lane_reward`, sin shaping.
+A son los destinos factibles según las reglas de la máscara del entorno: lane con carga,
+retorno a casa posible dentro de MAX_DURATION y retorno forzado cuando queda un arco.
+Volver a casa da la recompensa del arco y termina con valor cero. La recompensa es
+`lane_reward`, sin shaping.
+
+UB-DP es, por tanto, el valor óptimo aproximado de la política no anticipativa (salvo la
+discretización de 15 min y el muestreo con S = 500 sorteos). Una diferencia menor con el
+entorno: allí, volver al mismo nodo el mismo día ve la MISMA fila del mundo (es función de
+la semilla del mundo, el nodo y el día), mientras que la DP sortea una fila nueva en cada
+llegada. UB-PI (Solvers.solve_ub_pi) es la cota con información perfecta y debe quedar por
+encima de UB-DP.
 
 Estado de la tabla: V[k, d0, h, j, s]
   · k  : arcos restantes (incluido el retorno); solo en la tabla de K fijo.
@@ -22,10 +29,10 @@ Estado de la tabla: V[k, d0, h, j, s]
   · j  : nodo actual (tras sortear la fila de llegada).
   · s  : franja de tiempo, t = s · dt.
 
-Cotas: los tiempos de viaje se redondean hacia abajo a la franja (redondear hacia arriba
-eliminaría rutas factibles), por lo que la cota es aproximada: una llegada puede adelantarse
-al día anterior. Con S sorteos por estado, el error de muestreo dentro del máximo sesga V
-hacia arriba, que es conservador para una cota.
+Discretización y muestreo: los tiempos de viaje se redondean hacia abajo a la franja
+(redondear hacia arriba eliminaría rutas factibles); por eso el valor es aproximado: una
+llegada puede adelantarse al día anterior. Con S sorteos por estado, el error de muestreo
+dentro del máximo sesga V ligeramente hacia arriba.
 
 El primer movimiento desde casa no aplica la máscara de lanes (se puede salir hacia una
 lane sin carga), por eso V0[k, d0, h] se calcula aparte, con la fila sorteada en h y todos
@@ -89,7 +96,7 @@ class TablaDP:
     # ── UB-DP ────────────────────────────────────────────────────────────────
 
     def ub_dp(self, nodo_inicio: int, dia_semana: int, K=None) -> float:
-        """Cota superior UB-DP del valor de la mejor política no anticipativa.
+        """UB-DP: valor óptimo aproximado de la mejor política no anticipativa.
 
         K = None → caso libre; K = entero → tabla de K arcos (K ≤ K de la tabla).
         """
@@ -229,7 +236,7 @@ def _raiz(V_prev, R, f, smax, dev):
 
 def calcular_tabla(market, time_matrix, distance_arr, diesel_arr, K=K_MAX,
                    S=UBDP_S, dt=UBDP_DT_HORAS, seed=UBDP_SEED, device=None) -> TablaDP:
-    """Calcula V (K fijo y caso libre) y V0 con la ecuación de Bellman de la relajación."""
+    """Calcula V (K fijo y caso libre) y V0 con la ecuación de Bellman del problema."""
     dev = device or DEVICE
     N = market.num_nodes
     T = np.asarray(time_matrix, dtype=float)

@@ -10,7 +10,7 @@ Evaluación posterior al entrenamiento (baselines_drl_ruteo_estocastico.md):
 
 Arnés único: todas las políticas se ejecutan paso a paso en `VectorRoutingEnv` (B = 1) con
 la misma interfaz. Una política solo lee la máscara, la fila observada de cargas y tarifas,
-el nodo actual, la hora, k restante y los visitados (`baselines.Observacion`); el mismo
+el nodo actual, la hora y k restante (`baselines.Observacion`); el mismo
 `world_seed` da números aleatorios comunes y la no anticipatividad queda garantizada por
 construcción. `sample_world` se usa solo para UB-PI.
 
@@ -37,7 +37,7 @@ from dp_relajada import PoliticaB3
 from greedy_rollout import greedy_rollout
 from problem_data import build_rm_pen_stack, lane_reward
 from routing_env import VectorRoutingEnv
-from Solvers import solve_label_setting_oracle
+from Solvers import solve_ub_pi
 from stats_analysis import gap_pct, ic_bootstrap_media, ub_dp_floja, NOTA_UB_DP_FLOJA
 
 _DIAS_SIMULADOS_UB_PI = 6   # 77 h = 5,5 días de mercado: 6 días cubren cualquier ruta
@@ -189,7 +189,7 @@ def ejecutar_politica(politica, env, start_node, start_day_idx, k_max, world_see
     n_cargas = n_dec = 0
     t_dec = 0.0
     cerro = False
-    for _ in range(N + 1):
+    for _ in range(env.max_steps):
         mascara = masks[0]
         if not mascara.any():
             break                                         # sin acción factible (no cierra el ciclo)
@@ -202,7 +202,7 @@ def ejecutar_politica(politica, env, start_node, start_day_idx, k_max, world_see
         obs = Observacion(
             nodo=i, casa=int(start_node), tiempo=float(env.time_elapsed[0]),
             k_restante=int(env.k_remaining[0]) if env.k_restricted[0] else None,
-            visitados=env.visited_mask[0].copy(), mascara=mascara.copy(),
+            mascara=mascara.copy(),
             loads_row=loads_row, rate_row=rate_row, dia_semana_salida=int(dow0),
         )
         t0 = time.perf_counter()
@@ -291,23 +291,22 @@ def _ejecutar_drl(ctx, env, nodo, dia, K, world_seed, dow0, loads_stack=None, ra
 
 def ub_pi(market, time_matrix, distance_arr, diesel_arr, num_nodes, start_node, K,
           mundo, start_day_idx=0) -> tuple:
-    """UB-PI: mejor ruta con el mundo completo conocido, vía label-setting oráculo.
+    """UB-PI: mejor ruta con el mundo completo conocido, vía DP hacia atrás (Solvers.solve_ub_pi).
 
-    Se resuelve sin poda por dominancia (dominancia=False): con recompensas que dependen del
-    día de llegada la poda de (tiempo, reward) puede descartar el óptimo y la cota dejaría
-    de serlo.
+    Estado (nodo, franja de UBPI_DT_HORAS, k): el camión puede revisitar nodos, así que no hay
+    conjunto de visitados. La recompensa de salir de un nodo en una franja usa la fila del día
+    de esa franja del mundo, con las mismas reglas de factibilidad que el entorno.
 
     mundo = (loads [D, N, N], rate [D, N, N]) con el día 0 = día de salida (sample_world) o
     el stack histórico completo con start_day_idx. Devuelve (margen, ruta); (nan, None) si
     no hay ruta factible.
     """
     loads, rates = mundo
-    _, ruta, reward, _ = solve_label_setting_oracle(
+    valor, ruta = solve_ub_pi(
         start_node, np.asarray(time_matrix, dtype=float), rates, loads,
-        distance_arr, diesel_arr, MAX_DURATION, num_nodes,
-        start_day_idx=start_day_idx, k_max=K, dominancia=False,
+        distance_arr, diesel_arr, MAX_DURATION, start_day_idx=start_day_idx, k_max=K,
     )
-    return (float(reward), ruta) if ruta is not None else (float("nan"), None)
+    return (float(valor), ruta) if ruta is not None else (float("nan"), None)
 
 
 def _etiqueta_k(K) -> str:

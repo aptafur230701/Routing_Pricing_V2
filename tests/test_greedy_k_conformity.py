@@ -24,8 +24,8 @@ from greedy_rollout import greedy_rollout
 from problem_data import build_rm_pen_stack
 from routing_env import RoutingEnv, VectorRoutingEnv
 
-N = 9   # > max(K_LEVELS): un ciclo puede visitar hasta N-1 intermedios + retorno = N arcos,
-        # así que todos los niveles de K_LEVELS son físicamente alcanzables.
+N = 9   # el camión puede revisitar nodos, así que con MAX_DURATION_SYN holgado cualquier K de K_LEVELS
+        # es físicamente alcanzable.
 MAX_DURATION_SYN = 30.0   # con time_matrix=1.0/arco, permite hasta 30 arcos — K es el binding
 
 
@@ -129,7 +129,7 @@ def test_greedy_rollout_raw_reward_is_sum_of_lane_rewards(agent, env, synthetic)
 
 def test_greedy_env_reward_es_margen_sin_bonos(agent, env, synthetic, monkeypatch):
     """Sin shaping, env_reward (el que alimenta el self-critical) es margen / REWARD_SCALE_FACTOR
-    en las rutas válidas: sin bono de retorno ni términos de n_intermediate / time_util."""
+    en las rutas válidas: sin bono de retorno ni términos de arcos previos / time_util."""
     import routing_env
     monkeypatch.setattr(routing_env, "USE_REWARD_SHAPING", False)
     for k in (*K_LEVELS, None):
