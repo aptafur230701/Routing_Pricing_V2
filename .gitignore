@@ -6,3 +6,6 @@ runs/
 .ipynb_checkpoints/
 # Tabla V de UB-DP: se regenera con main.py (dp_relajada.cargar_o_calcular_tabla)
 datos/ubdp_tabla_*.npz
+
+# Caché de baselines y cotas de la evaluación (se regenera)
+datos/cache_eval/
