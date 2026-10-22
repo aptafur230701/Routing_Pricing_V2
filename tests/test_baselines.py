@@ -264,7 +264,7 @@ def test_margen_es_suma_de_lane_reward_de_la_ruta(inst10, sim10):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Oráculo: alineación con el entorno y exactitud
+# UB-PI: alineación con el entorno
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("nombre", ["inst10", "inst35"])
@@ -283,7 +283,7 @@ def test_ub_pi_alineado_con_el_entorno(nombre, request):
         dia, ws = int(dis["start_day"][m]), int(dis["world_seed"][m])
         loads, rates = inst.market.sample_world(ws, 6, dia)
         for K in (K_MAX, None):
-            rew, ruta = ev.ub_pi(inst.market, inst.T, inst.dist, inst.diesel, inst.n, h, K, (loads, rates))
+            rew, ruta = ev.ub_pi(inst.T, inst.dist, inst.diesel, h, K, (loads, rates))
             duracion = sum(inst.T[a, b] for a, b in zip(ruta[:-1], ruta[1:]))
             if duracion > MAX_DURATION:
                 assert duracion - MAX_DURATION < (len(ruta) - 1) / 60.0       # a lo sumo una franja por arco

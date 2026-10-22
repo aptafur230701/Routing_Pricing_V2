@@ -96,14 +96,14 @@ def test_free_case_rollout_quality_vs_exact_optimum(loaded):
                 f"start_node={start_node} day={day}: ruta {route} no cierra el ciclo"
             )
             opt_reward, _ = ub_pi(
-                None, time_matrix_np, distance_arr, diesel_arr, NUM_NODES, start_node, None,
+                time_matrix_np, distance_arr, diesel_arr, start_node, None,
                 (loads_stack, rate_stack), start_day_idx=day,
             )
             # El óptimo con el día conocido es una cota superior: si el DRL la supera, el
             # evaluador del agente y el del solver están desalineados.
             assert reward <= opt_reward + EPS, (
                 f"start_node={start_node} day={day}: DRL {reward} > óptimo {opt_reward} "
-                f"(ruta {route}) — evaluador desalineado con el oráculo"
+                f"(ruta {route}) — evaluador desalineado con UB-PI"
             )
             drl_rewards.append(reward)
             opt_rewards.append(opt_reward)

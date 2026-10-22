@@ -692,7 +692,7 @@ def build_temporal_features(
 
     [0] elapsed_time_norm   = time_elapsed / max_duration           (0-1)
     [1] remaining_time_norm = max(0, max_duration - time_elapsed) / max_duration  (0-1)
-    [2] progress_fraction   = step_count / num_nodes                (0-1)
+    [2] progress_fraction   = step_count / num_nodes                (puede pasar de 1: se puede revisitar)
 
     El tensor sigue siendo shape (3,) — sin cambio de dimensión.
     """

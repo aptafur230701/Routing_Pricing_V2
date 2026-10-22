@@ -20,7 +20,7 @@ Una fase por sesión; cada una termina con sus pruebas en verde y un commit.
 - **Crítico:** `CriticHead(h_t) → V(s)` (MLP d_h → d_h → d_h/2 → 1).
 - **Entrenamiento:** PPO con GAE, self-critical opcional, validación en mundos
   simulados, selección de checkpoint por media móvil.
-- **Baselines:** B3 (DP relajada) y UB-DP ya existen. No se usan para el pricing
+- **Baselines:** B3 (política sobre la tabla V de la DP) y UB-DP ya existen. No se usan para el pricing
   del DRL, solo como referencia para el ruteo (ya cubiertos en el entrenamiento).
 
 El pricing **no cambia** nada de eso. Reutiliza el mismo rollout de PPO, el mismo

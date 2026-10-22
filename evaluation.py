@@ -289,8 +289,7 @@ def _ejecutar_drl(ctx, env, nodo, dia, K, world_seed, dow0, loads_stack=None, ra
     return m
 
 
-def ub_pi(market, time_matrix, distance_arr, diesel_arr, num_nodes, start_node, K,
-          mundo, start_day_idx=0) -> tuple:
+def ub_pi(time_matrix, distance_arr, diesel_arr, start_node, K, mundo, start_day_idx=0) -> tuple:
     """UB-PI: mejor ruta con el mundo completo conocido, vía DP hacia atrás (Solvers.solve_ub_pi).
 
     Estado (nodo, franja de UBPI_DT_HORAS, k): el camión puede revisitar nodos, así que no hay
@@ -425,7 +424,7 @@ def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, load
     dis = disenar_mundos(num_nodes, M, market, num_dias=rate_train.shape[0], semilla=semilla_eval)
 
     def cotas(m, nodo, dow, K, mundo_pi):
-        pi, _ = ub_pi(market, time_matrix, distance_arr, diesel_arr, num_nodes, nodo, K, mundo_pi)
+        pi, _ = ub_pi(time_matrix, distance_arr, diesel_arr, nodo, K, mundo_pi)
         dp = tabla.ub_dp(nodo, dow, K) if (K is None or 2 <= K <= tabla.K) else float("nan")
         return dp, pi
 
@@ -522,7 +521,7 @@ def evaluar_replay(agent, market, tabla, time_matrix, rate_eval, loads_eval,
                 dow = int(market.dia_semana(TRAIN_DAYS + dia))
                 for K in k_levels:
                     if faltan is None:
-                        pi, _ = ub_pi(market, time_matrix, distance_arr, diesel_arr, num_nodes, nodo, K,
+                        pi, _ = ub_pi(time_matrix, distance_arr, diesel_arr, nodo, K,
                                       (loads_eval, rate_eval), start_day_idx=dia)
                     else:
                         pi = cota_previa.loc[(_etiqueta_k(K), c), "ub_pi"]
@@ -573,7 +572,7 @@ def _avisar_si_supera_cota(df: pd.DataFrame, tol: float = 1e-6) -> None:
     malos = df[ok & (df["margen"] > df["ub_pi"] + tol)]
     if len(malos):
         print(f"  ⚠ {len(malos)} filas con margen > UB-PI (p. ej. {malos.iloc[0]['metodo']} "
-              f"mundo {malos.iloc[0]['mundo']} K={malos.iloc[0]['K']}): revisar alineación del oráculo.")
+              f"mundo {malos.iloc[0]['mundo']} K={malos.iloc[0]['K']}): revisar UB-PI frente al entorno.")
 
 
 # ── Resumen ───────────────────────────────────────────────────

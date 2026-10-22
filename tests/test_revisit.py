@@ -96,7 +96,7 @@ def test_max_pasos_acota_los_episodios_y_hay_episodios_con_mas_de_n_pasos(sintet
         _, term, masks = vec.step(acc)
         active &= ~term
     assert not active.any()
-    assert vec.step_count.max() > N                                # la regla de no revisitar impediría esto
+    assert vec.step_count.max() > N                                # solo es posible si se revisitan nodos
     assert vec.step_count.max() <= vec.max_steps
 
 

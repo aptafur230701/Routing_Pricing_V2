@@ -16,9 +16,8 @@ import numpy as np
 import pytest
 import torch
 
-import attention_encoder as ae
 from attention_encoder import (
-    N_NODE_FEATURES, build_node_features, build_node_features_batch, build_continuation_features_batch,
+    N_NODE_FEATURES, build_node_features, build_node_features_batch,
 )
 from baselines import PoliticaB2, calcular_ev_esperado
 from config import (
