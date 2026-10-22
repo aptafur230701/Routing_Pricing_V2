@@ -14,7 +14,7 @@ Volver a casa da la recompensa del arco y termina con valor cero. La recompensa 
 `lane_reward`, sin shaping.
 
 UB-DP es, por tanto, el valor óptimo aproximado de la política no anticipativa (salvo la
-discretización de 15 min y el muestreo con S = 500 sorteos). Una diferencia menor con el
+discretización de 15 min y el muestreo con S = 5000 sorteos). Una diferencia menor con el
 entorno: allí, volver al mismo nodo el mismo día ve la MISMA fila del mundo (es función de
 la semilla del mundo, el nodo y el día), mientras que la DP sortea una fila nueva en cada
 llegada. UB-PI (Solvers.solve_ub_pi) es la cota con información perfecta y debe quedar por

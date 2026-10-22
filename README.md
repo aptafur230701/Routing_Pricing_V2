@@ -121,7 +121,7 @@ los mismos mundos simulados (mismo `world_seed`), paso a paso en `VectorRoutingE
 | B1 | Greedy miope: arco válido de mayor `lane_reward` de la fila observada (PFA). | [baselines.py](baselines.py) |
 | B2 | Reoptimización determinista con valores esperados de los arcos futuros; ejecuta solo el primer arco. Con K = 5 y con K libre (CFA). Recursión memoizada sobre (nodo, franja de 15 min, k restante) por (casa, día de salida); el camión puede revisitar nodos. | [baselines.py](baselines.py) |
 | B3 | Política de un paso sobre la tabla V de la DP de UB-DP (VFA de tabla). | [dp_relajada.py](dp_relajada.py) |
-| UB-DP | Valor óptimo aproximado de la política no anticipativa: DP en (hogar, día de salida, nodo, franja de 15 min, k), con revisitas permitidas (salvo la discretización y el muestreo con S = 500). Tabla en `datos/ubdp_tabla_<N>nodos.npz`, se recarga si coincide con los datos. | [dp_relajada.py](dp_relajada.py) |
+| UB-DP | Valor óptimo aproximado de la política no anticipativa: DP en (hogar, día de salida, nodo, franja de 15 min, k), con revisitas permitidas (salvo la discretización y el muestreo con S = 5000). Tabla en `datos/ubdp_tabla_<N>nodos.npz`, se recarga si coincide con los datos. | [dp_relajada.py](dp_relajada.py) |
 | UB-PI | Cota con información perfecta: mejor ruta con el mundo completo conocido (`sample_world` + DP hacia atrás con franjas de 1 min). Debe quedar por encima de UB-DP. | [evaluation.py](evaluation.py), [Solvers.py](Solvers.py) |
 
 | Archivo | Rol |

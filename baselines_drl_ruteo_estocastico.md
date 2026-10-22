@@ -46,12 +46,12 @@ El camión puede volver a pasar por un nodo intermedio, así que el estado es (n
 V(i,t,k) \;=\; \mathbb{E}_{\omega \sim P(\cdot \mid i,\, d(t))}\Big[\max_{j \in A(i,t,k,\omega)} \big\{ r_{ij}(\omega) + V(j,\, t+\tau_{ij},\, k-1) \big\}\Big]
 ```
 
-Aquí ω es la pareja (loads_row, rate_row) que sortea `MarketProcess` en el nodo i, d(t) es el día de la semana de llegada, A son los destinos factibles (lane con carga, retorno a casa posible dentro de 77 horas, k mayor que cero) y r es la recompensa de la fórmula compartida. Al volver a casa el valor terminal es cero. La esperanza se estima con S sorteos por estado (S = 500).
+Aquí ω es la pareja (loads_row, rate_row) que sortea `MarketProcess` en el nodo i, d(t) es el día de la semana de llegada, A son los destinos factibles (lane con carga, retorno a casa posible dentro de 77 horas, k mayor que cero) y r es la recompensa de la fórmula compartida. Al volver a casa el valor terminal es cero. La esperanza se estima con S sorteos por estado (S = 5000).
 
 V(casa, 0, K) es, por tanto, el valor óptimo aproximado de la mejor política no anticipativa, no una cota por relajación. Dos fuentes de aproximación:
 
 - Discretiza el tiempo en franjas de 15 minutos redondeando los tiempos de viaje hacia abajo. Redondear hacia arriba eliminaría rutas factibles. Redondear hacia abajo puede adelantar una llegada al día anterior y cambiar su día de la semana; con franjas de 15 minutos el efecto es mínimo, pero el valor es aproximado y así debe declararse.
-- Usa S = 500 sorteos por estado. El error de muestreo dentro del máximo sesga V ligeramente hacia arriba.
+- Usa S = 5000 sorteos por estado. El error de muestreo dentro del máximo sesga V ligeramente hacia arriba.
 
 Una diferencia menor con el entorno: en tu código cada fila es fija dentro de un mundo para cada par (nodo, día), así que volver al mismo nodo el mismo día ve la misma fila, mientras que la DP sortea de nuevo en cada llegada. Solo afecta a rutas que revisitan un nodo el mismo día de mercado (con tiempos de viaje de decenas de horas es raro).
 
@@ -151,7 +151,7 @@ Este bloque está escrito para Claude Code, en el repositorio AM-PPO. Implementa
 ### Pasos
 
 1. **Borrar los baselines viejos.** En `Solvers.py` elimina `solve_HGA_LNS_metaheuristic`, `solve_label_setting_exact`, las cuatro variantes `solve_heuristic_rolling_horizon*`, `solve_mc_rollout_stochastic` y los auxiliares que solo usaban ellas. Conserva solo la resolución de UB-PI (`solve_ub_pi`). Elimina también el modo DRL Det. Busca cada nombre borrado en todo el repositorio (`evaluation.py`, `stats_analysis.py`, `excel_report.py`, `main.py`, `run_k_comparison.py`, `inference.py`, `hpo_optuna.py`) y quita o actualiza cada referencia.
-2. **Configuración (`config.py`).** Agrega el paso de tiempo de UB-DP (`UBDP_DT_HORAS = 0.25`), el número de sorteos (`UBDP_S = 500`), su semilla y la ruta donde se guarda la tabla V. Mantén `MARKET_M_EVAL_WORLDS = 100` y `MARKET_SEED_EVAL`.
+2. **Configuración (`config.py`).** Agrega el paso de tiempo de UB-DP (`UBDP_DT_HORAS = 0.25`), el número de sorteos (`UBDP_S = 5000`), su semilla y la ruta donde se guarda la tabla V. Mantén `MARKET_M_EVAL_WORLDS = 100` y `MARKET_SEED_EVAL`.
 3. **UB-DP y B3 (`dp_relajada.py`).** Calcula V(día de la semana de salida, nodo, franja de tiempo, k) con la ecuación de Bellman de la sección UB-DP (el camión puede revisitar).
     - Los tiempos de viaje se redondean hacia abajo a la franja; el día de llegada es el día de salida más la parte entera de horas / 14.
     - Las acciones factibles siguen las reglas de la máscara del entorno: lane con carga en la fila sorteada, retorno a casa posible dentro de `MAX_DURATION`, retorno forzado cuando queda un arco, y la excepción del primer movimiento desde casa.

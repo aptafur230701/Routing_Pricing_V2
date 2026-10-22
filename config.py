@@ -180,7 +180,7 @@ def get_val_worlds(num_nodes: int) -> int:
 UBDP_DT_HORAS   = 0.25    # paso de tiempo de la DP (franjas de 15 min; tiempos de viaje redondeados hacia abajo);
                           # también lo usa B2
 UBPI_DT_HORAS   = 1.0 / 60.0   # paso de tiempo de la DP hacia atrás de UB-PI (franjas de 1 min; redondeo hacia abajo)
-UBDP_S          = 500     # sorteos de filas por par (nodo, día de la semana)
+UBDP_S          = 5000    # sorteos de filas por par (nodo, día de la semana)
 UBDP_SEED       = 20261018   # semilla del Generator propio de la DP
 UBDP_TABLA_PATH = "datos/ubdp_tabla_{n}nodos.npz"   # relativo a la raíz del proyecto; {n} = nº de nodos
 REPLAY_MAX_CASOS = 300   # tope de casos (nodo, día) del replay por nivel de K; si hay más, se toma un subconjunto balanceado
