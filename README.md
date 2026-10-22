@@ -39,6 +39,8 @@ problem_data.py ──► matrices (tiempo, tarifa, carga, distancia, diesel, LT
         │      → distribución π(a|s) sobre nodos válidos │
         │  CriticHead        (critic_head.py)             │
         │      → V(s_t) para la ventaja PPO                │
+        │  PostDecisionValueHead (critic_head.py)         │
+        │      → Ṽ(s, j) para el precio de reserva p*     │
         └─────────────────────────────────────────────┘
                               │
                               ▼
@@ -72,7 +74,9 @@ nodos, ver `NODE_SEQUENCE`).
 | [routing_env.py](routing_env.py) | Entorno Gymnasium (`RoutingEnv`, `VectorRoutingEnv`) para el DVRP estocástico. |
 | [attention_encoder.py](attention_encoder.py) | `AttentionEncoder` (Transformer) + `ContextNetwork`. |
 | [attention_decoder.py](attention_decoder.py) | `AttentionDecoder` (pointer network) con glimpse + pointer attention. |
-| [critic_head.py](critic_head.py) | `CriticHead`: estima V(s_t) para la ventaja PPO. |
+| [critic_head.py](critic_head.py) | `CriticHead`: estima V(s_t) para la ventaja PPO. `PostDecisionValueHead`: Ṽ(s, j), valor de llegar a j antes de ver su tablero (precio de reserva). |
+| [pricing.py](pricing.py) | `reservation_price`: precio de reserva p* por lane. |
+| [validate_pricing.py](validate_pricing.py) | Validación de p*: Monte Carlo de Ṽ, posición histórica, política de aceptación. |
 | [am_agent.py](am_agent.py) | `AMRoutingAgent`: combina encoder + contexto + decoder; el rollout se ejecuta paso a paso sobre el entorno. |
 | [am_training.py](am_training.py) | Loop de entrenamiento PPO-Clip + GAE. |
 | [greedy_rollout.py](greedy_rollout.py) | Rollout greedy (argmax por nodo) sobre `VectorRoutingEnv`: evaluación del DRL en replay de días reales o en mundos simulados, baseline self-critical y monitor de entrenamiento. |
@@ -142,6 +146,51 @@ el DRL.
 | `checkpoints/` | Pesos entrenados (`am_checkpoint_<N>nodes.pt`), compartidos entre tamaños para transfer learning. Ignorado por git (`.gitignore`). |
 | `results/<N>nodes/` | Salida de cada run: `DRL_Routing_Summary_AM.xlsx`, diagnósticos PPO/training (`.png`), `training_log_<N>nodes.pkl`/`.xlsx`. |
 | `docs/architecture.html` / `.png` | Diagrama explicativo del pipeline AM-PPO. |
+
+## Pricing: precio de reserva
+
+Además de la ruta, el modelo entrega una segunda salida: el **precio mínimo por milla** al que al camión le
+conviene aceptar una lane `i→j`, dada su posición y el tiempo restante. Es una recomendación del lado del
+transportista; **no modela aceptación** (no hay datos de aceptación y rechazo).
+
+**Modelo.** En `i` el agente ya ve `rate(i→j)` y `loads(i→j)`. Aceptar `i→j` rinde
+`r_obs = rate·dist − costo` y llega a `j`, cuyo tablero aún no conoce; su valor esperado es `Ṽ(s, j)` (valor
+post-decisión, cabeza `agent.post_value`, con `Ṽ(s, depot) = 0`). Con `S = REWARD_SCALE_FACTOR`:
+
+```
+Q(s, a)  = r_obs(i→a)/S + Ṽ(s, a)
+Q_alt(s) = max_{a ≠ j válida} Q(s, a)
+p*(i→j)  = ( S · (Q_alt − Ṽ(s, j)) + costo(i→j) ) / dist(i→j)      [USD/milla]
+```
+
+Es el costo de oportunidad por milla de ir a `j`: puede quedar por debajo del break-even `costo/dist` cuando
+`j` es una posición valiosa. Si `j` es la única acción factible se devuelve el piso `costo/dist` con
+`only_option = True`.
+
+**Entrenamiento.** `Ṽ` se regresa con el mismo rollout de PPO: `loss_post = MSE(Ṽ(s_t, a_t), G_t − r_t)` solo
+sobre la acción tomada (el retorno al depot se excluye: es el ancla `Ṽ = 0`). La cabeza usa `h_t.detach()` y
+`embeddings.detach()`, y sus parámetros van al optimizer del crítico, así que **no cambia la política**: con la
+misma semilla el reward del PPO es idéntico con o sin ella. Config: `USE_POST_HEAD`, `POST_HIDDEN`, `POST_COEF`.
+`post_mse` y `post_ev` quedan en el `training_log`.
+
+**Limitaciones.** (1) `p*` es un costo de oportunidad, no una probabilidad de aceptación. (2) `Ṽ` se entrena solo
+en acciones muestreadas: para lanes casi nunca tomadas la estimación (y `p*`) es más ruidosa. (3) Con tours de
+2-4 arcos `Ṽ` tiene varianza alta. (4) Los checkpoints anteriores no traen `post_value`: se cargan, pero la
+cabeza arranca desde cero; hay que reentrenar. La validación lo reporta (ver abajo).
+
+**Cómo ejecutarlo.**
+
+```bash
+python main.py                      # entrena con la cabeza y, al final (RUN_PRICING_VALIDATION), valida p*
+python validate_pricing.py --num-nodes 10 [--best] [--quick]   # validación sola sobre un checkpoint
+python inference.py [--show-board]  # ruta + p* por arco (y tablero por nodo); escribe results/<N>nodes/pricing_<run_tag>.csv
+```
+
+La validación escribe `results/<N>nodes/pricing_val/{figures,tables}` y la pestaña "Pricing" del Excel:
+(a) calibración de `Ṽ` contra Monte Carlo (sesgo y RMSE en USD, por tiempo restante), (b) percentil de `p*` en la
+serie histórica de la lane (por día de la semana y tiempo restante) y (c) "acepto si tarifa ≥ p*" contra "acepto
+la mejor tarifa" y "acepto siempre", bajo el supuesto explícito de que toda carga ofrecida está disponible a su
+tarifa observada.
 
 ## Flujo de trabajo típico
 

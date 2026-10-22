@@ -36,7 +36,7 @@ from config import (
     SEED, DEVICE, RUN_TAG, K_TRAINING_LEVELS, configurar_k, MARKET_SEED_EVAL, MARKET_SEED_EVAL_FINAL,
     HP_OVERRIDES, configurar_hp,
     get_episodes_per_node, TRAIN_DAYS,
-    AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF,
+    AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, USE_POST_HEAD,
 )
 from baselines import calcular_ev_esperado
 from problem_data import load_matrices
@@ -47,7 +47,8 @@ from evaluation import (
 )
 from market_process import MarketProcess, asegurar_parametros
 from stats_analysis import append_stats_sheets_to_excel, NOTA_REPLAY
-from transfer_learning import build_agent_for_training, load_checkpoint_compatible
+from transfer_learning import build_agent_for_training, checkpoint_tiene_post_head, load_checkpoint_compatible
+from validate_pricing import run_pricing_validation, append_pricing_sheet
 
 
 def set_seeds(seed: int):
@@ -214,9 +215,8 @@ def _evaluate_and_report(
 
 
 def main():
-    NUM_NODES       = int(os.environ.get("NUM_NODES", 35))   # opciones: 10 · 20 · 35 · 50 · 75 · 100
-    EVAL_ONLY       = os.environ.get("EVAL_ONLY", "0") == "1"   # True: carga checkpoint y salta entrenamiento
-                                                                 # (NUM_NODES y EVAL_ONLY se pueden fijar por variable de entorno)
+    NUM_NODES       = 10      # opciones: 10 · 20 · 35 · 50 · 75 · 100
+    EVAL_ONLY       = False   # True: carga checkpoint y salta entrenamiento
     USE_TRANSFER    = True   # True: warm-start desde el checkpoint del tamaño anterior en
                               # NODE_SEQUENCE (requiere mismo AM_D_H/AM_N_LAYERS que la fuente).
                               # False: entrena desde pesos aleatorios con la arquitectura de config.py.
@@ -239,6 +239,9 @@ def main():
     K_RESTRINGIDO = False      # True: entrena, valida y evalúa con K libre y K = K_MAX (5).
                                 # False: solo K libre (sin presupuesto de cardinalidad). Sirve para
                                 # pulir el método contra los baselines antes de añadir la restricción.
+    RUN_PRICING_VALIDATION = True   # True (y USE_POST_HEAD activo): al terminar, valida el precio de reserva p*
+                                     # (validate_pricing.py: Monte Carlo de Ṽ, posición de p*, política de aceptación)
+                                     # con el agente evaluado y agrega la pestaña "Pricing" al Excel. ~10-20 min a 35 nodos.
     # ──────────────────────────────────────────────────────────────────────────
 
     configurar_k(K_RESTRINGIDO)    # antes de entrenar/evaluar: fija K_TRAINING_LEVELS en el sitio
@@ -328,6 +331,20 @@ def main():
         semilla_eval=MARKET_SEED_EVAL if EVAL_SET == "dev" else MARKET_SEED_EVAL_FINAL,
         sufijo_cache="" if EVAL_SET == "dev" else "_final",
     )
+
+    if RUN_PRICING_VALIDATION and USE_POST_HEAD:
+        if getattr(agent_am, "post_value", None) is None or (
+            EVAL_ONLY and not checkpoint_tiene_post_head(_checkpoint_path(checkpoint_dir, NUM_NODES, usar_best))
+        ):
+            print("\nValidación del pricing omitida: el checkpoint no trae post_value (reentrena con USE_POST_HEAD=True).")
+        else:
+            tablas = run_pricing_validation(
+                agent_am, NUM_NODES, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
+                ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95, market_process,
+                ev_esperado=ev_esperado, output_dir=output_dir,
+            )
+            label = "AM" if EVAL_SET == "dev" else "AM_final"
+            append_pricing_sheet(os.path.join(output_dir, f"DRL_Routing_Summary_{label}.xlsx"), tablas)
 
     print(f"\nDone! Checkpoint guardado en: checkpoints/am_checkpoint_{NUM_NODES}nodes.pt")
 

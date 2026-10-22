@@ -1,0 +1,5 @@
+regla,margen_medio_usd,dif_vs_pstar_usd,dif_ic95_bajo,dif_ic95_alto,pct_ofertas_aceptadas,pct_ofertas_elegibles,largo_tour_medio,validez,n_mundos
+Greedy del DRL (referencia),1033.72,-13.492,-43.780300000000004,14.654599999999991,48.55072463768116,,2.524,1.0,500
+Acepto si tarifa ≥ p*,1047.212,0.0,0.0,0.0,47.354497354497354,47.354497354497354,2.48,1.0,500
+Acepto la mejor tarifa,771.204,-276.008,-348.4083,-206.73195,49.2382271468144,,2.47,1.0,500
+Acepto siempre que haya carga,600.906,-446.306,-529.6166000000001,-367.33835,48.48066298342541,,2.452,1.0,500

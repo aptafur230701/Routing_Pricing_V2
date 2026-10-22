@@ -18,6 +18,8 @@ from attention_encoder import (
     N_NODE_FEATURES,
 )
 from attention_decoder import AttentionDecoder
+from critic_head import PostDecisionValueHead
+from config import USE_POST_HEAD, POST_HIDDEN
 
 
 class AMRoutingAgent(nn.Module):
@@ -35,6 +37,7 @@ class AMRoutingAgent(nn.Module):
     device    : torch.device
     pre_norm  : bool  — pre-norm (True) vs post-norm (False) en el encoder (default True).
     dropout   : float — dropout en las sublayers del encoder (default 0.0).
+    use_post_head : bool — crea `post_value` (PostDecisionValueHead); None si es False (default config.USE_POST_HEAD).
     """
 
     def __init__(
@@ -48,6 +51,7 @@ class AMRoutingAgent(nn.Module):
         device:    torch.device = None,
         pre_norm:  bool  = True,
         dropout:   float = 0.0,
+        use_post_head: bool = USE_POST_HEAD,
     ):
         super().__init__()
         self.num_nodes = num_nodes
@@ -60,5 +64,9 @@ class AMRoutingAgent(nn.Module):
         )
         self.context_net = ContextNetwork(d_h, n_market=1)
         self.decoder     = AttentionDecoder(d_h, n_heads_glimpse=n_heads, clip_C=clip_C)
+        # Valor post-decisión Ṽ(s, j) para el precio de reserva (pricing.py). Se entrena con el
+        # optimizer del crítico y no toca a la política (detach interno): ver PostDecisionValueHead.
+        # El forward real vive en _forward de am_training.py; este módulo solo contiene los pesos.
+        self.post_value  = PostDecisionValueHead(d_h, POST_HIDDEN) if use_post_head else None
 
         self.to(self.device)

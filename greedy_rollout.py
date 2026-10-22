@@ -66,6 +66,10 @@ def greedy_rollout(
     device:             torch.device = None,   # dispositivo del agente (default: DEVICE de config)
     ev_esperado:        np.ndarray = None,   # (7, N, N) calcular_ev_esperado (baselines.py); obligatorio con
                                              # USE_CONTINUATION_FEATURES (features de continuación f8–f11)
+    step_hook:          callable   = None,   # fn(dict) invocada en cada paso ANTES de env.step, para inspeccionar la
+                                             # decisión sin alterarla (p. ej. el precio de reserva en inference.py).
+                                             # Claves: env, h_t (B, d_h), embeddings (B, N, d_h), masks (B, N),
+                                             # actions (B,), active (B,) bool, cur_nodes (B,)
 ) -> GreedyResult:
     """Rollout greedy (argmax por nodo) vectorizado sobre un VectorRoutingEnv.
 
@@ -131,6 +135,10 @@ def greedy_rollout(
                 current_emb = embeddings[torch.arange(B), cur_nodes_t, :]
                 h_t = agent.context_net(graph_emb, current_emb, temporal_t, market_t, budget_t, dow_t)
                 actions = agent.decoder.greedy_action(h_t, embeddings, mask_t).cpu().numpy()
+
+                if step_hook is not None:
+                    step_hook(dict(env=env, h_t=h_t, embeddings=embeddings, masks=masks, actions=actions,
+                                   active=active.copy(), cur_nodes=cur_nodes.copy()))
 
                 rewards, terminated, masks = env.step(actions)
 

@@ -44,6 +44,7 @@ from config import (
     MARKET_SEED_TRAIN,
     USE_CONTINUATION_FEATURES,
     CKPT_SELECTION, CKPT_WINDOW, USE_LR_COSINE, LR_FINAL_FRAC, hp,
+    USE_POST_HEAD, POST_COEF,
 )
 from routing_env import VectorRoutingEnv
 from greedy_rollout import greedy_rollout
@@ -121,11 +122,13 @@ class RolloutBuffer:
         self.old_log_probs = []   # list of float
         self.old_values    = []   # list of float
         self.dones         = []   # list of bool
+        self.is_return     = []   # list of bool — la acción cierra el tour en el depot (ancla Ṽ(s, depot) = 0)
         # (start_idx, end_idx) por episodio
         self.episode_boundaries = []
         # Calculados por compute_gae_per_episode()
         self.returns       = None
         self.advantages    = None
+        self.target_post   = None   # (n,) retorno − recompensa del paso (valor post-decisión), ver compute_target_post
         # Self-critical — poblados solo si USE_SELF_CRITICAL
         self.sc_advantage  = None   # (n_episodes,) ventaja normalizada por episodio
         self.episode_idx   = None   # (n_transitions,) índice de episodio por transición
@@ -144,6 +147,7 @@ class RolloutBuffer:
         market_feats:  np.ndarray = None,   # (1,)
         budget_feats:  np.ndarray = None,   # (2,)
         dow_feats:     np.ndarray = None,   # (7,)
+        is_return:     bool = False,
     ):
         self.node_feats.append(node_feats)
         self.temporal_feats.append(temporal)
@@ -160,6 +164,7 @@ class RolloutBuffer:
         self.old_log_probs.append(log_prob)
         self.old_values.append(value)
         self.dones.append(done)
+        self.is_return.append(is_return)
 
     def __len__(self):
         return len(self.actions)
@@ -204,6 +209,16 @@ class RolloutBuffer:
 
         self.returns    = returns
         self.advantages = advantages
+        self.target_post = self.compute_target_post()
+
+    def compute_target_post(self) -> np.ndarray:
+        """Objetivo de la cabeza post-decisión: target_post[t] = G_t − r_t (ambos ya divididos por S).
+
+        Es el retorno que queda DESPUÉS de cobrar la lane de t, es decir, el valor de llegar a
+        la acción tomada a_t antes de ver su tablero. En el paso que cierra el tour (o que
+        termina el episodio) no queda nada por cobrar y el objetivo es 0.
+        """
+        return (self.returns - np.asarray(self.rewards, dtype=np.float32)).astype(np.float32)
 
     def get_batches(self, batch_size: int):
         """
@@ -231,6 +246,7 @@ def _forward(
     market_feats_t: torch.Tensor = None,   # (B, 1)
     budget_feats_t: torch.Tensor = None,   # (B, 2)
     dow_feats_t:    torch.Tensor = None,   # (B, 7)
+    with_post:      bool = False,
 ):
     """
     Ejecuta encoder → context → decoder → critic para un batch.
@@ -244,6 +260,8 @@ def _forward(
     log_probs : Tensor (B,)
     entropies : Tensor (B,)
     values    : Tensor (B,)
+    post_values : Tensor (B, N) — Ṽ(s, j) por candidato (agent.post_value; sin gradiente hacia
+                la política). Solo se devuelve, como quinto elemento, si with_post=True.
     """
     B = node_feats_t.shape[0]
 
@@ -282,6 +300,10 @@ def _forward(
 
     check_tensor("log_probs", log_probs)
 
+    if with_post:
+        post_values = agent.post_value(h_t, embeddings)                # (B, N)
+        check_tensor("post_values", post_values)
+        return actions, log_probs, entropies, values, post_values
     return actions, log_probs, entropies, values
 
 
@@ -506,7 +528,7 @@ def run_am_training(
     agent  = pretrained_agent  if pretrained_agent  is not None \
              else AMRoutingAgent(
                  num_nodes, d_h, n_heads, n_layers, d_ff, device=DEVICE,
-                 pre_norm=AM_PRE_NORM, dropout=AM_DROPOUT,
+                 pre_norm=AM_PRE_NORM, dropout=AM_DROPOUT, use_post_head=USE_POST_HEAD,
              )
     critic = pretrained_critic if pretrained_critic is not None \
              else CriticHead(d_h).to(DEVICE)
@@ -519,8 +541,15 @@ def run_am_training(
     # corrompe el ratio de importancia como lo haría dropout en el path de logits).
     # Critic se deja en Adam puro (sin weight decay): su objetivo es MSE de
     # regresión, no política, y no comparte el problema de corrupción del ratio.
-    actor_optimizer  = torch.optim.AdamW(agent.parameters(),  lr=lr, weight_decay=PPO_WEIGHT_DECAY)
-    critic_optimizer = torch.optim.Adam(critic.parameters(), lr=lr * 10)
+    # Cabeza post-decisión (PRICING_PLAN.md): sus parámetros viven en el agente pero NO son de la
+    # política. Van al optimizer del crítico y quedan fuera del actor (ni AdamW, ni weight decay,
+    # ni la norma del clipping), para que el PPO sea el mismo con o sin ella.
+    use_post     = USE_POST_HEAD and getattr(agent, "post_value", None) is not None
+    post_params  = list(agent.post_value.parameters()) if use_post else []
+    post_ids     = {id(p) for p in post_params}
+    actor_params = [p for p in agent.parameters() if id(p) not in post_ids]
+    actor_optimizer  = torch.optim.AdamW(actor_params, lr=lr, weight_decay=PPO_WEIGHT_DECAY)
+    critic_optimizer = torch.optim.Adam(list(critic.parameters()) + post_params, lr=lr * 10)
 
     # LR con decaimiento coseno: cada LR baja desde su valor inicial hasta LR_FINAL_FRAC de ese valor
     # al terminar n_updates (un scheduler.step() al final de cada update).
@@ -730,6 +759,7 @@ def run_am_training(
                         "log_prob":     float(log_probs[b]),
                         "value":        float(values[b]),
                         "done":         bool(terminated[b]),
+                        "is_return":    bool(actions[b] == start_nodes_arr[b]),
                         "time_violation": bool(time_violation[b]),
                     })
 
@@ -782,6 +812,7 @@ def run_am_training(
                     log_prob=trans["log_prob"],
                     value=trans["value"],
                     done=trans["done"],
+                    is_return=trans["is_return"],
                     market_feats=trans["market_feats"],
                     budget_feats=trans["budget_feats"],
                     dow_feats=trans["dow_feats"],
@@ -835,9 +866,11 @@ def run_am_training(
         batch_kl_divs       = []
         batch_clip_fracs    = []
         batch_sc_losses     = []
+        batch_post_losses   = []
+        post_pred_ep0, post_tgt_ep0 = [], []   # predicciones/objetivos de la primera época (para post_ev)
         apply_self_critical = USE_SELF_CRITICAL and update >= SELF_CRITICAL_WARMUP_UPDATES
 
-        for _ in range(n_ppo_epochs):
+        for epoch_i in range(n_ppo_epochs):
 
             kl_too_high = False # Flag para detectar si el KL se dispara en este epoch
 
@@ -882,6 +915,12 @@ def run_am_training(
                     buffer.advantages[idx_batch], dtype=torch.float32
                 ).to(DEVICE)                                           # (B,)
 
+                if use_post:
+                    tp_b  = torch.tensor(buffer.target_post[idx_batch], dtype=torch.float32).to(DEVICE)   # (B,)
+                    nr_b  = torch.tensor(
+                        [not buffer.is_return[i] for i in idx_batch], dtype=torch.float32
+                    ).to(DEVICE)                                       # (B,) 0 en el retorno al depot (ancla Ṽ = 0)
+
                 if apply_self_critical:
                     sc_adv_b = torch.tensor(
                         buffer.sc_advantage[buffer.episode_idx[idx_batch]],
@@ -907,10 +946,12 @@ def run_am_training(
 
                 try:
                     # Forward con gradientes
-                    _, new_lp, entropy, new_val = _forward(
+                    fwd = _forward(
                         agent, critic, nf_b, tf_b, cn_b, mask_b,
                         actions_t=act_b, market_feats_t=mf_b, budget_feats_t=bf_b, dow_feats_t=dw_b,
+                        with_post=use_post,
                     )
+                    _, new_lp, entropy, new_val = fwd[:4]
 
                     # ── Loss del actor (PPO-Clip) ────────────────────────────
                     ratio       = torch.exp(new_lp - old_lp)
@@ -922,6 +963,16 @@ def run_am_training(
 
                     # ── Loss del critic (MSE) ────────────────────────────────
                     value_loss  = nn.functional.mse_loss(new_val, ret_b)
+
+                    # ── Loss de la cabeza post-decisión (MSE solo sobre la acción tomada) ──
+                    # El retorno al depot queda fuera: Ṽ(s, depot) = 0 se impone, no se aprende.
+                    if use_post:
+                        post_taken = fwd[4].gather(1, act_b.unsqueeze(1)).squeeze(1)       # (B,)
+                        loss_post  = (((post_taken - tp_b) ** 2) * nr_b).sum() / nr_b.sum().clamp(min=1.0)
+                        if epoch_i == 0:
+                            keep = nr_b.bool()
+                            post_pred_ep0.append(post_taken.detach()[keep].cpu().numpy())
+                            post_tgt_ep0.append(tp_b[keep].cpu().numpy())
 
                     # ── Bonus de entropía (exploración) ─────────────────────
                     entropy_loss = -entropy.mean()
@@ -972,10 +1023,16 @@ def run_am_training(
                 # suma = suma de gradientes), pero ~1.3x más rápido.
                 actor_optimizer.zero_grad()
                 critic_optimizer.zero_grad()
-                (actor_loss_total + value_loss).backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), grad_clip)
+                # loss_post solo llega a la cabeza post_value (detach de h_t y embeddings).
+                total_loss = actor_loss_total + value_loss
+                if use_post:
+                    total_loss = total_loss + POST_COEF * loss_post
+                total_loss.backward()
+                nn.utils.clip_grad_norm_(actor_params, grad_clip)
                 actor_optimizer.step()
                 nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
+                if use_post:
+                    nn.utils.clip_grad_norm_(post_params, grad_clip)
                 critic_optimizer.step()
 
                 with torch.no_grad():
@@ -998,6 +1055,8 @@ def run_am_training(
                 batch_clip_fracs.append(clip_frac)
                 if apply_self_critical:
                     batch_sc_losses.append(sc_loss.item())
+                if use_post:
+                    batch_post_losses.append(loss_post.item())
 
             if kl_too_high:  # sale también de n_ppo_epochs
                 break
@@ -1010,6 +1069,15 @@ def run_am_training(
             float(1.0 - np.var(ret_all - val_all) / (var_ret + 1e-8))
             if var_ret > 1e-8 else 0.0
         )
+
+        # Explained variance de la cabeza post-decisión sobre target_post (predicciones de la primera
+        # época, antes de que el mini-batch se use para actualizar), sin los retornos al depot.
+        avg_post_mse, post_ev = 0.0, 0.0
+        if use_post:
+            avg_post_mse = float(np.mean(batch_post_losses)) if batch_post_losses else 0.0
+            if post_tgt_ep0:
+                tg, pr = np.concatenate(post_tgt_ep0), np.concatenate(post_pred_ep0)
+                post_ev = float(1.0 - np.var(tg - pr) / (np.var(tg) + 1e-8)) if np.var(tg) > 1e-8 else 0.0
 
         avg_reward    = float(np.mean(update_ep_rewards))
         avg_loss      = float(np.mean(batch_total_losses))  if batch_total_losses  else 0.0
@@ -1060,6 +1128,9 @@ def run_am_training(
             "entropy_coef":     entropy_coef,
             "k_diagnostics":    k_diagnostics,
         }
+        if use_post:
+            log_entry["post_mse"] = avg_post_mse
+            log_entry["post_ev"]  = post_ev
         if USE_SELF_CRITICAL:
             log_entry["r_greedy_avg"]      = r_greedy_avg
             log_entry["sc_advantage_mean"] = sc_adv_raw_mean
@@ -1140,6 +1211,7 @@ def run_am_training(
                 f"| ent {avg_entropy:.3f} "
                 f"| kl {avg_kl:.4f} "
                 f"| ev {explained_var:.3f}"
+                + (f" | post_mse {avg_post_mse:.4f} post_ev {post_ev:.3f}" if use_post else "")
             )
 
             # Resumen compacto de diagnósticos de K — conformidad debe ser

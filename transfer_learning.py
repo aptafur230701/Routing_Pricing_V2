@@ -149,6 +149,18 @@ def load_checkpoint_compatible(
     return agent, critic
 
 
+def checkpoint_tiene_post_head(checkpoint_path: str) -> bool:
+    """True si el checkpoint trae los pesos de agent.post_value (cabeza de valor post-decisión).
+
+    Los checkpoints anteriores al precio de reserva no la traen: al cargarlos la cabeza arranca
+    desde cero (_reconcile_state_dict omite lo que falta) y p* no tendría sentido.
+    """
+    if not os.path.exists(checkpoint_path):
+        return False
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    return any(k.startswith("post_value.") for k in ckpt["agent"])
+
+
 def get_source_checkpoint(base_dir: str, target_num_nodes: int) -> str | None:
     """
     Dado el tamaño destino, devuelve la ruta al checkpoint del tamaño

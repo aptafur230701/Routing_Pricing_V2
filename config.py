@@ -68,6 +68,16 @@ PPO_WEIGHT_DECAY          = 6.093123878168306e-05  # Weight decay (AdamW) del ac
                                     # PPO-safe: no corrompe el ratio de importancia como el
                                     # dropout en el path de logits.
 
+# ── Precio de reserva (PRICING_PLAN.md) ───────────────────────
+# Cabeza de valor post-decisión Ṽ(s, j) sobre el estado congelado (h_t y embeddings con detach):
+# no cambia la política ni el PPO. Con ella se calcula p*, el precio mínimo por milla al que
+# conviene aceptar una lane (pricing.py).
+USE_POST_HEAD = True      # activa la cabeza de valor post-decisión
+POST_HIDDEN   = AM_D_H    # tamaño oculto del MLP (igual al encoder)
+POST_COEF     = 1.0       # peso de loss_post. Con detach() no afecta a la política, así que 1.0 es seguro.
+                          # Bajar solo si post_mse explota.
+PRICING_VAL_SEED = 20261022   # semilla del muestreo de validate_pricing.py (estados de Monte Carlo, ofertas, azar de "acepto siempre")
+
 # ── Self-critical baseline (híbrido sobre actor-critic) ────────────
 USE_SELF_CRITICAL            = True   # término self-critical sobre el argmax greedy
 SELF_CRITICAL_COEF           = 0.5     # peso del término self-critical en el loss total
@@ -215,7 +225,7 @@ def get_episodes_per_node(num_nodes: int) -> int:
     if num_nodes <= 35:  return 30000   # bajado de 25000: la política saturaba ~update 400;
                                         # con ~700 ep/update da ~500-600 updates, holgura sobre
                                         # el punto de saturación observado
-    if num_nodes <= 50:  return 32000
+    if num_nodes <= 50:  return 60000
     if num_nodes <= 75:  return 38000
-    return 43000          # 100 nodos
+    return 60000          # 100 nodos
 
