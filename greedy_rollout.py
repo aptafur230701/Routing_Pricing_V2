@@ -66,7 +66,7 @@ def greedy_rollout(
     max_duration:       float      = MAX_DURATION,
     device:             torch.device = None,   # dispositivo del agente (default: DEVICE de config)
     ev_esperado:        np.ndarray = None,   # (7, N, N) calcular_ev_esperado (baselines.py); obligatorio con
-                                             # USE_CONTINUATION_FEATURES (features de continuación f8–f11)
+                                             # USE_CONTINUATION_FEATURES (features de continuación f7–f10)
     step_hook:          callable   = None,   # fn(dict) invocada en cada paso ANTES de env.step, para inspeccionar la
                                              # decisión sin alterarla (p. ej. el precio de reserva en inference.py).
                                              # Claves: env, h_t (B, d_h), embeddings (B, N, d_h), masks (B, N),
@@ -115,6 +115,7 @@ def greedy_rollout(
                     avail_expected_arr=avail_expected_arr,
                     reward_rows=env.reward_rows,
                     ev=ev_esperado, time_elapsed=env.time_elapsed, dow0=env.start_dow,
+                    market_index=env.market_index, index_std=env.index_std,
                 )
                 temporal = build_temporal_features_batch(
                     env.time_elapsed, env.step_count, max_duration, num_nodes,

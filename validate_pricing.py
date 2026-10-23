@@ -95,6 +95,7 @@ class Escenario:
             self.N, MAX_DURATION, trucks_stack_raw=self.trucks, reward_global_p95=self.p95,
             avail_expected_arr=self.avail, reward_rows=env.reward_rows, ev=self.ev,
             time_elapsed=env.time_elapsed, dow0=env.start_dow,
+            market_index=env.market_index, index_std=env.index_std,
         )
         tmp = build_temporal_features_batch(env.time_elapsed, env.step_count, MAX_DURATION, self.N)
         mkt = build_market_features_batch(cur, env.current_day_idx, self.ltr) if self.ltr is not None \

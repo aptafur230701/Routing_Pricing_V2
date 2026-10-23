@@ -124,7 +124,7 @@ def configurar_k(restringido: bool) -> None:
     K_TRAINING_LEVELS[:] = K_LEVELS + [None]
 
 # ── Features de continuación por nodo ────────────────────────
-USE_CONTINUATION_FEATURES = True   # True: 4 features extra por nodo j (N_NODE_FEATURES = 11) con la
+USE_CONTINUATION_FEATURES = True   # True: 4 features extra por nodo j (N_NODE_FEATURES = 12 con el índice de mercado) con la
                                    # información de qué pasa después de j (tiempo y holgura de regreso a
                                    # casa, valor esperado de volver a casa y de seguir un salto más; ver
                                    # attention_encoder.py). False: las 7 features base. Ablacionable.
@@ -150,6 +150,13 @@ DIAS_EXCLUIDOS       = []             # fechas ("AAAA-MM-DD") a dejar fuera del 
 MARKET_PHI_MAX       = 1000.0         # tope de la dispersión phi (phi → ∞ equivale a Poisson)
 MARKET_N_GRUPOS      = 4              # grupos de volumen h (cuartiles de mu_ij) para estimar phi_h
 MARKET_PARAMS_PATH   = "datos/market_params.npz"   # relativo a la raíz del proyecto
+VENTANA_LENTO_DIAS   = 21             # ventana (impar, centrada) del promedio que separa el estado lento del rápido del
+                                      # índice de mercado; los días con la ventana completa son los "días de escenario"
+HORAS_DIA_MERCADO    = 14.0           # un día de mercado = 14 h (igual que RoutingEnv)
+MARKET_DIAS_EPISODIO = int(MAX_DURATION // HORAS_DIA_MERCADO) + 1   # días de mercado que puede tocar un episodio
+                                      # (el de salida y los que caben en MAX_DURATION: 6 con 77 h)
+MARKET_DIA_MAX       = TRAIN_DAYS - 1 + MARKET_DIAS_EPISODIO - 1    # último día posible de un episodio: el último
+                                      # día de salida (TRAIN_DAYS − 1) más los días que caben en MAX_DURATION
 MARKET_SEED_TRAIN    = int(os.environ.get("MARKET_SEED_TRAIN", 20260))   # semilla de los mundos de entrenamiento
                                                                           # (variable de entorno para variarla por corrida)
 MARKET_SEED_EVAL     = 777001  # semilla base de los mundos de evaluación (distinta de la de entrenamiento)

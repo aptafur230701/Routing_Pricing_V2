@@ -3,7 +3,8 @@ evaluation.py
 =============
 Evaluación posterior al entrenamiento (baselines_drl_ruteo_estocastico.md):
   · rollout_drl_env              — rollout greedy (argmax por nodo) del agente en el entorno
-  · evaluar_mundos_simulados     — DRL, B1, B2, B3 sobre los mismos mundos simulados + UB-PI y UB-DP
+  · evaluar_mundos_simulados     — DRL, B1, B2, B3 sobre los mismos mundos simulados + UB-PI (cota) y UB-DP
+                                   (referencia: valor de la política que ignora el mercado, no es cota)
   · evaluar_replay               — el mismo arnés sobre los días reales de evaluación (market_process=None)
   · resumen_metodos              — márgenes, gaps y métricas operativas por método
   · save_results, plot_*         — Excel y figuras
@@ -29,7 +30,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import torch
 from config import (
-    MAX_DURATION, K_MAX, TRAIN_DAYS,
+    MAX_DURATION, K_MAX, TRAIN_DAYS, MARKET_DIAS_EPISODIO,
     MARKET_SEED_EVAL, MARKET_M_EVAL_WORLDS, REPLAY_MAX_CASOS,
 )
 from baselines import Observacion, PoliticaB1, PoliticaB2, calcular_ev_esperado
@@ -40,18 +41,22 @@ from routing_env import VectorRoutingEnv
 from Solvers import solve_ub_pi
 from stats_analysis import gap_pct, ic_bootstrap_media, ub_dp_floja, NOTA_UB_DP_FLOJA
 
-_DIAS_SIMULADOS_UB_PI = 6   # 77 h = 5,5 días de mercado: 6 días cubren cualquier ruta
+_DIAS_SIMULADOS_UB_PI = MARKET_DIAS_EPISODIO   # días del mundo que cubren cualquier ruta (6: 77 h = 5,5 días de mercado)
 _METODOS = ("DRL", "B1", "B2", "B3")
 
 
 # ── DRL env-based rollout ─────────────────────────────────────
 def make_replay_env(time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
-                    day_offset=0):
+                    day_offset=0, market=None):
     """Entorno de replay de los días reales (market_process=None) sobre el stack dado.
 
     day_offset : índice absoluto del día 0 del stack (TRAIN_DAYS para los días de evaluación);
-        solo define el día de la semana que ve el agente.
+        define el día de la semana que ve el agente y los días de los que se toma el índice.
+    market : MarketProcess del que sale el índice de mercado observado de cada día real
+        (`indice_historico`: 194 nodos, media_lane de entrenamiento, tarifas reales del día, recortado a
+        N nodos). Sin él el entorno no expone `market_index` (y el agente no puede usarlo).
     """
+    indice = None if market is None else market.indice_historico(day_offset, day_offset + rate_stack.shape[0])
     return VectorRoutingEnv(
         time_matrix=time_matrix,
         rate_stack=rate_stack,
@@ -60,6 +65,8 @@ def make_replay_env(time_matrix, rate_stack, loads_stack, distance_arr, diesel_a
         num_nodes=num_nodes,
         max_duration=MAX_DURATION,
         day_offset=day_offset,
+        indice_stack=indice,
+        indice_std=None if market is None else market.params.indice_std,
     )
 
 
@@ -350,9 +357,10 @@ def _fila(modo, K, mundo, nodo, dia_abs, start_day, world_seed, dow, metodo, m, 
 
 
 def _firma_cache(ctx, *partes) -> str:
-    """Huella de lo que determina los baselines y las cotas: el ev (proceso ajustado), la tabla V
+    """Huella de lo que determina los baselines y las cotas: los parámetros del mercado, el ev, la tabla V
     de UB-DP y el diseño de la evaluación. Si cambia algo de eso, el caché no se reutiliza."""
-    h = hashlib.sha1(np.ascontiguousarray(ctx.ev).tobytes())
+    h = hashlib.sha1(ctx.market.firma_params().encode())
+    h.update(np.ascontiguousarray(ctx.ev).tobytes())
     h.update(np.ascontiguousarray(ctx.tabla.V_k).tobytes())
     h.update(np.ascontiguousarray(ctx.tabla.V_libre).tobytes())
     h.update(repr((partes, MAX_DURATION)).encode())
@@ -504,13 +512,13 @@ def evaluar_replay(agent, market, tabla, time_matrix, rate_eval, loads_eval,
 
     Fuera de muestra respecto del proceso (se ajusta solo con los TRAIN_DAYS de
     entrenamiento). ltr_eval / trucks_eval deben estar recortados a los mismos días que rate_eval.
-    UB-PI se resuelve sobre el histórico; UB-DP no aplica (es una cota del proceso).
+    UB-PI se resuelve sobre el histórico; UB-DP no aplica (es la referencia del proceso simulado).
     cache_path : como en evaluar_mundos_simulados, para B1, B2, B3 y UB-PI.
     """
     ctx = ContextoEval(agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
                        ltr_eval, trucks_eval, avail_expected_arr, reward_global_p95)
     env = make_replay_env(time_matrix, rate_eval, loads_eval, distance_arr, diesel_arr, num_nodes,
-                          day_offset=TRAIN_DAYS)
+                          day_offset=TRAIN_DAYS, market=market)
     nodos, dias = casos_replay(num_nodes, rate_eval.shape[0], max_casos)
 
     def baselines(faltan=None, cota_previa=None):
@@ -580,13 +588,15 @@ def _avisar_si_supera_cota(df: pd.DataFrame, tol: float = 1e-6) -> None:
 def resumen_metodos(df: pd.DataFrame) -> pd.DataFrame:
     """Margen medio, gaps contra UB-DP y UB-PI y métricas operativas, por (modo, K, método).
 
-    Los gaps comparan promedios sobre los mismos mundos: (UB − método) / |UB| · 100.
+    Los gaps comparan promedios sobre los mismos mundos: (ref − método) / |ref| · 100, con ref = UB-PI
+    (cota) o UB-DP (política que ignora el mercado; un gap negativo significa que el método la supera).
     margen_medio va con su IC del 95 % por bootstrap sobre mundos (BOOTSTRAP_B remuestreos,
     semilla fija): margen_ic95_low / margen_ic95_high. Cada grupo (modo, K, método) usa su
     propio Generator con la semilla fija, así que el IC no depende del orden de las filas.
-    Se añaden las filas de las cotas (UB-PI, UB-DP) con su valor medio, siempre separadas:
-    nunca se combinan ni se promedian. La columna `nota` marca los K donde UB-DP > UB-PI
-    (cota DP floja: no es la referencia principal ahí).
+    Se añaden las filas de UB-PI (cota) y UB-DP (valor de la política que ignora el mercado, NO es
+    cota: el DRL, que observa el índice, puede superarla), siempre separadas: nunca se combinan ni se
+    promedian. La columna `nota` marca los K donde UB-DP > UB-PI (la política que ignora el mercado no
+    puede superar a la de información perfecta: señal de desajuste entre la DP y el entorno).
     """
     filas = []
     for (modo, K), g in df.groupby(["modo", "K"], sort=False):

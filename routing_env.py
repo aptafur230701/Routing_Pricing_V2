@@ -50,6 +50,19 @@ loads_stack / rate_stack:
   · cada episodio es un "mundo" con semilla propia (`world_seed`): los sorteos
     son función de (world_seed, nodo, día) y no dependen de las acciones.
 
+Índice de mercado (feature del agente)
+--------------------------------------
+`market_index` expone el índice de mercado de TODOS los nodos en el día actual del episodio
+(ver market_process.py): (N,) en RoutingEnv y (B, N) en VectorRoutingEnv, y `index_std` la
+desviación del índice histórico con la que se normaliza.
+  · con market_process: el índice del mundo en (nodo, día) — `MarketProcess.indice_mundo`, con el día
+    de llegada SIN recortar al histórico (start_day_idx + int(t // 14)); solo las filas ya terminadas
+    pueden pasar de MARKET_DIA_MAX y se recortan (sus features no se usan);
+  · sin market_process (replay): `indice_stack[día actual]`, el índice observado de ese día real
+    (MarketProcess.indice_historico), con el mismo recorte de día que las tarifas del stack.
+`indice_stack` / `indice_std` son opcionales en el constructor; leer `market_index` en replay sin
+ellos es un error.
+
 Presupuesto de cardinalidad K (número de arcos, incluido el retorno)
 ----------------------------------------------------------------------
 Se pasa por episodio vía reset(options={"start_node": s, "k_max": K}).
@@ -79,6 +92,7 @@ from config import (
     BIG_M_PENALTY,
     USE_REWARD_SHAPING,
     MARKET_SEED_TRAIN,
+    MARKET_DIA_MAX,
 )
 from fit_market_process import dia_de_semana
 from problem_data import build_day_matrices, draw_lane_availability, lane_reward
@@ -117,6 +131,10 @@ class RoutingEnv(gym.Env):
     market_process : MarketProcess, opcional (default: None = días reales del
                      histórico). Si se pasa, cargas y tarifas se sortean al llegar
                      a cada nodo (ver docstring del módulo).
+    indice_stack   : np.ndarray [num_days, num_nodes], opcional — índice de mercado observado
+                     de cada día del stack (solo replay; ver docstring del módulo).
+    indice_std     : float, opcional — desviación del índice histórico (solo replay; con
+                     market_process sale de sus parámetros).
     """
 
     metadata = {"render_modes": []}
@@ -131,6 +149,8 @@ class RoutingEnv(gym.Env):
         num_nodes:      int,
         max_duration:   float = MAX_DURATION,
         market_process = None,
+        indice_stack:   np.ndarray = None,
+        indice_std:     float = None,
     ):
         super().__init__()
 
@@ -158,6 +178,8 @@ class RoutingEnv(gym.Env):
         self._rm_pen_cache:       dict     = {}
         # Modo market_process
         self._market               = market_process
+        self._indice_stack         = indice_stack
+        self._indice_std           = market_process.params.indice_std if market_process is not None else indice_std
         self._world_seed:          int      = None
         self._reward_row:          np.ndarray = None   # (N,) recompensa penalizada de las lanes salientes
         self._current_loads_row:   np.ndarray = None   # (N,) cargas sorteadas al llegar al nodo actual
@@ -245,8 +267,11 @@ class RoutingEnv(gym.Env):
         # Seed basado en (start_day_idx, node, arrival_day): dos rutas que llegan
         # al mismo nodo el mismo día de calendario ven la misma realización.
         if self._market is not None:
-            # El día de llegada no se recorta al histórico: el mundo es ilimitado.
-            self._revelar_mercado(next_node, self._start_day_idx + int(next_time // 14))
+            # El día de llegada no se recorta al histórico. Como en VectorRoutingEnv, no se revela
+            # nada tras una terminación por la condición A: sus filas no se usan y, con una violación
+            # de tiempo, el día puede salirse del mundo simulado.
+            if not terminated:
+                self._revelar_mercado(next_node, self._start_day_idx + int(next_time // 14))
         else:
             max_day     = self._rate_stack.shape[0] - 1
             arrival_day = min(self._start_day_idx + int(next_time // 14), max_day)
@@ -430,6 +455,23 @@ class RoutingEnv(gym.Env):
         return self._current_loads_row
 
     @property
+    def index_std(self) -> float:
+        """Desviación del índice histórico (normaliza la feature de índice del agente)."""
+        if self._indice_std is None:
+            raise ValueError("index_std requiere market_process o indice_std en el constructor")
+        return float(self._indice_std)
+
+    @property
+    def market_index(self) -> np.ndarray:
+        """(N,) índice de mercado de todos los nodos en el día actual del episodio (ver docstring del módulo)."""
+        if self._market is not None:
+            dia = min(self._start_day_idx + int(self._time_elapsed // 14), MARKET_DIA_MAX)
+            return self._market.indice_mundo(self._world_seed, dia)
+        if self._indice_stack is None:
+            raise ValueError("market_index en replay requiere indice_stack en el constructor")
+        return np.asarray(self._indice_stack[self._get_current_day_idx()], dtype=np.float64)
+
+    @property
     def current_rate_row(self):
         """(N,) tarifa por milla sorteada al llegar al nodo actual (None sin market_process)."""
         return self._current_rate_row
@@ -458,6 +500,9 @@ class VectorRoutingEnv:
     day_offset     : índice absoluto (en el histórico completo) del día 0 de los stacks de este
                    entorno. Solo sirve para `current_dow`: 0 cuando los stacks arrancan en el día 0
                    (entrenamiento, mundos simulados); TRAIN_DAYS para el replay de los días de eval.
+    indice_stack   : (días, N) índice de mercado observado de cada día del stack (replay; ver el
+                   docstring del módulo). Con market_process no se usa.
+    indice_std     : desviación del índice histórico (replay). Con market_process sale de sus parámetros.
     """
 
     def __init__(
@@ -473,6 +518,8 @@ class VectorRoutingEnv:
         diesel_arr:      np.ndarray = None,
         market_seed:     int = MARKET_SEED_TRAIN,
         day_offset:      int = 0,
+        indice_stack:    np.ndarray = None,
+        indice_std:      float = None,
     ):
         if market_process is None and rm_pen_stack is None:
             raise ValueError("rm_pen_stack es obligatorio sin market_process")
@@ -490,6 +537,8 @@ class VectorRoutingEnv:
         self.max_duration    = max_duration
         self._market         = market_process
         self._day_offset     = int(day_offset)
+        self._indice_stack   = indice_stack
+        self._indice_std     = market_process.params.indice_std if market_process is not None else indice_std
         self._distance_arr   = distance_arr
         self._diesel_arr     = diesel_arr
         self._seed_rng       = np.random.default_rng(market_seed)   # reparte semillas de mundo
@@ -825,6 +874,29 @@ class VectorRoutingEnv:
     def current_rate_row(self) -> np.ndarray:
         """(B, N) tarifa por milla sorteada al llegar al nodo actual (None sin market_process)."""
         return self._current_rate_row
+
+    @property
+    def index_std(self) -> float:
+        """Desviación del índice histórico (normaliza la feature de índice del agente)."""
+        if self._indice_std is None:
+            raise ValueError("index_std requiere market_process o indice_std en el constructor")
+        return float(self._indice_std)
+
+    @property
+    def market_index(self) -> np.ndarray:
+        """(B, N) índice de mercado de todos los nodos en el día actual de cada episodio.
+
+        Con market_process: el del mundo de cada episodio en su día de llegada sin recortar al histórico
+        (solo las filas ya terminadas pueden pasar de MARKET_DIA_MAX; se recortan y no se usan).
+        En replay: indice_stack[current_day_idx], el índice observado del día real."""
+        if self._market is not None:
+            dias = np.minimum(
+                self._start_day_idx + (self._time_elapsed // 14).astype(np.int64), MARKET_DIA_MAX,
+            )
+            return self._market.indice_mundo_lote(self._world_seed, dias)
+        if self._indice_stack is None:
+            raise ValueError("market_index en replay requiere indice_stack en el constructor")
+        return np.asarray(self._indice_stack, dtype=np.float64)[self.current_day_idx]
 
     @property
     def k_remaining(self) -> np.ndarray:

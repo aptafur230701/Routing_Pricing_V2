@@ -2,7 +2,8 @@
 excel_report.py
 ===============
 Libro de Excel con los resultados de la evaluación (baselines_drl_ruteo_estocastico.md):
-  · Resumen            — por (K, método): margen medio, gaps contra UB-DP y UB-PI,
+  · Resumen            — por (K, método): margen medio, gaps contra UB-DP (política que ignora el
+                         mercado, no es cota) y UB-PI (cota),
                          factibilidad y métricas operativas; mundos simulados y replay
                          (días reales 90-119, fuera de muestra; etiquetado "replay, fuera de muestra (días 90-119)"); tiempos
                          fuera de línea.
@@ -18,7 +19,7 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from evaluation import resumen_metodos
-from stats_analysis import NOTA_REPLAY, NOTA_UB_DP_FLOJA, NOTA_UB_DP_FLOJA_LARGA
+from stats_analysis import NOTA_REPLAY, NOTA_UB_DP, NOTA_UB_DP_FLOJA, NOTA_UB_DP_FLOJA_LARGA
 
 # ── Palette ───────────────────────────────────────────────────
 _BLUE_DARK    = "2E5395"
@@ -105,7 +106,7 @@ _COLS_RESUMEN = [
     ("Margen medio (USD)",  "margen_medio",        "#,##0"),
     ("IC95 inf (USD)",      "margen_ic95_low",     "#,##0"),
     ("IC95 sup (USD)",      "margen_ic95_high",    "#,##0"),
-    ("Gap vs UB-DP (%)",    "gap_ub_dp_pct",       '0.00"%"'),
+    ("Gap vs UB-DP, ignora el mercado (%)", "gap_ub_dp_pct", '0.00"%"'),
     ("Gap vs UB-PI (%)",    "gap_ub_pi_pct",       '0.00"%"'),
     ("Violación de tiempo (%)", "violacion_pct",   '0.0"%"'),
     ("Millas cargadas (%)", "millas_cargadas_pct", '0.0"%"'),
@@ -138,6 +139,11 @@ def _bloque_resumen(ws, row, titulo, color_oscuro, color_claro, resumen):
             ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=len(_COLS_RESUMEN))
             _data_cell(ws.cell(row, 1), f"* K = {K}: {NOTA_UB_DP_FLOJA_LARGA}", fill_hex=_YELLOW)
             ws.row_dimensions[row].height = 48
+            row += 1
+        if (g["metodo"] == "UB-DP").any():
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=len(_COLS_RESUMEN))
+            _data_cell(ws.cell(row, 1), NOTA_UB_DP)
+            ws.row_dimensions[row].height = 32
             row += 1
         row += 1
     return row

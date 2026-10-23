@@ -60,7 +60,7 @@ problem_data.py ──► matrices (tiempo, tarifa, carga, distancia, diesel, LT
 registro de visitados). La máscara solo excluye el self-loop (no hay acción de esperar), los nodos desde
 los que no se alcanza a volver a casa dentro de `MAX_DURATION` y las lanes sin carga (salvo en el primer
 movimiento desde casa); volver a casa termina el episodio y con K activo el último arco es el retorno
-forzado. Las features por nodo son 7 base + 4 de continuación = 11.
+forzado. Las features por nodo son 7 base + 4 de continuación + 1 de índice de mercado (última columna) = 12.
 
 **Por qué el modelo escala sin reentrenar desde cero**: ninguna capa de
 `AMRoutingAgent` ni de `CriticHead` depende de `num_nodes` — el Transformer
@@ -96,14 +96,14 @@ nodos, ver `NODE_SEQUENCE`).
 Diseño completo en [proceso_exogeno_cargas_tarifas.md](proceso_exogeno_cargas_tarifas.md).
 Con `USE_MARKET_PROCESS = True` el entrenamiento ya no reproduce días del
 histórico: al llegar a cada nodo se sortean las cargas (binomial negativa con
-factor de día de la semana) y las tarifas (remuestreo del histórico de la lane).
+factor de día de la semana) y las tarifas (media de la lane + índice de mercado del nodo + residuo; el índice es un nivel lento fijo en el mundo más una variación diaria AR(1), y el agente lo observa como feature).
 Con `False` el entrenamiento reproduce días reales como antes. La evaluación siempre usa el proceso.
 
 | Archivo | Rol |
 |---|---|
-| [fit_market_process.py](fit_market_process.py) | Estima s_d, mu_ij y phi_h con los primeros `TRAIN_DAYS` días (0-89) del histórico, sin los de evaluación, y guarda `datos/market_params.npz`. `main.py` lo corre solo si el archivo no existe. |
-| [market_process.py](market_process.py) | `MarketProcess`: `sample_arrivals` (lotes con un Generator), `sample_arrivals_por_mundo` (usado por el entorno; determinista por semilla de mundo, nodo y día) y `sample_world` (mundo completo [D, N, N] para baselines). |
-| [validate_market_process.py](validate_market_process.py) | Simula 1.000 réplicas del periodo de ajuste (dentro de muestra) y compara cargas por lane y tarifas con el histórico (tablas y gráficos en `results/market_validation/`). |
+| [fit_market_process.py](fit_market_process.py) | Estima s_d, mu_ij y phi_h, y el modelo de tarifas (media por lane, escenarios del nivel lento con `VENTANA_LENTO_DIAS`, ρ y σ_i del rápido, residuos), con los primeros `TRAIN_DAYS` días del histórico y los 194 nodos, sin los de evaluación, y guarda `datos/market_params.npz`. `main.py` lo corre solo si el archivo no existe. |
+| [market_process.py](market_process.py) | `MarketProcess`: `sample_arrivals` (lotes con un Generator, sin estado de mercado: la política que ignora el mercado de la DP y B2), `sample_arrivals_por_mundo` (usado por el entorno; determinista por semilla de mundo, nodo y día, con lento fijo y rápido AR(1) del mundo), `sample_world` (mundo completo [D, N, N] para baselines), `indice_mundo` e `indice_historico` (índice de mercado simulado y observado en días reales). |
+| [validate_market_process.py](validate_market_process.py) | Simula 200 mundos del periodo de ajuste (dentro de muestra) y compara cargas por lane, cuantiles de tarifa por lane y persistencia del índice (h = 1, 3, 5, 7) con el histórico (tablas y gráficos en `results/market_validation/`). |
 | [tests/test_market_process.py](tests/test_market_process.py) | Reproducibilidad, independencia de las acciones, formas, equivalencia con `market_process=None`, recompensa compartida, ajuste y smoke de entrenamiento. |
 
 Constantes (`FECHA_INICIO`, `DIAS_EXCLUIDOS`, `MARKET_PHI_MAX`, semillas, M) en
@@ -121,8 +121,8 @@ los mismos mundos simulados (mismo `world_seed`), paso a paso en `VectorRoutingE
 | B1 | Greedy miope: arco válido de mayor `lane_reward` de la fila observada (PFA). | [baselines.py](baselines.py) |
 | B2 | Reoptimización determinista con valores esperados de los arcos futuros; ejecuta solo el primer arco. Con K = 5 y con K libre (CFA). Recursión memoizada sobre (nodo, franja de 15 min, k restante) por (casa, día de salida); el camión puede revisitar nodos. | [baselines.py](baselines.py) |
 | B3 | Política de un paso sobre la tabla V de la DP de UB-DP (VFA de tabla). | [dp_relajada.py](dp_relajada.py) |
-| UB-DP | Valor óptimo aproximado de la política no anticipativa: DP en (hogar, día de salida, nodo, franja de 15 min, k), con revisitas permitidas (salvo la discretización y el muestreo con S = 5000). Tabla en `datos/ubdp_tabla_<N>nodos.npz`, se recarga si coincide con los datos. | [dp_relajada.py](dp_relajada.py) |
-| UB-PI | Cota con información perfecta: mejor ruta con el mundo completo conocido (`sample_world` + DP hacia atrás con franjas de 1 min). Debe quedar por encima de UB-DP. | [evaluation.py](evaluation.py), [Solvers.py](Solvers.py) |
+| UB-DP | Valor aproximado de la política que ignora el estado del mercado (no es cota; el DRL, que observa el índice, puede superarlo): DP en (hogar, día de salida, nodo, franja de 15 min, k), con revisitas permitidas (salvo la discretización y el muestreo con S = 5000). Tabla en `datos/ubdp_tabla_<N>nodos.npz`, se recarga si coincide con los datos. | [dp_relajada.py](dp_relajada.py) |
+| UB-PI | Cota con información perfecta: mejor ruta con el mundo completo conocido (`sample_world` + DP hacia atrás con franjas de 1 min). Debe quedar por encima de UB-DP y del DRL. | [evaluation.py](evaluation.py), [Solvers.py](Solvers.py) |
 
 | Archivo | Rol |
 |---|---|

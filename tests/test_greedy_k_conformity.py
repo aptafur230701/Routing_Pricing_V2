@@ -46,6 +46,7 @@ def synthetic():
         distance_arr=distance_arr, diesel_arr=diesel_arr,
         trucks_stack=trucks_stack, ltr_stack=ltr_stack, rm_pen_stack=rm_pen_stack,
         ev_esperado=np.random.RandomState(0).uniform(-50, 200, size=(7, N, N)),   # features de continuación
+        indice_stack=np.random.RandomState(1).normal(0.0, 0.1, size=(3, N)),      # índice de mercado por día
     )
 
 
@@ -55,6 +56,7 @@ def env(synthetic):
         time_matrix=synthetic["time_matrix"], rate_stack=synthetic["rate_stack"],
         loads_stack=synthetic["loads_stack"], rm_pen_stack=synthetic["rm_pen_stack"],
         num_nodes=N, max_duration=MAX_DURATION_SYN,
+        indice_stack=synthetic["indice_stack"], indice_std=0.1,
     )
 
 

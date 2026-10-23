@@ -178,10 +178,11 @@ def load_matrices(num_nodes: int) -> tuple:
     ltr_raw = np.load(os.path.join(data_dir, "ltr.npy"))
     ltr_stack = ltr_raw[:num_nodes, :].astype(np.float32)
 
-    # trucks_forward: [194, 600] donde 600 = 120 fechas × 5 deltas (orden: fecha es nivel outer)
-    # reshape a [num_nodes, 120, 5] y tomar solo deltas 1,2,3 (índices 0,1,2)
+    # trucks_forward: [194, fechas × 5 deltas] (orden: fecha es nivel outer); el nº de fechas sale de la forma
+    # del archivo. reshape a [num_nodes, fechas, 5] y tomar solo deltas 1,2,3 (índices 0,1,2)
     trucks_raw = np.load(os.path.join(data_dir, "trucks_forward.npy"))
-    trucks_stack = trucks_raw[:num_nodes, :].astype(np.float32).reshape(num_nodes, 120, 5)[:, :, 0:3]
+    n_deltas = 5
+    trucks_stack = trucks_raw[:num_nodes, :].astype(np.float32).reshape(num_nodes, -1, n_deltas)[:, :, 0:3]
 
     # ── Slice fixed matrices to num_nodes ─────────────────────────
     time_matrix  = time_matrix_raw.iloc[:num_nodes, :num_nodes].to_numpy(dtype=float)

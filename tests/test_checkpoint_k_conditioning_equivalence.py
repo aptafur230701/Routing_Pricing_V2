@@ -76,9 +76,10 @@ def test_free_case_rollout_quality_vs_exact_optimum(loaded):
      ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95) = data
     num_days = loads_stack.shape[0]
     time_matrix_np = np.asarray(time_matrix, dtype=float)
-    env = make_replay_env(time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, NUM_NODES)
     asegurar_parametros()
-    ev_esperado = calcular_ev_esperado(MarketProcess(NUM_NODES), distance_arr, diesel_arr)
+    market = MarketProcess(NUM_NODES)
+    env = make_replay_env(time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, NUM_NODES, market=market)
+    ev_esperado = calcular_ev_esperado(market, distance_arr, diesel_arr)
 
     drl_rewards, opt_rewards = [], []
     for day in range(TRAIN_DAYS, num_days):

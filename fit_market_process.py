@@ -13,15 +13,27 @@ proceso_exogeno_cargas_tarifas.md).
              · mu_ij: tasa diaria base de la lane = n_ij / E  (E = Σ s_d sobre las fechas)
              · phi_h: dispersión por grupo de volumen (cuartiles de mu_ij), por
                       máxima verosimilitud conjunta; tope MARKET_PHI_MAX
-  Fase 3 — tarifas: se guarda el histórico de tarifa por milla de cada lane
-           (todos los días de ajuste, con o sin cargas) para remuestrearlo con reemplazo.
+  Fase 3 — tarifas: modelo con estado de mercado por nodo,
+
+               tarifa(i→j, d) = media_lane(ij) + índice(i, d) + residuo(ij)
+               índice(i, d)   = lento(i) + rápido(i, d),   rápido(i, d) = ρ · rápido(i, d−1) + ε,  ε ~ N(0, σ_i²)
+
+             · media_lane : promedio de la tarifa de la lane en los días de ajuste
+             · índice     : promedio, sobre las lanes salientes de i del universo (≥ 1 carga, sin la
+                            diagonal), de tarifa − media_lane, menos el nivel nacional (promedio del
+                            índice bruto sobre todos los nodos)
+             · lento      : promedio centrado del índice en VENTANA_LENTO_DIAS días (solo los días con
+                            la ventana completa: los "días de escenario")
+             · rápido     : índice − lento; ρ por mínimos cuadrados (todos los nodos juntos), σ_i del
+                            error de esa regresión en cada nodo
+             · residuo    : tarifa − media_lane − índice, por lane y día de ajuste
 
 Uso
 ---
     python fit_market_process.py
 
 Escribe datos/market_params.npz (indexable por [origen, destino]). El ajuste usa los
-primeros TRAIN_DAYS días; las fechas salen de FECHA_INICIO + índice del día.
+primeros TRAIN_DAYS días y los 194 nodos; las fechas salen de FECHA_INICIO + índice del día.
 """
 
 import os
@@ -31,6 +43,7 @@ from scipy.special import gammaln
 
 from config import (
     FECHA_INICIO, DIAS_EXCLUIDOS, TRAIN_DAYS, MARKET_PHI_MAX, MARKET_N_GRUPOS, MARKET_PARAMS_PATH,
+    VENTANA_LENTO_DIAS,
 )
 
 _CWD = os.path.dirname(os.path.abspath(__file__))
@@ -120,6 +133,90 @@ def estimar_phi_grupo(y: np.ndarray, m: np.ndarray, phi_max: float = MARKET_PHI_
     return float(np.exp(res.x))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Fase 3 — tarifas: índice de mercado por nodo
+# ─────────────────────────────────────────────────────────────────────────────
+
+def indice_observado(rate: np.ndarray, media_lane: np.ndarray, universo_indice: np.ndarray) -> np.ndarray:
+    """Índice de mercado observado de todos los nodos en cada día, (D, N).
+
+    I(i, d)     = promedio, sobre las lanes salientes de i en `universo_indice`, de
+                  tarifa(i, j, d) − media_lane(ij)
+    nac(d)      = promedio de I(i, d) sobre los N nodos
+    índice(i,d) = I(i, d) − nac(d)
+
+    Es la definición del ajuste y también la del replay de días reales: allí rate son las
+    tarifas reales del día (N = 194 nodos), media_lane la de entrenamiento.
+    rate : (D, N, N). media_lane, universo_indice : (N, N).
+    """
+    rate = np.asarray(rate, dtype=np.float64)
+    cuenta = universo_indice.sum(axis=1)                                   # (N,) lanes del universo por nodo
+    if (cuenta == 0).any():
+        raise ValueError(f"nodos sin lanes salientes en el universo: {np.flatnonzero(cuenta == 0).tolist()}")
+    desvio = (rate - media_lane[None]) * universo_indice[None]             # (D, N, N)
+    bruto = desvio.sum(axis=2) / cuenta[None]                              # (D, N)
+    return bruto - bruto.mean(axis=1, keepdims=True)
+
+
+def ajustar_tarifas(rates: np.ndarray, universo: np.ndarray, ventana: int = VENTANA_LENTO_DIAS,
+                    dias: np.ndarray = None) -> dict:
+    """Estima media_lane, escenarios de lento, ρ, σ_i y residuos (pasos a–g del modelo de tarifas).
+
+    rates : (D, N, N) tarifa por milla de los días de ajuste. universo : (N, N) bool, lanes con al menos
+    una carga. El índice usa el universo sin la diagonal (las lanes i→i no son jugables).
+    dias : (D,) índice de calendario de cada día de ajuste (por defecto 0 … D−1). Una ventana del lento solo
+    es completa si sus `ventana` días de calendario están todos presentes (con DIAS_EXCLUIDOS vacía, todas
+    las que caben en los D días).
+    """
+    rates = np.asarray(rates, dtype=np.float64)
+    D, N, _ = rates.shape
+    dias = np.arange(D) if dias is None else np.asarray(dias)
+    if ventana % 2 != 1 or ventana < 1:
+        raise ValueError(f"la ventana del lento debe ser impar, recibí {ventana}")
+    mitad = ventana // 2
+
+    media_lane = rates.mean(axis=0)                                        # (N, N)
+    universo_indice = universo & ~np.eye(N, dtype=bool)
+    indice = indice_observado(rates, media_lane, universo_indice)          # (D, N)
+
+    # lento: promedio centrado en `ventana` días; solo con la ventana completa → días de escenario.
+    if D < ventana:
+        raise ValueError(f"{D} días no alcanzan para la ventana de {ventana}")
+    ventanas = np.lib.stride_tricks.sliding_window_view(indice, ventana, axis=0)     # (D − ventana + 1, N, ventana)
+    inicio = np.arange(D - ventana + 1)
+    completa = (dias[inicio + ventana - 1] - dias[inicio]) == ventana - 1
+    centros = inicio[completa] + mitad                                     # posición del día de escenario
+    lento = ventanas.mean(axis=-1)[completa]                               # (n_esc, N)
+    rapido = indice[centros] - lento                                       # (n_esc, N)
+
+    # ρ: regresión de rápido(d) sobre rápido(d−1) por mínimos cuadrados (por el origen: rápido tiene media ~0),
+    # todos los nodos juntos, con los pares de días de escenario consecutivos. σ_i: desviación del error de esa
+    # regresión en el nodo i.
+    seguido = (centros[1:] - centros[:-1]) == 1
+    if not seguido.any():
+        raise ValueError(f"{D} días no alcanzan para la ventana de {ventana}: se necesitan ≥ 2 días de escenario seguidos")
+    x, y = rapido[:-1][seguido], rapido[1:][seguido]
+    rho = float((x * y).sum() / (x * x).sum())
+    sigma = (y - rho * x).std(axis=0, ddof=1)                              # (N,)
+
+    residuos = rates - media_lane[None] - indice[:, :, None]               # (D, N, N)
+    var_indice = float(indice[centros].var())
+    return {
+        "media_lane": media_lane,
+        "min_lane": rates.min(axis=0),
+        "universo_indice": universo_indice,
+        "indice": indice,                                                  # (D, N) del ajuste (para validar)
+        "indice_std": np.float64(indice.std()),                            # desviación del índice histórico, un solo valor
+        "lento_escenarios": lento,                                         # (n_esc, N)
+        "dias_escenario": dias[centros].astype(np.int64),
+        "rho": np.float64(rho),
+        "sigma": sigma,
+        "residuos": residuos.astype(np.float32),                           # (D, N, N)
+        "frac_var_lento": np.float64(float(lento.var()) / var_indice),
+        "ventana_lento": np.int64(ventana),
+    }
+
+
 def ajustar(
     loads_stack: np.ndarray,
     rate_stack:  np.ndarray,
@@ -127,8 +224,9 @@ def ajustar(
     dias_excluidos=None,
     phi_max: float = MARKET_PHI_MAX,
     n_grupos: int = MARKET_N_GRUPOS,
+    ventana_lento: int = VENTANA_LENTO_DIAS,
 ) -> dict:
-    """Estima s_d, mu_ij, phi_h y reúne las tarifas históricas por lane.
+    """Estima s_d, mu_ij, phi_h y el modelo de tarifas (media_lane, lento, ρ, σ_i, residuos).
 
     Parámetros
     ----------
@@ -167,13 +265,15 @@ def ajustar(
         m = media_dia[:, None] * mu[sel][None, :]          # (D, L_h)
         phi[h] = estimar_phi_grupo(y.ravel(), m.ravel(), phi_max)
 
+    tarifas = ajustar_tarifas(rates, universo, ventana_lento, idx)
+
     return {
+        **tarifas,
         "s": s,
         "mu": mu,
         "phi": phi,
         "grupo": grupo,
         "universo": universo,
-        "tarifas": rates.astype(np.float32),          # (D, N, N) histórico por lane
         "n_ij": n_ij,
         "exposicion": np.float64(exposicion),
         "cortes_grupo": cortes,
@@ -204,6 +304,13 @@ def imprimir_resumen(params: dict) -> None:
     print("phi_h (dispersión por grupo de volumen, h = 0 menor volumen):")
     for h, (p, n) in enumerate(zip(params["phi"], params["n_lanes_grupo"])):
         print(f"   h={h}: phi = {p:10.3f}   ({n} lanes)")
+    print(f"Tarifas — ρ (persistencia del rápido) : {float(params['rho']):.4f}")
+    print(f"          σ_i del rápido              : media {params['sigma'].mean():.4f}  "
+          f"[{params['sigma'].min():.4f}, {params['sigma'].max():.4f}]")
+    print(f"          escenarios de lento         : {len(params['lento_escenarios'])} "
+          f"(ventana {int(params['ventana_lento'])} días)")
+    print(f"          fracción de la varianza del índice que es lento: {float(params['frac_var_lento']):.4f}")
+    print(f"          desviación del índice       : {float(params['indice_std']):.4f} $/milla")
 
 
 def main() -> dict:

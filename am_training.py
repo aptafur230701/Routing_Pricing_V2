@@ -63,6 +63,7 @@ from baselines import calcular_ev_esperado
 from debug_utils import check_tensor
 from dp_relajada import cargar_o_calcular_tabla, PoliticaB3
 from evaluation import disenar_mundos, ejecutar_politica
+from market_process import MarketProcess, asegurar_parametros
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -580,6 +581,15 @@ def run_am_training(
         ev_esperado = calcular_ev_esperado(market_process, distance_arr, diesel_arr)
 
     # ── Entorno vectorizado (una sola instancia, reutilizada en cada update) ──
+    # Índice de mercado observado de los días de entrenamiento (194 nodos, recortado a N): lo ven los entornos
+    # de replay (el monitor greedy y el entrenamiento con días reales). Con proceso exógeno el entrenamiento
+    # usa el índice del mundo de cada episodio.
+    if market_process is not None:
+        mercado = market_process
+    else:
+        asegurar_parametros()
+        mercado = MarketProcess(num_nodes)
+    indice_train = mercado.indice_historico(0, num_train_days)
     vec_env = VectorRoutingEnv(
         time_matrix=time_matrix,
         rate_stack=rate_stack,
@@ -590,6 +600,8 @@ def run_am_training(
         market_process=market_process,
         distance_arr=distance_arr,
         diesel_arr=diesel_arr,
+        indice_stack=indice_train,
+        indice_std=mercado.params.indice_std,
     )
     # Entorno del monitor greedy: replay de los días de entrenamiento (market_process=None),
     # aunque el entrenamiento use mundos simulados. Si ya hay rm_pen_stack se reutiliza.
@@ -603,6 +615,8 @@ def run_am_training(
         ),
         num_nodes=num_nodes,
         max_duration=MAX_DURATION,
+        indice_stack=indice_train,
+        indice_std=mercado.params.indice_std,
     )
     # Generador PROPIO de semillas de mundo (nunca el estado global de numpy): una
     # semilla por episodio y update, independiente de las decisiones del agente.
@@ -716,6 +730,7 @@ def run_am_training(
                     avail_expected_arr=avail_expected_arr,
                     reward_rows=vec_env.reward_rows,
                     ev=ev_esperado, time_elapsed=time_el, dow0=vec_env.start_dow,
+                    market_index=vec_env.market_index, index_std=vec_env.index_std,
                 )   # (B, N, N_NODE_FEATURES)
                 temporal = build_temporal_features_batch(time_el, step_cnt, MAX_DURATION, num_nodes)   # (B, 3)
                 market   = build_market_features_batch(cur_nodes, day_idx, ltr_stack) if ltr_stack is not None \

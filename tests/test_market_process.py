@@ -3,8 +3,12 @@ test_market_process.py
 ======================
 Pruebas del proceso exógeno de cargas y tarifas (proceso_exogeno_cargas_tarifas.md):
 
-  · misma semilla y mismos parámetros ⇒ misma salida
+  · misma semilla y mismos parámetros ⇒ misma salida (cargas, tarifas, lento e índice del mundo)
   · la salida no cambia con las acciones del agente
+  · el lento es fijo durante el episodio; el rápido arranca en su distribución estacionaria
+  · un mismo (nodo, día) da el mismo índice desde el entorno, sample_world e indice_mundo
+  · tarifas: nunca por debajo del mínimo histórico de la lane; sample_arrivals con los mismos marginales
+  · las cargas son las del generador anterior (misma terna ⇒ mismas cargas)
   · formas, tipos y tarifa positiva en todas las lanes
   · con market_process=None el entorno reproduce las recompensas de siempre
   · la función de recompensa compartida coincide con rm_pen_stack
@@ -21,6 +25,7 @@ import pytest
 import am_training
 from config import (
     MAX_DURATION, REWARD_SCALE_FACTOR, BIG_M_PENALTY, DIAS_EXCLUIDOS, FECHA_INICIO, TRAIN_DAYS,
+    MARKET_DIA_MAX,
 )
 from fit_market_process import ajustar, dia_de_semana, cargar_matrices_completas, params_path
 from market_process import MarketProcess, asegurar_parametros
@@ -164,7 +169,7 @@ def test_entorno_ve_el_mismo_mundo_que_sample_world(data, mp):
 def test_formas_tipos_y_tarifa_positiva(mp):
     B = 64
     rng = np.random.default_rng(0)
-    nodos = rng.integers(0, NUM_NODES, B); dias = rng.integers(0, 120, B)
+    nodos = rng.integers(0, NUM_NODES, B); dias = rng.integers(0, TRAIN_DAYS, B)
 
     loads, rates = mp.sample_arrivals(nodos, dias, rng)
     for l, r in (
@@ -384,6 +389,184 @@ def test_media_y_ceros_simulados_se_parecen_al_historico_por_grupo():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Modelo de tarifas: lento, rápido, índice del mundo
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Cargas capturadas del generador ANTERIOR (remuestreo por lane) con NUM_NODES = 10: (semilla, nodo, día, cargas).
+# Las cargas no cambian con el modelo de tarifas: misma terna ⇒ mismas cargas.
+CARGAS_REFERENCIA = [
+    (5, 0, 3, [215, 82, 73, 34, 8, 1, 19, 28, 1, 0]),
+    (5, 1, 40, [256, 191, 53, 7, 39, 16, 3, 69, 10, 0]),
+    (123, 3, 89, [18, 4, 18, 40, 27, 3, 0, 7, 0, 0]),
+    (777, 9, 12, [0, 15, 0, 0, 0, 0, 0, 0, 0, 0]),
+    (20260, 7, 60, [161, 25, 66, 11, 2, 0, 6, 30, 2, 0]),
+    (31, 2, 94, [38, 15, 109, 26, 5, 7, 7, 32, 7, 0]),
+]
+
+
+@pytest.mark.parametrize("semilla,nodo,dia,cargas", CARGAS_REFERENCIA)
+def test_cargas_son_las_del_generador_anterior(mp, semilla, nodo, dia, cargas):
+    loads, _ = mp.sample_arrivals_por_mundo([nodo], [dia], [semilla])
+    assert loads[0].tolist() == cargas
+
+
+def test_mundo_determinista_por_semilla_nodo_dia(mp):
+    """lento, índice y filas son función pura de la semilla (y del nodo y día), también con otro caché."""
+    otro = MarketProcess(NUM_NODES)
+    for semilla in (3, 4):
+        assert np.array_equal(mp.lento_mundo(semilla), otro.lento_mundo(semilla))
+        for dia in (0, 17, MARKET_DIA_MAX):
+            assert np.array_equal(mp.indice_mundo(semilla, dia), otro.indice_mundo(semilla, dia))
+    assert not np.array_equal(mp.indice_mundo(3, 5), mp.indice_mundo(4, 5))
+    l1, r1 = mp.sample_arrivals_por_mundo([2, 2], [10, 10], [8, 8])
+    assert np.array_equal(r1[0], r1[1]) and np.array_equal(l1[0], l1[1])
+    # el índice de un nodo no depende de cuántos nodos tenga la corrida (el mundo se genera con los 194)
+    mp5 = MarketProcess(5)
+    assert np.array_equal(mp5.indice_mundo(3, 12), mp.indice_mundo(3, 12)[:5])
+
+
+def test_indice_mundo_fuera_del_mundo_es_error(mp):
+    with pytest.raises(ValueError):
+        mp.indice_mundo(1, MARKET_DIA_MAX + 1)
+    with pytest.raises(ValueError):
+        mp.indice_mundo(1, -1)
+
+
+def test_lento_es_el_mismo_todo_el_episodio(mp):
+    """El lento del mundo es la fila de un día de escenario y no cambia con el día ni con las llamadas."""
+    for semilla in (1, 2, 3):
+        lento = mp.lento_mundo(semilla).copy()
+        assert any(np.array_equal(lento, fila) for fila in mp.params.lento_escenarios)
+        for dia in range(0, MARKET_DIA_MAX + 1, 7):
+            mp.indice_mundo(semilla, dia)
+            mp.sample_arrivals_por_mundo([0, 1], [dia, dia], [semilla, semilla])
+        assert np.array_equal(mp.lento_mundo(semilla), lento)
+
+
+def test_rapido_estacionario_y_con_la_persistencia_estimada():
+    """índice − lento, entre mundos, tiene desviación σ_i / sqrt(1 − ρ²) desde el día 0 y autocorrelación ρ."""
+    mp = MarketProcess(NUM_NODES)
+    W = 1500
+    rapido = np.stack([mp._mundo(s)[1] - mp._mundo(s)[0] for s in range(W)])    # (W, días, N)
+    sd = mp.params.sigma / np.sqrt(1 - mp.params.rho ** 2)
+    for dia in (0, 1, 30, MARKET_DIA_MAX):
+        np.testing.assert_allclose(rapido[:, dia].std(axis=0), sd, rtol=0.12)
+    x, y = rapido[:, 40:-1].ravel(), rapido[:, 41:].ravel()
+    assert (x * y).sum() / (x * x).sum() == pytest.approx(mp.params.rho, abs=0.03)
+
+
+def test_indice_coincide_entre_entorno_sample_world_e_indice_mundo(data, mp):
+    semilla, dia0 = 99, 3
+    _, _, ind_w = mp.sample_world(semilla, 8, dia_inicial=dia0, devolver_indice=True)      # (8, N)
+    for d in range(8):
+        assert np.array_equal(ind_w[d], mp.indice_mundo(semilla, dia0 + d))
+    # entorno escalar y vectorial: mismo índice en el día de salida y en los días siguientes
+    senv = _scalar_env(data, mp)
+    senv.reset(seed=0, options={"start_node": 2, "start_day_idx": dia0, "world_seed": semilla})
+    venv = _vector_env(data, mp)
+    venv.reset(np.array([2]), np.array([dia0]), world_seeds=np.array([semilla]))
+    assert np.array_equal(senv.market_index, ind_w[0]) and np.array_equal(venv.market_index[0], ind_w[0])
+    assert senv.index_std == venv.index_std == mp.params.indice_std
+    # y tras avanzar el tiempo (días de mercado de 14 h), con acciones válidas hasta que termine el episodio
+    rng = np.random.RandomState(0)
+    mask = senv._get_action_mask()
+    for _ in range(NUM_NODES):
+        destino = int(rng.choice(np.where(mask == 1)[0]))
+        _, _, terminado, _, info = senv.step(destino)
+        _, _, masks = venv.step(np.array([destino]))
+        if terminado:
+            break
+        d = int(senv.time_elapsed // 14)
+        assert np.array_equal(senv.market_index, ind_w[d]) and np.array_equal(venv.market_index[0], ind_w[d])
+        mask = info["action_mask"]
+
+
+def test_indice_del_entorno_no_depende_de_las_acciones(data, mp):
+    B = 30
+    rng = np.random.RandomState(1)
+    starts = rng.randint(0, NUM_NODES, B).astype(np.int64)
+    days = rng.randint(0, TRAIN_DAYS, B).astype(np.int64)
+    seeds = rng.randint(0, 2**31 - 1, B)
+    for politica in (1, 2):
+        env = _vector_env(data, mp)
+        masks = env.reset(starts, days, world_seeds=seeds)
+        r = np.random.RandomState(politica)
+        activos = np.ones(B, dtype=bool)
+        for _ in range(NUM_NODES):
+            if not activos.any():
+                break
+            for b in np.where(activos)[0]:
+                dia = int(env._start_day_idx[b]) + int(env.time_elapsed[b] // 14)
+                assert np.array_equal(env.market_index[b], mp.indice_mundo(int(seeds[b]), dia))
+            acts = np.array([r.choice(np.where(m == 1)[0]) for m in masks])
+            _, term, masks = env.step(acts)
+            activos &= ~term
+
+
+def test_tarifas_no_bajan_del_minimo_historico_y_se_cuentan_los_recortes(mp):
+    mp.reiniciar_recorte()
+    for semilla in range(30):
+        _, rates = mp.sample_arrivals_por_mundo(
+            np.arange(NUM_NODES), np.full(NUM_NODES, semilla % TRAIN_DAYS), np.full(NUM_NODES, semilla))
+        assert (rates.astype(np.float64) >= mp.params.min_lane - 1e-12).all()
+    rng = np.random.default_rng(0)
+    nodos = rng.integers(0, NUM_NODES, 300)
+    _, rates = mp.sample_arrivals(nodos, rng.integers(0, TRAIN_DAYS, 300), rng)
+    assert (rates.astype(np.float64) >= mp.params.min_lane[nodos] - 1e-12).all()
+    est = mp.estadisticas_recorte()
+    assert est["tarifas"] == (30 * NUM_NODES + 300) * NUM_NODES
+    assert 0 < est["recortadas"] < est["tarifas"]                  # el piso se activa en una fracción pequeña
+    assert 0 <= est["pct_universo"] < 15
+
+
+def test_sample_arrivals_tiene_los_mismos_marginales_que_los_mundos(mp):
+    """Sin memoria pero con la misma distribución de la tarifa en un (nodo, día) cualquiera."""
+    n = 3000
+    nodo, dia = 4, 20
+    _, r_mundos = mp.sample_arrivals_por_mundo(np.full(n, nodo), np.full(n, dia), np.arange(n))
+    _, r_llegadas = mp.sample_arrivals(np.full(n, nodo), np.full(n, dia), np.random.default_rng(0))
+    uni = mp._universo_lane[nodo]
+    for f in (np.mean, np.std):
+        a, b = f(r_mundos[:, uni], axis=0), f(r_llegadas[:, uni], axis=0)
+        assert np.median(np.abs(a - b) / np.abs(a)) < 0.03
+
+
+def test_la_firma_cambia_con_los_parametros_del_mercado(mp):
+    """La tabla V de UB-DP y el caché de la evaluación se recalculan solos si cambian los datos del mercado."""
+    import copy
+    from dp_relajada import _firma
+    from config import UBDP_DT_HORAS, UBDP_S, UBDP_SEED
+    T = np.ones((NUM_NODES, NUM_NODES)); D = np.ones((NUM_NODES, NUM_NODES))
+    args = (T, D, D, 5, UBDP_S, UBDP_DT_HORAS, UBDP_SEED)
+    base, f0 = mp.firma_params(), _firma(mp, *args)
+    assert MarketProcess(NUM_NODES).firma_params() == base
+    for campo, cambio in (("media_lane", lambda a: a + 0.01), ("sigma", lambda a: a * 1.1),
+                          ("residuos", lambda a: a + np.float32(0.01)), ("lento_escenarios", lambda a: a + 0.01),
+                          ("min_lane", lambda a: a - 0.01), ("mu", lambda a: a * 1.1)):
+        otro = copy.copy(mp); otro.params = copy.copy(mp.params)
+        setattr(otro.params, campo, cambio(getattr(mp.params, campo)))
+        assert otro.firma_params() != base and _firma(otro, *args) != f0, campo
+    otro = copy.copy(mp); otro.params = copy.copy(mp.params); otro.params.rho = mp.params.rho + 0.01
+    assert otro.firma_params() != base
+
+
+def test_indice_historico_es_la_definicion_del_ajuste():
+    """Días de entrenamiento: el índice guardado en el ajuste. Días de evaluación: misma definición con
+    los 194 nodos y las tarifas reales, recortada a N."""
+    mp = MarketProcess(NUM_NODES)
+    with np.load(params_path()) as z:
+        guardado = z["indice"][:, :NUM_NODES]
+    assert np.allclose(mp.indice_historico(0, TRAIN_DAYS), guardado, atol=1e-9)
+    ev = mp.indice_historico(TRAIN_DAYS, None)
+    rate = np.load(os.path.join(os.path.dirname(__file__), "..", "datos", "rate.npy")).astype(np.float64)[TRAIN_DAYS:]
+    assert ev.shape == (rate.shape[0], NUM_NODES)
+    with np.load(params_path()) as z:
+        media, uni = z["media_lane"], z["universo_indice"]
+    bruto = ((rate - media[None]) * uni[None]).sum(axis=2) / uni.sum(axis=1)[None]
+    assert np.allclose(ev, (bruto - bruto.mean(axis=1, keepdims=True))[:, :NUM_NODES])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Ajuste
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -399,10 +582,11 @@ def test_dias_excluidos_vacia_por_defecto_y_ajuste_usa_todos_los_dias():
     assert list(DIAS_EXCLUIDOS) == []
     for D in (21, 35):   # el número de días sale de la forma de la matriz
         loads, rate = _panel_sintetico(D=D)
-        p = ajustar(loads, rate, FECHA_INICIO, DIAS_EXCLUIDOS)
+        p = ajustar(loads, rate, FECHA_INICIO, DIAS_EXCLUIDOS, ventana_lento=5)
         assert len(p["dias_usados"]) == D
         assert np.array_equal(p["dias_usados"], np.arange(D))
-        assert p["tarifas"].shape[0] == D
+        assert p["residuos"].shape[0] == p["indice"].shape[0] == D
+        assert len(p["lento_escenarios"]) == D - 5 + 1                   # días con la ventana completa
         assert p["fechas_ajuste"][0] == FECHA_INICIO
         assert p["s"].mean() == pytest.approx(1.0)
         assert p["mu"][0, 1] == 0 and not p["universo"][0, 1]
@@ -410,7 +594,7 @@ def test_dias_excluidos_vacia_por_defecto_y_ajuste_usa_todos_los_dias():
 
 def test_ajuste_excluye_solo_las_fechas_indicadas():
     loads, rate = _panel_sintetico(D=21)
-    p = ajustar(loads, rate, FECHA_INICIO, ["2026-01-05", "2026-01-06"])
+    p = ajustar(loads, rate, FECHA_INICIO, ["2026-01-05", "2026-01-06"], ventana_lento=5)
     assert len(p["dias_usados"]) == 19
     assert 4 not in p["dias_usados"] and 5 not in p["dias_usados"]
     with pytest.raises(ValueError):
@@ -424,7 +608,7 @@ def test_parametros_guardados_usan_solo_dias_de_entrenamiento():
     loads, rate = cargar_matrices_completas(TRAIN_DAYS)
     assert loads.shape[0] == TRAIN_DAYS
     with np.load(params_path()) as z:
-        assert z["tarifas"].shape[0] == len(z["dias_usados"]) == TRAIN_DAYS
+        assert z["residuos"].shape[0] == z["indice"].shape[0] == len(z["dias_usados"]) == TRAIN_DAYS
         assert np.array_equal(z["dias_usados"], np.arange(TRAIN_DAYS))
 
 

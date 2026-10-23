@@ -82,12 +82,13 @@ def load_latest_day():
 
     # Último día del stack histórico = día más reciente disponible
     last = rate_stack.shape[0] - 1
+    asegurar_parametros()
+    market = MarketProcess(NUM_NODES)
     env = make_replay_env(
         time_matrix, rate_stack[last:], loads_stack[last:], distance_arr, diesel_arr, NUM_NODES,
-        day_offset=last,
+        day_offset=last, market=market,
     )
-    asegurar_parametros()
-    ev_esperado = calcular_ev_esperado(MarketProcess(NUM_NODES), distance_arr, diesel_arr)   # una vez
+    ev_esperado = calcular_ev_esperado(market, distance_arr, diesel_arr)   # una vez
     return dict(
         env=env,
         ev_esperado=ev_esperado,

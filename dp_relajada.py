@@ -13,12 +13,14 @@ retorno a casa posible dentro de MAX_DURATION y retorno forzado cuando queda un 
 Volver a casa da la recompensa del arco y termina con valor cero. La recompensa es
 `lane_reward`, sin shaping.
 
-UB-DP es, por tanto, el valor óptimo aproximado de la política no anticipativa (salvo la
-discretización de 15 min y el muestreo con S = 5000 sorteos). Una diferencia menor con el
-entorno: allí, volver al mismo nodo el mismo día ve la MISMA fila del mundo (es función de
-la semilla del mundo, el nodo y el día), mientras que la DP sortea una fila nueva en cada
-llegada. UB-PI (Solvers.solve_ub_pi) es la cota con información perfecta y debe quedar por
-encima de UB-DP.
+UB-DP es, por tanto, el valor aproximado (salvo la discretización de 15 min y el muestreo con
+S = 5000 sorteos) de la mejor política que IGNORA EL ESTADO DEL MERCADO: conoce la distribución
+de cargas y tarifas pero no el índice del nodo ni su persistencia (`sample_arrivals` sortea un
+lento y un rápido estacionario nuevos en cada llegada). No es una cota para una política que
+observa el índice, que puede superarla. Una diferencia menor con el entorno: allí, volver al
+mismo nodo el mismo día ve la MISMA fila del mundo (es función de la semilla del mundo, el
+nodo y el día), mientras que la DP sortea una fila nueva en cada llegada. UB-PI
+(Solvers.solve_ub_pi) es la cota con información perfecta y debe quedar por encima de UB-DP.
 
 Estado de la tabla: V[k, d0, h, j, s]
   · k  : arcos restantes (incluido el retorno); solo en la tabla de K fijo.
@@ -72,6 +74,8 @@ def tabla_path(num_nodes: int) -> str:
 class TablaDP:
     """Tablas V (K fijo y caso libre) de UB-DP y acceso en línea para B3.
 
+    UB-DP no es una cota: es el valor de la política que ignora el mercado (ver el docstring del módulo).
+
     Atributos
     ---------
     V_k    : (K+1, 7, H, N, Ns) float32 — tabla con dimensión k (k = 0 sin uso).
@@ -96,7 +100,7 @@ class TablaDP:
     # ── UB-DP ────────────────────────────────────────────────────────────────
 
     def ub_dp(self, nodo_inicio: int, dia_semana: int, K=None) -> float:
-        """UB-DP: valor óptimo aproximado de la mejor política no anticipativa.
+        """UB-DP: valor aproximado de la mejor política que ignora el estado del mercado (no es cota).
 
         K = None → caso libre; K = entero → tabla de K arcos (K ≤ K de la tabla).
         """
@@ -180,8 +184,8 @@ def _sortear_filas(market, distance_arr, diesel_arr, S, seed):
 def _firma(market, time_matrix, distance_arr, diesel_arr, K, S, dt, seed) -> str:
     """Huella de todo lo que determina la tabla (decide si un .npz guardado sirve)."""
     h = hashlib.sha256()
-    for a in (market.params.mu, market.params.s, market.params.phi, market.params.grupo,
-              market.params.tarifas, time_matrix, distance_arr, diesel_arr):
+    h.update(market.firma_params().encode())          # cargas y tarifas (media_lane, lento, ρ, σ, residuos, ...)
+    for a in (time_matrix, distance_arr, diesel_arr):
         h.update(np.ascontiguousarray(a).tobytes())
     h.update(repr((K, S, dt, seed, MAX_DURATION, market.num_nodes)).encode())
     return h.hexdigest()

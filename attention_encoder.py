@@ -39,6 +39,12 @@ t = tiempo transcurrido, ev = calcular_ev_esperado(...) de baselines.py):
   Con dow_j = (dow0 + (t + T[i,j]) // 14) % 7. Para j == i las cuatro valen 0; para j == h,
   f7 = f9 = f10 = 0 y f8 es la holgura del retorno directo.
 
+Índice de mercado (siempre la ÚLTIMA columna: [11] con continuación, [7] sin ella; así los checkpoints
+anteriores se cargan con esa columna en cero, ver transfer_learning.py):
+  [11] market_index — índice(j, día actual) / desviación del índice histórico (una sola para todos los
+                      nodos, calculada en el ajuste). Estado del mercado de salida del nodo j neto del
+                      nivel nacional, en desviaciones estándar (market_process.py).
+
 Condicionamiento en presupuesto de cardinalidad K:
   ContextNetwork recibe, además del bloque temporal y de mercado, un bloque
   separado de budget features (ver build_budget_features/_batch): k_remaining
@@ -58,9 +64,10 @@ import torch.nn.functional as F
 from config import LTR_CLIP, TRUCKS_CLIP, LOADS_EXPECTED_CLIP, K_NORM, USE_CONTINUATION_FEATURES
 
 # Número de features por nodo — debe coincidir con build_node_features()
-N_BASE_NODE_FEATURES = 7
-N_CONT_FEATURES      = 4
-N_NODE_FEATURES = N_BASE_NODE_FEATURES + (N_CONT_FEATURES if USE_CONTINUATION_FEATURES else 0)
+N_BASE_NODE_FEATURES  = 7
+N_CONT_FEATURES       = 4
+N_INDEX_FEATURES      = 1   # índice de mercado: siempre la última columna
+N_NODE_FEATURES = N_BASE_NODE_FEATURES + (N_CONT_FEATURES if USE_CONTINUATION_FEATURES else 0) + N_INDEX_FEATURES
 
 # Número de features de presupuesto de cardinalidad K — debe coincidir con
 # build_budget_features() / build_budget_features_batch().
@@ -163,6 +170,8 @@ def build_node_features(
     ev:                      np.ndarray = None,  # (7, N, N) calcular_ev_esperado — features [7-10]
     time_elapsed:            float      = 0.0,   # horas transcurridas — features [7-10]
     dow0:                    int        = 0,     # día de la semana (lunes = 0) de salida — features [7-10]
+    market_index:            np.ndarray = None,  # (N,) índice de mercado de todos los nodos hoy — última feature
+    index_std:               float      = None,  # desviación del índice histórico (normaliza market_index)
 ) -> np.ndarray:
     """
     Construye la matriz de features de nodos para el encoder (vectorizada).
@@ -170,7 +179,7 @@ def build_node_features(
     Cada fila j contiene las features del nodo j vistas desde current_node:
       [reward_norm, time_norm, dist_norm, is_depot, trucks_norm,
        avail_prior, reward_abs] (+ 4 de continuación si USE_CONTINUATION_FEATURES; requieren
-       ev, time_elapsed y dow0)
+       ev, time_elapsed y dow0) + market_index / index_std (última columna)
 
     La diagonal de reward_matrix_penalized tiene BIG_M_PENALTY (-1e9).
     Se recorta a [-1e4, 1e4] antes de normalizar para evitar desbordamientos.
@@ -180,6 +189,8 @@ def build_node_features(
     feats = np.zeros((num_nodes, N_NODE_FEATURES), dtype=np.float32)
     if USE_CONTINUATION_FEATURES and ev is None:
         raise ValueError("USE_CONTINUATION_FEATURES requiere ev (calcular_ev_esperado)")
+    if market_index is None or index_std is None:
+        raise ValueError("build_node_features requiere market_index e index_std (índice de mercado)")
 
     # Columns 0-2: reward / time / distance, all from current_node row
     feats[:, 0] = reward_matrix_penalized[current_node]
@@ -238,11 +249,14 @@ def build_node_features(
 
     # Columnas 7-10: continuación (misma función que la versión batcheada, con B = 1)
     if USE_CONTINUATION_FEATURES:
-        feats[:, N_BASE_NODE_FEATURES:] = build_continuation_features_batch(
+        feats[:, N_BASE_NODE_FEATURES:N_BASE_NODE_FEATURES + N_CONT_FEATURES] = build_continuation_features_batch(
             np.array([current_node]), np.array([start_node]),
             np.array([time_elapsed]), np.array([dow0]), time_matrix, ev,
             max_duration, reward_global_p95,
         )[0]
+
+    # Última columna: índice de mercado normalizado por la desviación del índice histórico
+    feats[:, -1] = np.asarray(market_index, dtype=np.float64) / max(float(index_std), 1e-12)
 
     if np.isnan(feats).any():
         bad = np.argwhere(np.isnan(feats)).tolist()
@@ -355,7 +369,7 @@ class AttentionEncoder(nn.Module):
 
     Parámetros
     ----------
-    d_input  : int — features por nodo (N_NODE_FEATURES: 7, o 11 con USE_CONTINUATION_FEATURES).
+    d_input  : int — features por nodo (N_NODE_FEATURES: 8, o 12 con USE_CONTINUATION_FEATURES).
     d_h      : int — dimensión del embedding (ej. 128).
     n_heads  : int — cabezas de atención (ej. 8, debe dividir d_h).
     n_layers : int — capas del encoder (ej. 3).
@@ -554,6 +568,9 @@ def build_node_features_batch(
     ev:                np.ndarray = None,   # (7, N, N) calcular_ev_esperado — features de continuación [7-10]
     time_elapsed:      np.ndarray = None,   # (B,) horas transcurridas — idem
     dow0:              np.ndarray = None,   # (B,) día de la semana (lunes = 0) de salida — idem
+    market_index:      np.ndarray = None,   # (B, N) índice de mercado de todos los nodos en el día actual
+                                            # (env.market_index) — última feature
+    index_std:         float      = None,   # desviación del índice histórico (env.index_std)
 ) -> np.ndarray:                            # (B, N, N_NODE_FEATURES) float32
     """
     Batched version of build_node_features.
@@ -568,6 +585,8 @@ def build_node_features_batch(
     N = num_nodes
     if USE_CONTINUATION_FEATURES and (ev is None or time_elapsed is None or dow0 is None):
         raise ValueError("USE_CONTINUATION_FEATURES requiere ev, time_elapsed y dow0")
+    if market_index is None or index_std is None:
+        raise ValueError("build_node_features_batch requiere market_index e index_std (índice de mercado)")
     feats = np.zeros((B, N, N_NODE_FEATURES), dtype=np.float32)
 
     # ── f0: reward from rm_pen_stack ──────────────────────────────────────────
@@ -636,10 +655,13 @@ def build_node_features_batch(
 
     # ── f7–f10: continuación (tiempo/holgura de regreso, valor esperado a 1 y 2 saltos) ──
     if USE_CONTINUATION_FEATURES:
-        feats[:, :, N_BASE_NODE_FEATURES:] = build_continuation_features_batch(
+        feats[:, :, N_BASE_NODE_FEATURES:N_BASE_NODE_FEATURES + N_CONT_FEATURES] = build_continuation_features_batch(
             current_node, start_node, time_elapsed, dow0,
             time_matrix_arr, ev, max_duration, reward_global_p95,
         )
+
+    # ── última columna: índice de mercado / desviación del índice histórico ──
+    feats[:, :, -1] = np.asarray(market_index, dtype=np.float64) / max(float(index_std), 1e-12)
 
     _check_node_features(feats, B, N)
     return feats

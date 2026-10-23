@@ -7,7 +7,7 @@ B3 (política sobre la tabla V de la DP) vive en dp_relajada.py.
 Todas se ejecutan paso a paso en el entorno con la misma interfaz que el DRL: en cada
 nodo reciben una `Observacion` con la máscara, la fila observada de cargas y tarifas, el
 nodo actual, la hora y k restante. Los parámetros del proceso (mu, s_d,
-phi y las tarifas históricas) se pasan al construir la política. Ninguna recibe la
+phi y la tarifa media por lane) se pasan al construir la política. Ninguna recibe la
 semilla del mundo evaluado ni llama a `sample_world`.
 """
 
@@ -47,13 +47,13 @@ def calcular_ev_esperado(market, distance_arr, diesel_arr) -> np.ndarray:
 
         E[r_jl] = P(N_jl ≥ 1) · q̄_jl · dist_jl − c_jl,   P(N ≥ 1) = 1 − (φ / (φ + m_jl))^φ
 
-    con m = mu_jl · s_d (d = día de la semana de llegada) y q̄ la tarifa media histórica de la
+    con m = mu_jl · s_d (d = día de la semana de llegada) y q̄ = media_lane, la tarifa media de la
     lane. Es el valor que usa B2 para los arcos futuros y el que alimenta las features de
     continuación del DRL; se calcula una vez por número de nodos.
     """
     p = market.params
     phi = p.phi[p.grupo]                                              # (N, N)
-    q_medio = p.tarifas.mean(axis=0).astype(float)                    # (N, N)
+    q_medio = p.media_lane                                            # (N, N) tarifa media de la lane
     costo = distance_arr * (diesel_arr / MPG) + distance_arr * MARGINAL_COST_SIN_DIESEL
     m = p.mu[None, :, :] * p.s[:, None, None]                         # (7, N, N)
     prob = 1.0 - (phi[None] / (phi[None] + m)) ** phi[None]           # P(N ≥ 1); m = 0 ⇒ 0
@@ -86,7 +86,7 @@ class PoliticaB2:
 
         E[r_jl] = P(N_jl ≥ 1) · q̄_jl · dist_jl − c_jl,   P(N ≥ 1) = 1 − (φ / (φ + m_jl))^φ
 
-    con m = mu_jl · s_d del día de llegada estimado y q̄ la tarifa media histórica de la lane.
+    con m = mu_jl · s_d del día de llegada estimado y q̄ = media_lane, la tarifa media de la lane.
 
     El camión puede volver a pasar por un nodo, así que el estado del futuro es (j, franja de
     tiempo, k restante) y la mejor continuación es una recursión memoizada por (casa, día de

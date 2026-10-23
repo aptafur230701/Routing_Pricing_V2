@@ -1,15 +1,16 @@
 """
 test_continuation_features.py
 =============================
-Features de continuación por nodo (f7–f10, USE_CONTINUATION_FEATURES), calcular_ev_esperado y
-la expansión del checkpoint de 7 a 11 columnas de entrada.
+Features de continuación por nodo (f7–f10, USE_CONTINUATION_FEATURES), índice de mercado (f11),
+calcular_ev_esperado y la expansión del checkpoint a más columnas de entrada.
 
-  · calcular_ev_esperado da exactamente el (7, N, N) que PoliticaB2 tenía en __init__.
-  · (B, N, 11), sin NaN/Inf; f7–f10 coinciden con una referencia escalar con loops.
+  · calcular_ev_esperado da exactamente el (7, N, N) que PoliticaB2 tenía en __init__ (con media_lane).
+  · (B, N, 12), sin NaN/Inf; f7–f10 coinciden con una referencia escalar con loops.
+  · f11 = índice de mercado del nodo en el día actual / desviación del índice histórico.
   · f9 coincide con PoliticaB2._ev en 5 estados elegidos al azar.
   · casos especiales: j == i (todo 0) y j == h (f7 = f9 = f10 = 0, f8 = holgura del retorno directo).
   · la versión escalar build_node_features coincide con la batcheada.
-  · start_dow del entorno; transfer de 7 → 11 columnas (nuevas en cero, misma salida que antes).
+  · start_dow del entorno; transfer de 7 → 11 y de 11 → 12 columnas (nuevas en cero, misma salida que antes).
 """
 
 import numpy as np
@@ -23,7 +24,7 @@ from baselines import PoliticaB2, calcular_ev_esperado
 from config import (
     MAX_DURATION, MPG, MARGINAL_COST_SIN_DIESEL, USE_CONTINUATION_FEATURES, TRAIN_DAYS,
 )
-from evaluation import make_sim_env
+from evaluation import make_sim_env, make_replay_env
 from fit_market_process import dia_de_semana
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
@@ -65,6 +66,7 @@ def _features(d, env, starts):
         MAX_DURATION, trucks_stack_raw=d["trucks"], reward_global_p95=d["p95"],
         avail_expected_arr=d["avail"], reward_rows=env.reward_rows,
         ev=d["ev"], time_elapsed=env.time_elapsed, dow0=env.start_dow,
+        market_index=env.market_index, index_std=env.index_std,
     )
 
 
@@ -95,8 +97,8 @@ def _referencia(d, env, starts, b):
     return out
 
 
-def test_n_node_features_es_11():
-    assert N_NODE_FEATURES == 11
+def test_n_node_features_es_12():
+    assert N_NODE_FEATURES == 12
 
 
 def test_ev_esperado_identico_al_de_b2(datos):
@@ -106,7 +108,7 @@ def test_ev_esperado_identico_al_de_b2(datos):
     costo = d["dist"] * (d["diesel"] / MPG) + d["dist"] * MARGINAL_COST_SIN_DIESEL
     m = p.mu[None, :, :] * p.s[:, None, None]
     prob = 1.0 - (phi[None] / (phi[None] + m)) ** phi[None]
-    ev_original = prob * p.tarifas.mean(axis=0).astype(float)[None] * d["dist"][None] - costo[None]
+    ev_original = prob * p.media_lane[None] * d["dist"][None] - costo[None]
     assert d["ev"].shape == (7, N, N)
     assert np.array_equal(d["ev"], ev_original)
 
@@ -117,9 +119,9 @@ def test_ev_esperado_identico_al_de_b2(datos):
 def test_forma_y_finitud(datos):
     env, activas, starts = _estados(datos)
     feats = _features(datos, env, starts)
-    assert feats.shape == (len(starts), N, 11) and feats.dtype == np.float32
+    assert feats.shape == (len(starts), N, 12) and feats.dtype == np.float32
     assert np.isfinite(feats).all()
-    cont = feats[:, :, 7:]
+    cont = feats[:, :, 7:11]
     assert cont[:, :, 0].min() >= 0                       # f7 = T[j, h] / MAX no se recorta (puede pasar de 1)
     assert cont[:, :, 1].min() >= 0 and cont[:, :, 1].max() <= 1
     assert cont[:, :, [2, 3]].min() >= -1 and cont[:, :, [2, 3]].max() <= 1
@@ -131,7 +133,7 @@ def test_f7_a_f10_coinciden_con_referencia_con_loops(datos, pasos):
     feats = _features(datos, env, starts)
     assert len(activas) > 5
     for b in activas:
-        np.testing.assert_allclose(feats[b, :, 7:], _referencia(datos, env, starts, b), atol=1e-6)
+        np.testing.assert_allclose(feats[b, :, 7:11], _referencia(datos, env, starts, b), atol=1e-6)
 
 
 def test_f9_coincide_con_ev_de_b2_en_5_estados_al_azar(datos):
@@ -155,14 +157,14 @@ def test_casos_especiales_self_loop_y_casa(datos):
     feats = _features(datos, env, starts)
     for b in activas:
         i, h = int(env.current_node[b]), int(starts[b])
-        assert (feats[b, i, 7:] == 0).all()
+        assert (feats[b, i, 7:11] == 0).all()
         assert feats[b, h, 7] == 0 and feats[b, h, 9] == 0 and feats[b, h, 10] == 0
         directo = np.clip((MAX_DURATION - env.time_elapsed[b] - datos["T"][i, h]) / MAX_DURATION, 0, 1)
         assert feats[b, h, 8] == pytest.approx(float(directo), abs=1e-6)
     # en el primer paso i == h: todo en cero para el self-loop
     env0, _, starts0 = _estados(datos, pasos=0, semilla=9)
     f0 = _features(datos, env0, starts0)
-    assert (f0[np.arange(len(starts0)), starts0, 7:] == 0).all()
+    assert (f0[np.arange(len(starts0)), starts0, 7:11] == 0).all()
 
 
 def test_f10_es_al_menos_f9(datos):
@@ -182,9 +184,45 @@ def test_version_escalar_coincide_con_la_batcheada(datos):
             datos["T"], datos["dist"], N, MAX_DURATION, trucks_stack=None,
             reward_global_p95=datos["p95"], avail_expected_arr=datos["avail"],
             ev=datos["ev"], time_elapsed=float(env.time_elapsed[b]), dow0=int(env.start_dow[b]),
+            market_index=env.market_index[b], index_std=env.index_std,
         )
-        assert esc.shape == (N, 11)
+        assert esc.shape == (N, 12)
         np.testing.assert_allclose(esc[:, 7:], feats[b, :, 7:], atol=1e-6)
+
+
+def test_f11_es_el_indice_de_mercado_normalizado(datos):
+    """La última columna es índice(j, día actual) / desviación del índice histórico, sin NaN."""
+    env, activas, starts = _estados(datos, pasos=1, semilla=4)
+    feats = _features(datos, env, starts)
+    idx = env.market_index
+    assert idx.shape == (len(starts), N) and env.index_std == datos["market"].params.indice_std
+    np.testing.assert_allclose(feats[:, :, 11], idx / env.index_std, atol=1e-6)
+    # el índice es el del mundo de cada episodio en su día actual (sin recortar al histórico)
+    for b in activas[:10]:
+        dia = int(env._start_day_idx[b]) + int(env.time_elapsed[b] // 14)
+        assert np.array_equal(idx[b], datos["market"].indice_mundo(int(env.world_seed[b]), dia))
+
+
+def test_replay_features_forma_sin_nan_e_indice_del_dia_real(datos):
+    """Replay de días reales de evaluación: (B, N, 12) sin NaN; f11 es el índice observado del día."""
+    d = datos
+    tm, rate, loads, dist, diesel, *_ = load_matrices(N)
+    ev_dias = rate[TRAIN_DAYS:]
+    env = make_replay_env(tm, ev_dias, loads[TRAIN_DAYS:], dist, diesel, N, day_offset=TRAIN_DAYS, market=d["market"])
+    B = 12
+    rng = np.random.default_rng(0)
+    starts = rng.integers(0, N, size=B)
+    dias = rng.integers(0, ev_dias.shape[0], size=B)
+    env.reset(starts, dias, k_max_arr=[None] * B)
+    feats = build_node_features_batch(
+        env.current_node, starts, None, d["T"], dist, env.current_day_idx, N, MAX_DURATION,
+        trucks_stack_raw=d["trucks"][:, TRAIN_DAYS:], reward_global_p95=d["p95"], avail_expected_arr=d["avail"],
+        reward_rows=env.reward_rows, ev=d["ev"], time_elapsed=env.time_elapsed, dow0=env.start_dow,
+        market_index=env.market_index, index_std=env.index_std,
+    )
+    assert feats.shape == (B, N, 12) and np.isfinite(feats).all()
+    esperado = d["market"].indice_historico(TRAIN_DAYS, None)[dias] / d["market"].params.indice_std
+    np.testing.assert_allclose(feats[:, :, 11], esperado, atol=1e-6)
 
 
 def test_start_dow_del_entorno(datos):
@@ -208,6 +246,18 @@ def test_transfer_7_a_11_columnas_deja_las_nuevas_en_cero():
     assert torch.equal(w[:, :7], viejo) and (w[:, 7:] == 0).all() and not omitidos
     x = torch.randn(4, 11)
     assert torch.allclose(x @ w.T, x[:, :7] @ viejo.T)    # las features nuevas no cambian la salida
+
+
+def test_transfer_11_a_12_columnas_deja_el_indice_en_cero():
+    """Un checkpoint de 11 features se carga con la columna del índice de mercado (la última) en cero."""
+    from transfer_learning import _reconcile_state_dict
+    torch.manual_seed(1)
+    viejo = torch.randn(32, 11)
+    destino = {"encoder.input_proj.proj.weight": torch.randn(32, 12), "encoder.input_proj.proj.bias": torch.randn(32)}
+    fuente = {"encoder.input_proj.proj.weight": viejo, "encoder.input_proj.proj.bias": torch.ones(32)}
+    sd, _, omitidos = _reconcile_state_dict(destino, fuente)
+    w = sd["encoder.input_proj.proj.weight"]
+    assert torch.equal(w[:, :11], viejo) and (w[:, 11] == 0).all() and not omitidos
 
 
 def test_transfer_rechaza_forma_incompatible_con_error_claro():
