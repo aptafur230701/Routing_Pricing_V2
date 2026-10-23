@@ -71,22 +71,24 @@ class PostDecisionValueHead(nn.Module):
     encoder. Con cualquiera de los dos sin detach, loss_post contaminaría los parámetros
     de la política.
 
-    La inicialización usa un RNG propio (torch.Generator con semilla fija): crear la cabeza no
+    La inicialización usa un RNG propio (torch.Generator con semilla `seed`): crear la cabeza no
     consume el RNG global de torch, así que el resto del agente y el crítico se inicializan
-    igual con o sin ella (mismo reward con la misma semilla).
+    igual con o sin ella (mismo reward con la misma semilla). Las dos cabezas del precio de
+    reserva (A y B) reciben semillas distintas, si no nacerían idénticas.
 
     Parámetros
     ----------
     d_h    : int — dimensión del embedding (igual que AttentionEncoder).
     hidden : int — tamaño oculto (config.POST_HIDDEN).
+    seed   : int — semilla de la inicialización (default `_INIT_SEED`).
     """
 
     _INIT_SEED = 20261021
 
-    def __init__(self, d_h: int, hidden: int = None):
+    def __init__(self, d_h: int, hidden: int = None, seed: int = None):
         super().__init__()
         hidden = hidden or d_h
-        gen = torch.Generator().manual_seed(self._INIT_SEED)
+        gen = torch.Generator().manual_seed(self._INIT_SEED if seed is None else seed)
         with torch.random.fork_rng(devices=[]):   # nn.Linear sortea su init por defecto: no tocar el RNG global
             self.net = nn.Sequential(
                 nn.Linear(2 * d_h, hidden),
@@ -114,3 +116,11 @@ class PostDecisionValueHead(nn.Module):
         h = h_t.detach().unsqueeze(1).expand(-1, embeddings.shape[1], -1)   # (B, N, d_h)
         x = torch.cat([h, embeddings.detach()], dim=-1)                     # (B, N, 2·d_h)
         return self.net(x).squeeze(-1)
+
+    def forward_pairs(self, h_t: torch.Tensor, e_a: torch.Tensor) -> torch.Tensor:
+        """Ṽ para pares (estado, acción) ya emparejados: h_t (M, d_h), e_a (M, d_h) → (M,).
+
+        Es la entrada del entrenamiento posterior al PPO (post_training.py), que guarda
+        (h_t, e_a) congelados por ejemplo. Sin detach: las entradas ya vienen sin gradiente.
+        """
+        return self.net(torch.cat([h_t, e_a], dim=-1)).squeeze(-1)

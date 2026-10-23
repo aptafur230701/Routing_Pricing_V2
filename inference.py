@@ -3,20 +3,23 @@ inference.py
 ============
 Inferencia en tiempo real con el modelo AM entrenado.
 
-Carga el checkpoint am_checkpoint_<NUM_NODES>nodes.pt y genera una ruta desde
-el nodo que el usuario ingrese, usando los datos del día más reciente. La ruta
-se construye paso a paso en el entorno (argmax de la política en cada nodo).
+Carga el checkpoint con las cabezas Ṽ A/B (am_checkpoint_<NUM_NODES>nodes_pricing.pt, ver post_training.py) y
+genera, desde el nodo que el usuario ingrese y con los datos del día más reciente, dos salidas:
 
-Si el checkpoint trae la cabeza post_value (PRICING_PLAN.md), además de la ruta se imprime
-el precio de reserva p* de cada arco (pricing.py) y se escribe
-results/<N>nodes/pricing_<run_tag>.csv. p* es el precio mínimo por milla al que al camión le
-conviene aceptar la lane frente a su mejor alternativa; no es una probabilidad de aceptación.
+  · la RUTA de DRL-Q: en cada nodo, el argmax de Q(s, a) = r_obs(i→a)/S + Ṽ(s, a), con Ṽ = promedio de A y B;
+  · el PRECIO DE RESERVA p* por arco (pricing.py): la tarifa mínima por milla a la que al camión le conviene
+    aceptar la lane frente a su mejor alternativa. Se imprime también su rango [mín, máx] entre las parejas AB/BA
+    (variabilidad del estimador por partición de datos y ruido de etiquetas, NO es un intervalo de confianza) y se
+    escribe results/<N>nodes/pricing_<run_tag>.csv con una fila por arco.
+
+p* es un costo de oportunidad del transportista; no es una probabilidad de aceptación del cliente. Solo se calcula
+para lanes con carga: un arco sin carga (reposicionamiento) o el retorno a casa no llevan p*.
 
 Uso
 ---
     python inference.py [--show-board] [--start-node K] [--num-nodes N] [--checkpoint RUTA]
 
-  --show-board   en cada nodo, tabla con el p* de cada lane saliente válida (además de la acción greedy)
+  --show-board   en cada nodo, tabla con el p* de cada lane saliente con carga (además de la acción de DRL-Q)
   --start-node   corre un solo tour desde ese nodo, sin el loop interactivo
 """
 
@@ -32,17 +35,17 @@ from config import (
 )
 from am_agent import AMRoutingAgent
 from baselines import calcular_ev_pronostico
-from evaluation import make_replay_env, rollout_drl_env
+from evaluation import make_replay_env
 from greedy_rollout import greedy_rollout
 from market_process import MarketProcess, asegurar_parametros
-from pricing import lane_cost_row, percentil_historico, reservation_price
+from pricing import lane_cost_row, percentil_historico, reservation_price, crear_selector_q
 from problem_data import load_matrices
 from transfer_learning import checkpoint_tiene_post_head, load_checkpoint_compatible
 
 # ── Configuración ─────────────────────────────────────────────────────────────
 
 NUM_NODES       = 10
-CHECKPOINT_NAME = f"am_checkpoint_{NUM_NODES}nodes.pt"
+CHECKPOINT_NAME = f"am_checkpoint_{NUM_NODES}nodes_pricing.pt"
 
 
 # ── Carga del modelo ──────────────────────────────────────────────────────────
@@ -96,6 +99,7 @@ def load_latest_day():
         distance_arr=distance_arr,
         diesel_arr=diesel_arr,
         rate_train=rate_stack[:TRAIN_DAYS],            # serie histórica para el percentil de p*
+        loads_train=loads_stack[:TRAIN_DAYS],          # (solo cuentan los días con carga)
         rate_last=rate_stack[last:], loads_last=loads_stack[last:],   # tablero del día (replay)
         ltr_stack=ltr_stack[:, last:],
         trucks_stack=trucks_stack[:, last:],
@@ -106,38 +110,35 @@ def load_latest_day():
 
 # ── Inferencia ────────────────────────────────────────────────────────────────
 
-CSV_COLUMNS = ["episode_id", "step", "from", "to", "rate_hoy", "p_estrella", "break_even",
-               "percentil_historico", "only_option", "is_return"]
+CSV_COLUMNS = ["episode_id", "step", "from", "to", "rate_hoy", "p_estrella", "p_min", "p_max", "break_even",
+               "percentil_historico", "only_option", "is_return", "has_load"]
 
 
 def _rollout_con_pricing(agent, start_node, day, with_board) -> tuple:
-    """Rollout greedy con el p* de cada arco. Retorna (route, reward, duración, arcos, tableros).
+    """Rollout de DRL-Q (argmax de Q) con el p* de cada arco. Retorna (route, reward, duración, arcos, tableros).
 
-    Un hook de greedy_rollout mira cada decisión antes de que el entorno la ejecute, así que la
-    ruta es la misma que la de rollout_drl_env. tableros[k] = lanes ofertadas en el paso k.
+    El selector de DRL-Q elige la acción de cada paso y un hook de greedy_rollout calcula el precio de reserva
+    del arco elegido antes de que el entorno lo ejecute. tableros[k] = lanes con carga ofertadas en el paso k.
     route es None si el tour no cierra el ciclo dentro de max_duration.
     """
     env, N = day["env"], NUM_NODES
     arcos, tableros = [], []
+    selector = crear_selector_q(agent, day["distance_arr"], day["diesel_arr"], REWARD_SCALE_FACTOR)
 
     def hook(c):
         h_t, emb = c["h_t"][:1], c["embeddings"][:1]
         i, j, mask = int(c["cur_nodes"][0]), int(c["actions"][0]), c["masks"][0]
-        d = int(env.current_day_idx[0])
-        rate = env.current_rate_row[0] if env.current_rate_row is not None else day["rate_last"][d, i]
-        loads = env.current_loads_row[0] if env.current_loads_row is not None else day["loads_last"][d, i]
+        rate, loads = env.rate_row_obs[0].astype(np.float64), env.loads_row_obs[0]
         dist, cost = day["distance_arr"][i], lane_cost_row(day["distance_arr"][i], day["diesel_arr"][i])
-        v = agent.post_value(h_t, emb).squeeze(0).detach().cpu().numpy()
+        va, vb = (v.squeeze(0).detach().cpu().numpy().astype(np.float64) for v in agent.post_values(h_t, emb))
 
         def fila(a):
-            p, only = reservation_price(agent, h_t, emb, mask, i, a, rate, dist, cost, start_node, REWARD_SCALE_FACTOR,
-                                        loads_row=loads, post_values=v)
-            ret = a == start_node
-            be = float(cost[a] / dist[a])
+            pr = reservation_price(va, vb, mask, i, a, rate, dist, cost, start_node, REWARD_SCALE_FACTOR, loads_row=loads)
             return dict(
-                **{"from": i, "to": a}, rate_hoy=float(rate[a]), p_estrella=be if ret else p, break_even=be,
-                percentil_historico=float("nan") if (ret or only) else percentil_historico(p, day["rate_train"][:, i, a]),
-                only_option=bool(only), is_return=ret,
+                **{"from": i, "to": a}, rate_hoy=float(rate[a]), p_estrella=pr.p, p_min=pr.p_min, p_max=pr.p_max,
+                break_even=pr.break_even, only_option=pr.only_option, is_return=(a == start_node), has_load=pr.has_load,
+                percentil_historico=percentil_historico(pr.p, day["rate_train"][:, i, a], day["loads_train"][:, i, a])
+                if pr.definido else float("nan"),
             )
 
         arcos.append(fila(j))
@@ -150,7 +151,7 @@ def _rollout_con_pricing(agent, start_node, day, with_board) -> tuple:
         day["time_matrix_arr"], day["distance_arr"], day["trucks_stack"], day["ltr_stack"],
         day["reward_global_p95"], NUM_NODES,
         k_max_arr=[None], avail_expected_arr=day["avail_expected_arr"],
-        ev_esperado=day["ev_esperado"], step_hook=hook,
+        ev_esperado=day["ev_esperado"], selector=selector, step_hook=hook,
     )
     if not res.valid[0]:
         return None, -np.inf, np.inf, arcos, tableros
@@ -164,50 +165,44 @@ def formatear_bloque(route, arcos) -> str:
         cab = f"  {a['from']}→{a['to']}: "
         if a["is_return"]:
             lineas.append(cab + "p* = cost/dist (retorno al depot, Ṽ = 0)")
+        elif not a["has_load"]:
+            lineas.append(cab + "sin carga en esta lane (reposicionamiento): sin p*")
         elif a["only_option"]:
             lineas.append(cab + "p* = cost/dist (única acción factible)")
         else:
             marca = "  ← posición valiosa" if a["p_estrella"] < a["break_even"] else ""
             lineas.append(
-                cab + f"p* = {a['p_estrella']:.2f} /mi  (rate_hoy = {a['rate_hoy']:.2f}, "
-                f"break-even = {a['break_even']:.2f}, percentil histórico {a['percentil_historico']:.0f} %)" + marca
+                cab + f"p* = {a['p_estrella']:.2f} /mi  [rango {a['p_min']:.2f}–{a['p_max']:.2f}]  "
+                f"(rate_hoy = {a['rate_hoy']:.2f}, break-even = {a['break_even']:.2f}, "
+                f"percentil histórico {a['percentil_historico']:.0f} %)" + marca
             )
     return "\n".join(lineas)
 
 
 def formatear_tablero(i, tablero) -> str:
-    """Tabla del p* de cada lane saliente ofertada en el nodo i (la elegida por la política lleva *)."""
-    lineas = [f"    Tablero en el nodo {i}:   lane    rate_hoy      p*   break-even  percentil"]
+    """Tabla del p* de cada lane saliente con carga ofertada en el nodo i (la elegida por DRL-Q lleva *)."""
+    lineas = [f"    Tablero en el nodo {i}:   lane    rate_hoy      p*      rango p*       break-even  percentil"]
     for f in sorted(tablero, key=lambda f: f["to"]):
-        pct = "   --" if f["only_option"] else f"{f['percentil_historico']:5.0f}"
-        marca = "←" if f["p_estrella"] < f["break_even"] and not f["only_option"] else " "
+        if f["only_option"] or not np.isfinite(f["p_estrella"]):
+            p, rango, pct = "     --", "       --      ", "   --"
+        else:
+            p, rango, pct = f"{f['p_estrella']:7.2f}", f"[{f['p_min']:5.2f}–{f['p_max']:5.2f}]", f"{f['percentil_historico']:5.0f}"
+        marca = "←" if np.isfinite(f["p_estrella"]) and f["p_estrella"] < f["break_even"] else " "
         lineas.append(
-            f"      {'*' if f['elegida'] else ' '} {f['from']:>3}→{f['to']:<3}  {f['rate_hoy']:9.2f}  {f['p_estrella']:7.2f}"
+            f"      {'*' if f['elegida'] else ' '} {f['from']:>3}→{f['to']:<3}  {f['rate_hoy']:9.2f}  {p}  {rango}"
             f"  {f['break_even']:10.2f}  {pct} {marca}"
         )
     return "\n".join(lineas)
 
 
-def run_inference(agent: AMRoutingAgent, start_node: int, day: dict, pricing: bool = False,
-                  show_board: bool = False, filas_csv: list = None):
-    """Genera una ruta greedy desde start_node y muestra el resultado (y el p* por arco si pricing)."""
+def run_inference(agent: AMRoutingAgent, start_node: int, day: dict, show_board: bool = False, filas_csv: list = None):
+    """Genera la ruta de DRL-Q desde start_node, muestra el resultado y el p* por arco."""
     import time
 
     print(f"\n  Generando ruta desde nodo {start_node}...")
 
     t0 = time.perf_counter()
-    arcos, tableros = [], []
-    if pricing:
-        route, total_reward, time_elapsed, arcos, tableros = _rollout_con_pricing(agent, start_node, day, show_board)
-    else:
-        route, total_reward, time_elapsed = rollout_drl_env(
-            agent, day["env"], start_node, 0,
-            day["time_matrix_arr"], day["distance_arr"], day["ltr_stack"], day["trucks_stack"],
-            NUM_NODES,
-            reward_global_p95=day["reward_global_p95"],
-            avail_expected_arr=day["avail_expected_arr"],
-            ev_esperado=day["ev_esperado"],
-        )
+    route, total_reward, time_elapsed, arcos, tableros = _rollout_con_pricing(agent, start_node, day, show_board)
     inference_ms = (time.perf_counter() - t0) * 1000
 
     print("\n" + "=" * 50)
@@ -216,24 +211,24 @@ def run_inference(agent: AMRoutingAgent, start_node: int, day: dict, pricing: bo
         print(f"     (Tiempo máximo permitido: {MAX_DURATION:.1f} h)")
     else:
         ruta_str = " → ".join(str(n) for n in route)
-        print(f"  Ruta      : {ruta_str}")
+        print(f"  Ruta      : {ruta_str}   (DRL-Q)")
         print(f"  Reward    : {total_reward:.0f}")
         print(f"  Duración  : {time_elapsed:.2f} h  (máx {MAX_DURATION:.1f} h)")
         print(f"  Nodos vis.: {len(route) - 1} de {NUM_NODES}")
-        if pricing:
-            if show_board:
-                for k, tab in enumerate(tableros):
-                    print(formatear_tablero(arcos[k]["from"], tab))
-            print()
-            print(formatear_bloque(route, arcos))
-            if filas_csv is not None:
-                ep = 1 + max((f["episode_id"] for f in filas_csv), default=-1)
-                for k, a in enumerate(arcos):
-                    filas_csv.append(dict(
-                        episode_id=ep, step=k, rate_hoy=a["rate_hoy"], p_estrella=a["p_estrella"],
-                        break_even=a["break_even"], percentil_historico=a["percentil_historico"],
-                        only_option=a["only_option"], is_return=a["is_return"], **{"from": a["from"], "to": a["to"]},
-                    ))
+        if show_board:
+            for k, tab in enumerate(tableros):
+                print(formatear_tablero(arcos[k]["from"], tab))
+        print()
+        print(formatear_bloque(route, arcos))
+        if filas_csv is not None:
+            ep = 1 + max((f["episode_id"] for f in filas_csv), default=-1)
+            for k, a in enumerate(arcos):
+                filas_csv.append(dict(
+                    episode_id=ep, step=k, rate_hoy=a["rate_hoy"], p_estrella=a["p_estrella"], p_min=a["p_min"],
+                    p_max=a["p_max"], break_even=a["break_even"], percentil_historico=a["percentil_historico"],
+                    only_option=a["only_option"], is_return=a["is_return"], has_load=a["has_load"],
+                    **{"from": a["from"], "to": a["to"]},
+                ))
     print(f"  Inferencia: {inference_ms:.2f} ms")
     print("=" * 50)
 
@@ -254,15 +249,13 @@ def main():
     ap.add_argument("--show-board", action="store_true", help="tabla de p* por lane saliente en cada nodo")
     ap.add_argument("--start-node", type=int, help="un solo tour desde este nodo (sin loop interactivo)")
     ap.add_argument("--num-nodes", type=int, default=NUM_NODES)
-    ap.add_argument("--checkpoint", help="ruta del .pt (default: checkpoints[/RUN_TAG]/am_checkpoint_<N>nodes.pt)")
+    ap.add_argument("--checkpoint", help="ruta del .pt con las cabezas Ṽ (default: checkpoints[/RUN_TAG]/am_checkpoint_<N>nodes_pricing.pt)")
     args = ap.parse_args()
     NUM_NODES = args.num_nodes
-    CHECKPOINT_NAME = f"am_checkpoint_{NUM_NODES}nodes.pt"
+    CHECKPOINT_NAME = f"am_checkpoint_{NUM_NODES}nodes_pricing.pt"
 
     cwd             = os.path.dirname(os.path.abspath(__file__))
     checkpoint_path = args.checkpoint or os.path.join(cwd, "checkpoints", RUN_TAG, CHECKPOINT_NAME)
-    if not args.checkpoint and not os.path.exists(checkpoint_path):
-        checkpoint_path = os.path.join(cwd, CHECKPOINT_NAME)   # ubicación anterior (raíz del proyecto)
 
     print("=" * 50)
     print(f"  AM Inference — {NUM_NODES} nodos")
@@ -273,18 +266,16 @@ def main():
     # Cargar modelo y datos una sola vez
     print("\nCargando modelo...")
     agent = load_agent(checkpoint_path)
-    pricing = getattr(agent, "post_value", None) is not None and checkpoint_tiene_post_head(checkpoint_path)
-    if not pricing:
-        print("  ⚠  El checkpoint no trae post_value: se muestra la ruta sin precio de reserva "
-              "(reentrena con USE_POST_HEAD=True).")
+    if not checkpoint_tiene_post_head(checkpoint_path):
+        raise SystemExit(f"{checkpoint_path} no trae las cabezas Ṽ A/B: corre post_training.py primero.")
     print("Cargando datos del día más reciente...")
     day = load_latest_day()
     print("Listo.\n")
     filas_csv = []
 
     if args.start_node is not None:
-        run_inference(agent, args.start_node, day, pricing, args.show_board, filas_csv)
-        if pricing and filas_csv:
+        run_inference(agent, args.start_node, day, args.show_board, filas_csv)
+        if filas_csv:
             _escribir_csv(filas_csv, cwd)
         return
 
@@ -306,8 +297,8 @@ def main():
             print(f"  ✗ Nodo fuera de rango. Debe estar entre 0 y {NUM_NODES - 1}.\n")
             continue
 
-        run_inference(agent, start_node, day, pricing, args.show_board, filas_csv)
-        if pricing and filas_csv:
+        run_inference(agent, start_node, day, args.show_board, filas_csv)
+        if filas_csv:
             _escribir_csv(filas_csv, cwd)
         print()
 

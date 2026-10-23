@@ -2,7 +2,8 @@
 greedy_rollout.py
 =================
 Evaluación del agente paso a paso en el entorno: en cada nodo se elige el
-argmax de la política (sobre las acciones válidas de la máscara del entorno).
+argmax de la política (sobre las acciones válidas de la máscara del entorno), o,
+con `selector`, la acción que este devuelva (DRL-Q: argmax de Q).
 
 No hay búsqueda: una sola ruta por episodio. El mismo rollout sirve para
   · mundos simulados  (env con market_process, un mundo por `world_seeds[b]`),
@@ -67,6 +68,8 @@ def greedy_rollout(
     device:             torch.device = None,   # dispositivo del agente (default: DEVICE de config)
     ev_esperado:        np.ndarray = None,   # EvEsperado, calcular_ev_pronostico (baselines.py); obligatorio con
                                              # USE_CONTINUATION_FEATURES (features de continuación f7–f10)
+    selector:           callable   = None,   # fn(h_t, embeddings, masks, env) → (B,) int64: reemplaza el argmax del actor
+                                             # (p. ej. el argmax de Q de DRL-Q, pricing.crear_selector_q). None ⇒ actor greedy.
     step_hook:          callable   = None,   # fn(dict) invocada en cada paso ANTES de env.step, para inspeccionar la
                                              # decisión sin alterarla (p. ej. el precio de reserva en inference.py).
                                              # Claves: env, h_t (B, d_h), embeddings (B, N, d_h), masks (B, N),
@@ -136,7 +139,10 @@ def greedy_rollout(
                 embeddings, graph_emb = agent.encoder(node_feats_t)
                 current_emb = embeddings[torch.arange(B), cur_nodes_t, :]
                 h_t = agent.context_net(graph_emb, current_emb, temporal_t, market_t, budget_t, dow_t)
-                actions = agent.decoder.greedy_action(h_t, embeddings, mask_t).cpu().numpy()
+                if selector is None:
+                    actions = agent.decoder.greedy_action(h_t, embeddings, mask_t).cpu().numpy()
+                else:
+                    actions = np.asarray(selector(h_t, embeddings, masks, env), dtype=np.int64)
 
                 if step_hook is not None:
                     step_hook(dict(env=env, h_t=h_t, embeddings=embeddings, masks=masks, actions=actions,

@@ -80,16 +80,17 @@ nodos, ver `NODE_SEQUENCE`).
 | [routing_env.py](routing_env.py) | Entorno Gymnasium (`RoutingEnv`, `VectorRoutingEnv`) para el DVRP estocástico. |
 | [attention_encoder.py](attention_encoder.py) | `AttentionEncoder` (Transformer) + `ContextNetwork`. |
 | [attention_decoder.py](attention_decoder.py) | `AttentionDecoder` (pointer network) con glimpse + pointer attention. |
-| [critic_head.py](critic_head.py) | `CriticHead`: estima V(s_t) para la ventaja PPO. `PostDecisionValueHead`: Ṽ(s, j), valor de llegar a j antes de ver su tablero (precio de reserva). |
-| [pricing.py](pricing.py) | `reservation_price`: precio de reserva p* por lane. |
-| [validate_pricing.py](validate_pricing.py) | Validación de p*: Monte Carlo de Ṽ, posición histórica, política de aceptación. |
+| [critic_head.py](critic_head.py) | `CriticHead`: estima V(s_t) para la ventaja PPO. `PostDecisionValueHead`: Ṽ(s, j), valor de llegar a j antes de ver su tablero (precio de reserva); el agente trae dos (A y B). |
+| [pricing.py](pricing.py) | `reservation_price`: precio de reserva p* por lane (parejas AB/BA, rango); `crear_selector_q`: ruta DRL-Q (argmax de Q). |
+| [post_training.py](post_training.py) | Fase posterior al PPO: entrena las cabezas Ṽ A/B con el actor congelado y guarda `am_checkpoint_<N>nodes_pricing.pt`. |
+| [validate_pricing.py](validate_pricing.py) | Validación de p* y de DRL-Q: contrafactual, utilidad (márgenes pareados, regla por umbral), plausibilidad. |
 | [am_agent.py](am_agent.py) | `AMRoutingAgent`: combina encoder + contexto + decoder; el rollout se ejecuta paso a paso sobre el entorno. |
 | [am_training.py](am_training.py) | Loop de entrenamiento PPO-Clip + GAE. |
 | [greedy_rollout.py](greedy_rollout.py) | Rollout greedy (argmax por nodo) sobre `VectorRoutingEnv`: evaluación del DRL en replay de días reales o en mundos simulados, baseline self-critical y monitor de entrenamiento. |
 | [debug_utils.py](debug_utils.py) | `check_tensor`: verificación de NaN/Inf en el forward pass (falla rápido en vez de silenciar con `nan_to_num`). Usado en producción por el encoder/decoder/training, no es un script de debug puntual. |
 | [transfer_learning.py](transfer_learning.py) | Warm-start de pesos entre tamaños de grafo (`NODE_SEQUENCE`). |
 | [Solvers.py](Solvers.py) | DP hacia atrás de UB-PI (`solve_ub_pi`), único solver que se conserva: mejor ruta con el mundo completo conocido, estado (nodo, franja de 1 min, k). |
-| [inference.py](inference.py) | Inferencia standalone: carga un checkpoint y genera una ruta greedy desde un nodo dado. |
+| [inference.py](inference.py) | Inferencia standalone: carga el checkpoint con las cabezas Ṽ y genera la ruta de DRL-Q desde un nodo dado, con el precio de reserva p* por arco. |
 
 ### Proceso exógeno de cargas y tarifas (opcional)
 
@@ -155,50 +156,51 @@ el DRL.
 | `results/<N>nodes/` | Salida de cada run: `DRL_Routing_Summary_AM.xlsx`, diagnósticos PPO/training (`.png`), `training_log_<N>nodes.pkl`/`.xlsx`. |
 | `docs/architecture.html` / `.png` | Diagrama explicativo del pipeline AM-PPO. |
 
-## Pricing: precio de reserva
+## Pricing: precio de reserva y ruta DRL-Q
 
-Además de la ruta, el modelo entrega una segunda salida: el **precio mínimo por milla** al que al camión le
-conviene aceptar una lane `i→j`, dada su posición y el tiempo restante. Es una recomendación del lado del
-transportista; **no modela aceptación** (no hay datos de aceptación y rechazo).
+Descripción completa en [PRICING_PLAN.md](PRICING_PLAN.md). El modelo entrega dos salidas: la **ruta** y, para cada
+arco con carga, el **precio mínimo por milla** (p\*) al que al camión le conviene aceptar la lane frente a su mejor
+alternativa. Es una recomendación del lado del transportista; **no modela aceptación** (no hay datos de aceptación
+y rechazo) y p\* es un costo de oportunidad, no una probabilidad.
 
-**Modelo.** En `i` el agente ya ve `rate(i→j)` y `loads(i→j)`. Aceptar `i→j` rinde
-`r_obs = rate·dist − costo` y llega a `j`, cuyo tablero aún no conoce; su valor esperado es `Ṽ(s, j)` (valor
-post-decisión, cabeza `agent.post_value`, con `Ṽ(s, depot) = 0`). Con `S = REWARD_SCALE_FACTOR`:
+**Modelo.** Con `S = REWARD_SCALE_FACTOR` y `r_obs = tarifa·dist·1[carga] − costo`:
 
 ```
-Q(s, a)  = r_obs(i→a)/S + Ṽ(s, a)
-Q_alt(s) = max_{a ≠ j válida} Q(s, a)
-p*(i→j)  = ( S · (Q_alt − Ṽ(s, j)) + costo(i→j) ) / dist(i→j)      [USD/milla]
+Q(s, a)  = r_obs(i→a)/S + Ṽ(s, a)                     Ṽ(s, casa) = 0
+p*(i→j)  = ( S · (Q_alt − Ṽ(s, j)) + costo(i→j) ) / dist(i→j)      [USD/milla],   Q_alt = mejor Q entre a ≠ j válidas
 ```
 
-Es el costo de oportunidad por milla de ir a `j`: puede quedar por debajo del break-even `costo/dist` cuando
-`j` es una posición valiosa. Si `j` es la única acción factible se devuelve el piso `costo/dist` con
-`only_option = True`.
+`Ṽ(s, a)` es el margen esperado desde la llegada a `a` hasta volver a casa siguiendo el actor en modo greedy.
+Hay dos cabezas, A y B, entrenadas con mitades distintas de los mundos: p\*_AB elige la alternativa con A y evalúa
+con B (p\*_BA, al revés); p\* es el promedio y el **rango** [mín, máx] es la variabilidad del estimador (partición
+de datos y ruido de etiquetas), **no un intervalo de confianza** (comparten encoder, contexto y actor).
 
-**Entrenamiento.** `Ṽ` se regresa con el mismo rollout de PPO: `loss_post = MSE(Ṽ(s_t, a_t), G_t − r_t)` solo
-sobre la acción tomada (el retorno al depot se excluye: es el ancla `Ṽ = 0`). La cabeza usa `h_t.detach()` y
-`embeddings.detach()`, y sus parámetros van al optimizer del crítico, así que **no cambia la política**: con la
-misma semilla el reward del PPO es idéntico con o sin ella. Config: `USE_POST_HEAD`, `POST_HIDDEN`, `POST_COEF`.
-`post_mse` y `post_ev` quedan en el `training_log`.
+**Ruta.** *DRL-Q* elige en cada nodo el argmax de Q con `Ṽ = (Ṽ_A + Ṽ_B)/2`; es la ruta que se entrega y está en el
+arnés de evaluación junto al DRL de siempre (el actor) y los baselines.
 
-**Limitaciones.** (1) `p*` es un costo de oportunidad, no una probabilidad de aceptación. (2) `Ṽ` se entrena solo
-en acciones muestreadas: para lanes casi nunca tomadas la estimación (y `p*`) es más ruidosa. (3) Con tours de
-2-4 arcos `Ṽ` tiene varianza alta. (4) Los checkpoints anteriores no traen `post_value`: se cargan, pero la
-cabeza arranca desde cero; hay que reentrenar. La validación lo reporta (ver abajo).
+**Entrenamiento.** El PPO no entrena Ṽ. Después del PPO (`post_training.py`), con encoder, contexto y actor
+congelados: se generan ~200 000 ejemplos (estado de una ruta del actor, acción al azar entre las válidas salvo volver
+a casa, y margen real posterior con el actor greedy en el mismo mundo) y se ajustan A y B. Config: `USE_POST_HEAD`,
+`POST_*`, `MARKET_SEED_POST_*` en `config.py`. Solo se calcula p\* para lanes con carga (no para el retorno ni para
+arcos de reposicionamiento).
 
 **Cómo ejecutarlo.**
 
 ```bash
-python main.py                      # entrena con la cabeza y, al final (RUN_PRICING_VALIDATION), valida p*
-python validate_pricing.py --num-nodes 10 [--best] [--quick]   # validación sola sobre un checkpoint
-python inference.py [--show-board]  # ruta + p* por arco (y tablero por nodo); escribe results/<N>nodes/pricing_<run_tag>.csv
+python main.py                                   # PPO (o checkpoint) → Ṽ A/B → evaluación con DRL-Q → validación
+python post_training.py --num-nodes 10           # solo la fase de Ṽ (checkpoint del PPO → *_pricing.pt)
+python validate_pricing.py --num-nodes 10        # solo la validación sobre el checkpoint *_pricing.pt
+python inference.py [--show-board]               # ruta DRL-Q + p* por arco; escribe results/<N>nodes/pricing_<run_tag>.csv
 ```
 
 La validación escribe `results/<N>nodes/pricing_val/{figures,tables}` y la pestaña "Pricing" del Excel:
-(a) calibración de `Ṽ` contra Monte Carlo (sesgo y RMSE en USD, por tiempo restante), (b) percentil de `p*` en la
-serie histórica de la lane (por día de la semana y tiempo restante) y (c) "acepto si tarifa ≥ p*" contra "acepto
-la mejor tarifa" y "acepto siempre", bajo el supuesto explícito de que toda carga ofrecida está disponible a su
-tarifa observada.
+(b) prueba contrafactual del sesgo de p\* (IC95 por bootstrap de mundos), (c) margen de DRL-Q contra DRL, B1, B2, B2P y B3
+(pareado) y regla de aceptación por umbral con tres pisos (break-even, break-even + 0,30 USD/mi y p\*), y
+(d) percentil de p\* en las tarifas históricas de la lane y correlación con el índice de mercado del destino.
+
+**Limitaciones.** (1) p\* es un costo de oportunidad, no una probabilidad de aceptación. (2) Ṽ se entrena con una
+sola realización por ejemplo, así que el error es alto por construcción. (3) Con K libre la ruta típica es una lane
+con carga más el retorno. (4) Ṽ sigue al actor, no a DRL-Q.
 
 ## Flujo de trabajo típico
 
@@ -213,7 +215,7 @@ tarifa observada.
 4. **Entrenar con el proceso exógeno**: `USE_MARKET_PROCESS = True` en
    `main.py` (si falta `datos/market_params.npz` corre `fit_market_process.py`).
    Validar el simulador con `python validate_market_process.py`.
-5. **Inferencia puntual**: `python inference.py` con un checkpoint ya
+5. **Inferencia puntual**: `python inference.py` con un checkpoint `*_pricing.pt` ya
    guardado en `checkpoints/`.
 
 ## Requisitos

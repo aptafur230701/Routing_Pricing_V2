@@ -1,27 +1,34 @@
 """
 validate_pricing.py
 ===================
-Validación del precio de reserva p* (PRICING_PLAN.md, Fase P3). Tres comprobaciones sobre
-mundos simulados de validación (MARKET_SEED_VAL), con un checkpoint que trae `post_value`:
+Validación del precio de reserva p* y de la ruta DRL-Q (PRICING_PLAN.md §4). Necesita un checkpoint con las
+cabezas Ṽ A/B entrenadas (post_training.py). Todo en K libre salvo que K_TRAINING_LEVELS diga otra cosa.
 
-  (a) Calibración de Ṽ por Monte Carlo. Se muestrean (s, j) del rollout de la política; desde la
-      llegada a j se corren R rollouts de la política con mundos nuevos (el tablero de j y los
-      siguientes se vuelven a sortear) y se compara la media con Ṽ(s, j) de la cabeza. Sesgo y
-      RMSE en USD, globales y por bucket de tiempo restante.
-  (b) Posición de p* dentro de la serie histórica de tarifas de la lane (días de train): percentil
-      de p* y su sensibilidad al día de la semana y al tiempo restante (tabla pivot).
-  (c) Política de aceptación, bajo el supuesto EXPLÍCITO de que toda carga ofrecida está
-      disponible a su tarifa observada: "acepto si tarifa ≥ p*" contra "acepto la mejor tarifa" y
-      "acepto siempre que haya carga" (más el greedy del DRL como referencia).
+  (b) Prueba contrafactual. Se muestrean N_EST_CONTRAFACTUAL estados de rutas de DRL-Q en mundos de validación
+      (MARKET_SEED_VAL, distinta de entrenamiento, de Ṽ y de evaluación). Desde el estado, en el MISMO mundo, se
+      sigue la lane j que eligió DRL-Q y, por separado, la mejor alternativa según el modelo (la de A para p*_AB y
+      la de B para p*_BA); después de cada una, el actor greedy hasta casa:
+          p*_realizado = ( G_alt − C_j + costo_j ) / dist_j
+      con G_alt el margen total desde el estado tomando la alternativa (incluida su carga) y C_j el margen
+      posterior a llegar a j. Sesgo = p* predicho − p*_realizado, con IC95 por bootstrap que remuestrea MUNDOS
+      (los estados de un mismo mundo no son independientes).
+  (c) Utilidad, en los mundos simulados de evaluación y en replay: margen de DRL-Q frente a DRL (actor), B1, B2,
+      B2P y B3 (diferencias pareadas, IC95); % de arcos de DRL-Q con p* bajo el break-even y sobre break-even +
+      BE_MARGEN; y la regla de aceptación por umbral con tres pisos: break-even, break-even + BE_MARGEN y p*.
+  (d) Plausibilidad: percentil de p* en las tarifas históricas de la lane (días de entrenamiento con carga) y
+      correlación de (p* − break-even) con el índice de mercado del destino (esperada negativa: un destino con
+      índice alto vale más ⇒ Ṽ(j) mayor ⇒ p* menor).
+  (a) Las pruebas internas (Q(s, j) = Q_alt a tarifa p*, monotonía en el costo, invariancia en S) están en tests/.
 
-p* es un costo de oportunidad del transportista, no una probabilidad de aceptación (D5).
+p* es un costo de oportunidad del transportista, no una probabilidad de aceptación. Su rango [mín, máx] entre
+las parejas AB/BA mide la variabilidad del estimador, NO es un intervalo de confianza.
 
 Salidas: <output_dir>/pricing_val/figures/*.png y <output_dir>/pricing_val/tables/*.csv
 (output_dir por defecto results/<N>nodes[_<RUN_TAG>]).
 
 Uso
 ---
-    python validate_pricing.py --num-nodes 10 [--checkpoint RUTA] [--best] [--quick]
+    python validate_pricing.py --num-nodes 10 [--checkpoint RUTA] [--quick]
 """
 
 import argparse
@@ -35,56 +42,72 @@ import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
 
 from config import (
-    DEVICE, MAX_DURATION, REWARD_SCALE_FACTOR as S, TRAIN_DAYS, MARKET_SEED_VAL, PRICING_VAL_SEED,
-    K_TRAINING_LEVELS, configurar_k, RUN_TAG, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF,
+    DEVICE, MAX_DURATION, REWARD_SCALE_FACTOR as S, TRAIN_DAYS, MARKET_SEED_VAL, MARKET_SEED_EVAL,
+    PRICING_VAL_SEED, K_TRAINING_LEVELS, configurar_k, RUN_TAG, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF,
+    N_EST_CONTRAFACTUAL, N_MUNDOS_CONTRAFACTUAL, BE_MARGEN, INDICE_DISPERSION_SEMANAL, MARKET_M_EVAL_WORLDS,
+    BOOTSTRAP_B, BOOTSTRAP_SEED,
 )
 from attention_encoder import (
     build_node_features_batch, build_temporal_features_batch, build_market_features_batch,
     build_budget_features_batch, build_dow_features_batch,
 )
 from baselines import calcular_ev_pronostico
-from evaluation import disenar_mundos, make_sim_env
+from evaluation import disenar_mundos, make_sim_env, make_replay_env, casos_replay, _etiqueta_k
 from market_process import MarketProcess, asegurar_parametros
-from pricing import lane_cost_row, percentil_historico, reservation_price
+from pricing import (
+    lane_cost_row, percentil_historico, reservation_price, crear_selector_q, PrecioReserva,
+)
 from problem_data import load_matrices
-from stats_analysis import ic_bootstrap_media
+from stats_analysis import (
+    ic_bootstrap_media, ic_bootstrap_cluster, ic_bootstrap_cociente, comparar_con_baselines, BASELINES_Q,
+)
 
-DOW = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
-# Buckets de horas restantes. En (b) se mide en el estado de decisión s (el tablero de hoy); en (a) a la
-# llegada a j, que es de lo que depende Ṽ(s, j): casi todos los s de un tour de 2-3 arcos tienen ≥ 60 h.
-BUCKET_LABELS = ["<20 h", "20-40 h", "40-60 h", "≥60 h"]
-BUCKET_LABELS_LLEGADA = ["<15 h", "15-30 h", "30-45 h", "≥45 h"]
+TRAMOS = [("< 300 mi", 0.0, 300.0), ("300-800 mi", 300.0, 800.0), ("> 800 mi", 800.0, np.inf)]
 
 
-def _bucket(rem_h, edges=(0.0, 20.0, 40.0, 60.0, np.inf), labels=None) -> np.ndarray:
-    return pd.cut(np.asarray(rem_h, dtype=float), list(edges), right=False, labels=labels or BUCKET_LABELS)
+def _tramo(dist) -> np.ndarray:
+    d = np.asarray(dist, dtype=float)
+    return np.select([d < 300.0, d <= 800.0], [TRAMOS[0][0], TRAMOS[1][0]], TRAMOS[2][0])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Escenario: datos + red, con el forward compartido por los tres rollouts
+# Escenario: datos + red, con el forward compartido por todos los rollouts por lotes
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Escenario:
-    """Datos del problema y utilidades de rollout por lotes sobre mundos simulados."""
+    """Datos del problema y rollouts por lotes sobre mundos simulados o sobre el replay de los días de evaluación.
+
+    modo="simulado": rate_stack/loads_stack = días de entrenamiento (fijan el último día con datos del entorno).
+    modo="replay"  : rate_stack/loads_stack = días de evaluación (TRAIN_DAYS en adelante) y ltr/trucks recortados
+                     a los mismos días; world_seed no existe.
+    rate_hist/loads_hist son siempre la serie de entrenamiento (para el percentil histórico de p*).
+    """
 
     def __init__(self, agent, num_nodes, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-                 ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95, market, ev_esperado=None):
-        if getattr(agent, "post_value", None) is None:
-            raise ValueError("el agente no tiene post_value (USE_POST_HEAD=False o checkpoint sin la cabeza)")
-        self.agent, self.N, self.market = agent.eval(), num_nodes, market
+                 ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95, market, ev_esperado=None,
+                 modo="simulado", rate_hist=None, loads_hist=None):
+        self.agent, self.N, self.market, self.modo = agent.eval(), num_nodes, market, modo
         self.T = np.asarray(time_matrix, dtype=float)
-        self.dist, self.diesel = distance_arr, diesel_arr
-        self.cost = lane_cost_row(distance_arr, diesel_arr)            # (N, N)
-        self.rate_train, self.loads_train = rate_stack[:TRAIN_DAYS], loads_stack[:TRAIN_DAYS]
+        self.dist, self.diesel = np.asarray(distance_arr, dtype=float), diesel_arr
+        self.cost = lane_cost_row(self.dist, np.asarray(diesel_arr, dtype=float))             # (N, N)
+        self.rate_stack, self.loads_stack = rate_stack, loads_stack
+        self.rate_hist = rate_stack[:TRAIN_DAYS] if rate_hist is None else rate_hist
+        self.loads_hist = loads_stack[:TRAIN_DAYS] if loads_hist is None else loads_hist
         self.time_matrix = time_matrix
         self.ltr, self.trucks, self.avail, self.p95 = ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95
         self.ev = ev_esperado if ev_esperado is not None else calcular_ev_pronostico(market, distance_arr, diesel_arr)
         self.device = next(agent.parameters()).device
+        self.con_cabezas = bool(getattr(agent, "post_entrenadas", False))
+        self.selector_q = crear_selector_q(agent, distance_arr, diesel_arr, S) if self.con_cabezas else None
 
     def make_env(self):
-        return make_sim_env(self.time_matrix, self.rate_train, self.loads_train, self.dist, self.diesel,
+        if self.modo == "replay":
+            return make_replay_env(self.time_matrix, self.rate_stack, self.loads_stack, self.dist, self.diesel,
+                                   self.N, day_offset=TRAIN_DAYS, market=self.market)
+        return make_sim_env(self.time_matrix, self.rate_stack, self.loads_stack, self.dist, self.diesel,
                             self.N, self.market)
 
     def encode(self, env, masks):
@@ -108,326 +131,411 @@ class Escenario:
         h_t = self.agent.context_net(graph, emb[torch.arange(B), cur_t, :], t(tmp), t(mkt), t(bud), t(dow))
         return h_t, emb, t(masks)
 
-    def post_values(self, h_t, emb) -> np.ndarray:
-        """(B, N) Ṽ(s, j) de la cabeza, con el ancla Ṽ(s, depot) = 0 aplicada por el llamador."""
-        return self.agent.post_value(h_t, emb).cpu().numpy().astype(np.float64)
+    def valores(self, h_t, emb) -> tuple:
+        """(Ṽ_A, Ṽ_B), cada una (B, N) float64 en unidades escaladas por 1/S (sin el ancla Ṽ(depot) = 0)."""
+        va, vb = self.agent.post_values(h_t, emb)
+        return va.detach().cpu().numpy().astype(np.float64), vb.detach().cpu().numpy().astype(np.float64)
 
-    def act(self, h_t, emb, mask_t, sample: bool) -> np.ndarray:
-        if sample:
+    def acciones(self, h_t, emb, mask_t, masks, env, modo: str) -> np.ndarray:
+        """modo: "greedy" (argmax del actor), "sample" (muestreada del actor) o "q" (argmax de Q, DRL-Q)."""
+        if modo == "sample":
             return self.agent.decoder.act(h_t, emb, mask_t)[0].cpu().numpy()
+        if modo == "q":
+            return self.selector_q(h_t, emb, masks, env)
         return self.agent.decoder.greedy_action(h_t, emb, mask_t).cpu().numpy()
 
-    # ── (1) trayectorias de la política con todo lo que p* necesita ──────────
-    @torch.no_grad()
-    def recolectar(self, dis, k_arr, sample=True) -> list:
-        """Rollout de la política sobre los mundos `dis`; un registro por (episodio, paso).
+    def precio(self, rec, j) -> PrecioReserva:
+        """Precio de reserva de la lane rec['i'] → j en el estado del registro."""
+        i = rec["i"]
+        return reservation_price(rec["va"], rec["vb"], rec["mask"], i, j, rec["rate"], self.dist[i], self.cost[i],
+                                 rec["start"], S, loads_row=rec["loads"])
 
-        Cada registro guarda lo observado en el estado s (máscara, tablero, Ṽ de la cabeza) y la
-        acción tomada, con lo necesario para reanudar el episodio en el nodo de llegada.
+    # ── (1) trayectorias de una política con todo lo que p* necesita ─────────
+    @torch.no_grad()
+    def recolectar(self, dis, k_arr, modo="q", con_indice=False, con_valores=None) -> list:
+        """Rollout de la política `modo` sobre los mundos `dis`; un registro por (episodio, paso).
+
+        Cada registro guarda lo observado en el estado s (máscara, tablero, Ṽ de las cabezas, índice de mercado
+        si con_indice) y la acción tomada. `futuro_usd` es lo que se cobra DESPUÉS de ese paso en el episodio.
         """
+        con_valores = self.con_cabezas if con_valores is None else con_valores
         env = self.make_env()
         B = len(dis["nodo"])
-        masks = env.reset(dis["nodo"], dis["start_day"], k_max_arr=k_arr, world_seeds=dis["world_seed"])
+        masks = env.reset(dis["nodo"], dis["start_day"], k_max_arr=k_arr, world_seeds=dis.get("world_seed"))
         active = np.ones(B, dtype=bool)
         recs = []
         for _ in range(env.max_steps):
             if not active.any():
                 break
             h_t, emb, mask_t = self.encode(env, masks)
-            v = self.post_values(h_t, emb)
-            actions = self.act(h_t, emb, mask_t, sample)
+            va, vb = self.valores(h_t, emb) if con_valores else (None, None)
+            actions = self.acciones(h_t, emb, mask_t, masks, env, modo)
+            rate, loads = env.rate_row_obs, env.loads_row_obs
+            idx = env.market_index if con_indice else None
             paso = []
             for b in np.where(active)[0]:
                 paso.append(len(recs))
                 recs.append(dict(
                     b=int(b), step=int(env.step_count[b]), i=int(env.current_node[b]), j=int(actions[b]),
                     start=int(env.start_node[b]), start_day=int(dis["start_day"][b]), k=k_arr[b],
-                    t=float(env.time_elapsed[b]), mask=masks[b].copy(), v=v[b].copy(),
-                    rate=env.current_rate_row[b].astype(np.float64), loads=env.current_loads_row[b].copy(),
-                    k_rem=int(env.k_remaining[b]),
-                    dow=int(env.current_dow[b]), term=False,
+                    t=float(env.time_elapsed[b]), mask=masks[b].copy(), rate=np.array(rate[b], dtype=np.float64),
+                    loads=np.array(loads[b]), k_rem=int(env.k_remaining[b]), dow=int(env.current_dow[b]),
+                    world_seed=None if dis.get("world_seed") is None else int(dis["world_seed"][b]),
+                    va=None if va is None else va[b].copy(), vb=None if vb is None else vb[b].copy(),
+                    idx=None if idx is None else np.array(idx[b], dtype=np.float64), term=False, valido=False,
                 ))
             _, term, masks = env.step(actions)
             for r, b in zip(paso, np.where(active)[0]):
                 recs[r]["term"] = bool(term[b])
-                recs[r]["r_raw"] = float(env.last_raw_reward[b])        # lane cobrada en este paso (USD)
+                recs[r]["r_raw"] = float(env.last_raw_reward[b])              # lane cobrada en este paso (USD)
+                recs[r]["valido"] = bool(term[b] and actions[b] == env.start_node[b] and not env.last_time_violation[b])
             active &= ~term
-        # Lo que se cobra DESPUÉS de este paso en el mismo episodio: una muestra del valor que Ṽ y el MC estiman.
         futuro = {}
         for r in reversed(recs):
             r["futuro_usd"] = futuro.get(r["b"], 0.0)
             futuro[r["b"]] = futuro.get(r["b"], 0.0) + r["r_raw"]
         return recs
 
-    def p_estrella(self, rec, j) -> tuple:
-        """(p*, only_option) de la lane rec['i']→j en el estado del registro."""
-        i = rec["i"]
-        return reservation_price(
-            self.agent, None, None, rec["mask"], i, j, rec["rate"], self.dist[i], self.cost[i],
-            rec["start"], S, loads_row=rec["loads"], post_values=rec["v"],
-        )
-
-    # ── (2) valor de continuación por Monte Carlo ───────────────────────────
+    # ── (2) reproducción del prefijo: reanudar un episodio en un estado ─────
     @torch.no_grad()
-    def mc_valores(self, estados, R, rng, chunk_rows=3000, sample=True) -> tuple:
-        """Media y error estándar del retorno escalado (1/S) que sigue a llegar a j.
+    def reproducir(self, start, start_day, seeds, k_arr, prefijos, forzada, capturar=False, chunk=8192) -> dict:
+        """Reanuda episodios en un estado y los sigue con el actor greedy hasta casa.
 
-        estados : list[(rec, j)]. Cada uno se reanuda en el nodo j, en t + t_ij, con el mismo
-        presupuesto K, y R mundos nuevos: el tablero de j se vuelve a sortear.
+        El mundo es función pura de (semilla, nodo, día) y no depende de las acciones, así que basta reproducir el
+        prefijo de acciones (el de la trayectoria original) hasta el estado, forzar la acción `forzada[r]` en ese
+        paso y seguir con el actor greedy. Solo usa la API pública del entorno.
+
+        prefijos : list[list[int]] — acciones de los pasos anteriores al estado (len = paso del estado).
+        forzada  : (R,) acción tomada EN el estado (la que se evalúa).
+        Devuelve r_forzada (R,) = lane cobrada por la acción forzada (USD), cont (R,) = margen cobrado después de
+        llegar a ella (USD), valida (R,) = el episodio cerró en casa sin violar el tiempo, y con capturar los
+        (h_t, e_a) del estado (R, d_h) para entrenar las cabezas Ṽ.
         """
-        medias, ses = [], []
-        por_chunk = max(1, chunk_rows // R)
-        for c0 in range(0, len(estados), por_chunk):
-            sub = estados[c0:c0 + por_chunk]
-            ret = self._mc_chunk(sub, R, rng, sample)                     # (len(sub), R)
-            medias += list(ret.mean(axis=1))
-            ses += list(ret.std(axis=1, ddof=1) / np.sqrt(R))
-        return np.array(medias), np.array(ses)
+        R = len(start)
+        if seeds is not None and all(x is None for x in seeds):
+            seeds = None
+        out = dict(r_forzada=np.zeros(R), cont=np.zeros(R), valida=np.zeros(R, dtype=bool))
+        if capturar:
+            out["h"] = torch.zeros(R, self.agent.d_h)
+            out["e"] = torch.zeros(R, self.agent.d_h)
+        for c0 in range(0, R, chunk):
+            sl = slice(c0, min(R, c0 + chunk))
+            self._reproducir_chunk(
+                np.asarray(start)[sl], np.asarray(start_day)[sl], None if seeds is None else np.asarray(seeds)[sl],
+                list(k_arr[sl]), prefijos[sl], np.asarray(forzada)[sl], capturar, out, sl,
+            )
+        return out
 
-    def _mc_chunk(self, sub, R, rng, sample) -> np.ndarray:
-        rep = lambda xs: np.repeat(np.asarray(xs), R, axis=0)
-        n = len(sub)
-        B = n * R
-        start = rep([r["start"] for r, _ in sub]).astype(np.int64)
-        sday = rep([r["start_day"] for r, _ in sub]).astype(np.int64)
-        k_arr = [r["k"] for r, _ in sub for _ in range(R)]
+    def _reproducir_chunk(self, start, start_day, seeds, k_arr, prefijos, forzada, capturar, out, sl):
+        R = len(start)
         env = self.make_env()
-        env.reset(start, sday, k_max_arr=k_arr, world_seeds=rng.integers(0, 2**31 - 1, size=B))
-        # Estado de llegada a j (los atributos privados son los que step() actualiza).
-        j = rep([jj for _, jj in sub]).astype(np.int64)
-        i = rep([r["i"] for r, _ in sub]).astype(np.int64)
-        env._current_node = j
-        env._time_elapsed = (rep([r["t"] for r, _ in sub]).astype(np.float32)
-                             + self.T[i, j].astype(np.float32))
-        env._step_count = rep([r["step"] + 1 for r, _ in sub]).astype(np.int64)
-        env._k_remaining = rep([r["k_rem"] - 1 for r, _ in sub]).astype(np.int64)
-        env._active = np.ones(B, dtype=bool)
-        env._revelar_mercado(np.arange(B), env._start_day_idx + (env._time_elapsed // 14).astype(np.int64))
-        masks = env._compute_masks()
-
-        ret = np.zeros(B, dtype=np.float64)
-        active = np.ones(B, dtype=bool)
-        for _ in range(env.max_steps):
+        masks = env.reset(start.astype(np.int64), start_day.astype(np.int64), k_max_arr=k_arr, world_seeds=seeds)
+        L = np.array([len(p) for p in prefijos])
+        P = np.full((R, int(L.max()) + 1), -1, dtype=np.int64)
+        for r, p in enumerate(prefijos):
+            P[r, :len(p)] = p
+        r_f, cont, valida = np.zeros(R), np.zeros(R), np.zeros(R, dtype=bool)
+        active = np.ones(R, dtype=bool)
+        for t in range(env.max_steps):
             if not active.any():
                 break
             h_t, emb, mask_t = self.encode(env, masks)
-            actions = self.act(h_t, emb, mask_t, sample)
-            rewards, term, masks = env.step(actions)
-            ret += np.where(active, rewards, 0.0)
+            greedy = self.acciones(h_t, emb, mask_t, masks, env, "greedy")
+            en_estado = active & (L == t)
+            if capturar and en_estado.any():
+                ix = np.where(en_estado)[0]
+                out["h"][sl.start + ix] = h_t[ix].detach().cpu().float()
+                out["e"][sl.start + ix] = emb[ix, torch.as_tensor(forzada[ix], device=emb.device)].detach().cpu().float()
+            pref_t = P[:, min(t, P.shape[1] - 1)]
+            acc = np.where(L > t, pref_t, np.where(L == t, forzada, greedy)).astype(np.int64)
+            _, term, masks = env.step(acc)
+            raw = env.last_raw_reward.astype(np.float64)
+            r_f[en_estado] = raw[en_estado]
+            cont += np.where(active & (L < t), raw, 0.0)
+            valida |= active & term & (acc == start) & ~env.last_time_violation & (L <= t)
             active &= ~term
-        return ret.reshape(n, R)
+        sl_abs = slice(sl.start, sl.stop)
+        out["r_forzada"][sl_abs], out["cont"][sl_abs], out["valida"][sl_abs] = r_f, cont, valida
 
-    # ── (3) política de aceptación ──────────────────────────────────────────
+    # ── (3) regla de aceptación por umbral ───────────────────────────────────
     @torch.no_grad()
-    def aceptacion(self, dis, k_arr, regla: str, rng) -> pd.DataFrame:
-        """Un episodio por mundo bajo la regla de aceptación; una fila por mundo.
+    def umbral(self, dis, k_arr, tipo: str) -> pd.DataFrame:
+        """Un episodio por mundo con la regla de aceptación por umbral; una fila por mundo.
 
-        Reglas: "drl" (greedy de la política), "pstar" (acepto si tarifa ≥ p*), "mejor_tarifa" (la
-        oferta de mayor tarifa/milla) y "siempre" (una oferta al azar). Oferta = lane saliente
-        válida con carga. Sin oferta aceptable se vuelve al depot; en el primer paso, donde el depot
-        está enmascarado, se usa la acción greedy de la política.
+        Paso a paso sobre las tarifas observadas: entre las lanes con carga válidas cuya tarifa observada ≥ umbral
+        de la lane, toma la de mayor (tarifa − umbral)·dist; si ninguna califica, vuelve a casa; donde volver a casa
+        no es válido (paso 0), usa la acción de DRL-Q. tipo: "be" (umbral = costo/dist), "be+margen"
+        (costo/dist + BE_MARGEN) o "pstar" (el p* de DRL-Q en ese estado).
         """
         env = self.make_env()
         B = len(dis["nodo"])
-        masks = env.reset(dis["nodo"], dis["start_day"], k_max_arr=k_arr, world_seeds=dis["world_seed"])
+        masks = env.reset(dis["nodo"], dis["start_day"], k_max_arr=k_arr, world_seeds=dis.get("world_seed"))
         active = np.ones(B, dtype=bool)
         ar = np.arange(self.N)
-        margen = np.zeros(B)
-        n_ofertas = np.zeros(B)
-        n_elegibles = np.zeros(B)
-        n_aceptadas = np.zeros(B)
-        n_arcos = np.zeros(B, dtype=int)
+        margen, n_arcos = np.zeros(B), np.zeros(B, dtype=int)
         valido = np.zeros(B, dtype=bool)
         for _ in range(env.max_steps):
             if not active.any():
                 break
             h_t, emb, mask_t = self.encode(env, masks)
-            greedy = self.act(h_t, emb, mask_t, False)
-            v = self.post_values(h_t, emb) if regla == "pstar" else None
-            acc = greedy.copy()
+            a_q = self.acciones(h_t, emb, mask_t, masks, env, "q")
+            va, vb = self.valores(h_t, emb) if tipo == "pstar" else (None, None)
+            rate_all, loads_all = env.rate_row_obs, env.loads_row_obs
+            acc = a_q.copy()
             for b in np.where(active)[0]:
                 i, s0 = int(env.current_node[b]), int(env.start_node[b])
-                loads, rate = env.current_loads_row[b], env.current_rate_row[b].astype(np.float64)
+                rate, loads = rate_all[b].astype(np.float64), loads_all[b]
                 ofertas = np.where((masks[b] == 1) & (loads > 0) & (ar != s0) & (ar != i))[0]
-                n_ofertas[b] += len(ofertas)
-                volver = s0 if (masks[b][s0] == 1 and i != s0) else int(greedy[b])
-                if regla == "drl":
-                    acc[b] = greedy[b]
-                elif regla == "pstar":
-                    rec = dict(i=i, mask=masks[b], rate=rate, loads=loads, start=s0, v=v[b])
-                    pj = [(j, self.p_estrella(rec, j)[0]) for j in ofertas]
-                    ok = [(j, (rate[j] - p) * self.dist[i, j]) for j, p in pj if rate[j] >= p]
-                    n_elegibles[b] += len(ok)
-                    acc[b] = max(ok, key=lambda x: x[1])[0] if ok else volver
-                elif regla == "mejor_tarifa":
-                    acc[b] = int(ofertas[np.argmax(rate[ofertas])]) if len(ofertas) else volver
-                elif regla == "siempre":
-                    acc[b] = int(rng.choice(ofertas)) if len(ofertas) else volver
-                else:
-                    raise ValueError(regla)
-                if loads[acc[b]] > 0 and acc[b] != s0:
-                    n_aceptadas[b] += 1
-            rewards, term, masks = env.step(acc)
+                be = self.cost[i] / self.dist[i]
+                ok = []
+                for j in ofertas:
+                    if tipo == "be":
+                        thr = be[j]
+                    elif tipo == "be+margen":
+                        thr = be[j] + BE_MARGEN
+                    else:
+                        thr = self.precio(dict(i=i, mask=masks[b], rate=rate, loads=loads, start=s0,
+                                               va=va[b], vb=vb[b]), j).p
+                    if np.isfinite(thr) and rate[j] >= thr:
+                        ok.append((j, (rate[j] - thr) * self.dist[i, j]))
+                if ok:
+                    acc[b] = max(ok, key=lambda x: x[1])[0]
+                elif masks[b][s0] == 1 and i != s0:
+                    acc[b] = s0                                                   # ninguna califica: a casa
+            _, term, masks = env.step(acc)
             margen += np.where(active, env.last_raw_reward, 0.0)
             n_arcos += active.astype(int)
             valido |= active & term & (acc == env.start_node) & ~env.last_time_violation
             active &= ~term
-        return pd.DataFrame(dict(
-            mundo=np.arange(B), margen=margen, valido=valido, n_arcos=n_arcos,
-            n_ofertas=n_ofertas, n_aceptadas=n_aceptadas, n_elegibles=n_elegibles,
-        ))
+        return pd.DataFrame(dict(mundo=np.arange(B), margen=margen, valido=valido, n_arcos=n_arcos))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Las tres validaciones
+# (b) Prueba contrafactual
 # ─────────────────────────────────────────────────────────────────────────────
 
-def validar_calibracion(esc: Escenario, recs, rng, n_estados=300, n_rollouts=50, n_no_tomadas=100) -> tuple:
-    """(a) Ṽ de la cabeza contra la media Monte Carlo. Retorna (muestras, resumen) en USD."""
+def _corr_cluster_ic(x, y, grupos, B=1000, semilla=BOOTSTRAP_SEED) -> tuple:
+    """IC95 de la correlación de Pearson remuestreando mundos enteros."""
+    x, y, g = np.asarray(x, float), np.asarray(y, float), np.asarray(grupos)
+    ug, inv = np.unique(g, return_inverse=True)
+    filas = [np.where(inv == k)[0] for k in range(len(ug))]
+    rng = np.random.Generator(np.random.PCG64(semilla))
+    cs = []
+    for _ in range(B):
+        ix = np.concatenate([filas[k] for k in rng.integers(0, len(ug), size=len(ug))])
+        if np.std(x[ix]) > 0 and np.std(y[ix]) > 0:
+            cs.append(np.corrcoef(x[ix], y[ix])[0, 1])
+    return (float(np.percentile(cs, 2.5)), float(np.percentile(cs, 97.5))) if cs else (float("nan"), float("nan"))
+
+
+def validar_contrafactual(esc: Escenario, n_mundos: int, n_estados: int, rng, k_nivel=None, max_bloques: int = 10) -> tuple:
+    """(b) Retorna (estados DataFrame, resumen DataFrame).
+
+    Los mundos se generan por bloques de `n_mundos` (el primero con exactamente MARKET_SEED_VAL, los siguientes con
+    MARKET_SEED_VAL + k) hasta reunir n_estados arcos de DRL-Q con carga y alternativa: con K libre la ruta típica
+    es 1 lane cargada + el retorno, así que hacen falta más mundos que estados.
+    """
     N = esc.N
-    tomadas = [(r, r["j"]) for r in recs if r["j"] != r["start"] and not r["term"]]
-    no_tomadas = []
+    elegibles, acciones_mundo, bloque = [], {}, 0
+    while len(elegibles) < n_estados and bloque < max_bloques:
+        dis = disenar_mundos(N, n_mundos, esc.market, num_dias=TRAIN_DAYS, semilla=MARKET_SEED_VAL + bloque)
+        recs = esc.recolectar(dis, [k_nivel] * n_mundos, modo="q")
+        for r in recs:
+            r["b"] += bloque * n_mundos                                     # id de mundo único entre bloques
+            acciones_mundo.setdefault(r["b"], []).append(r["j"])
+        for r in recs:
+            if r["j"] == r["start"] or r["loads"][r["j"]] <= 0:
+                continue
+            pr = esc.precio(r, r["j"])
+            if pr.definido:
+                elegibles.append((r, pr))
+        bloque += 1
+    if not elegibles:
+        raise RuntimeError("sin estados elegibles para la prueba contrafactual")
+    ix = rng.choice(len(elegibles), size=min(n_estados, len(elegibles)), replace=False)
+    estados = [elegibles[k] for k in ix]
+
+    # ramas distintas a evaluar: (estado, acción) → fila
+    filas, claves = [], {}
+    for s, (r, pr) in enumerate(estados):
+        for a in {r["j"], pr.alt_a, pr.alt_b}:
+            claves[(s, a)] = len(filas)
+            filas.append((r, a))
+    rama = esc.reproducir(
+        [r["start"] for r, _ in filas], [r["start_day"] for r, _ in filas], [r["world_seed"] for r, _ in filas],
+        [r["k"] for r, _ in filas], [acciones_mundo[r["b"]][:r["step"]] for r, _ in filas],
+        [a for _, a in filas],
+    )
+    reg = []
+    for s, (r, pr) in enumerate(estados):
+        i, j = r["i"], r["j"]
+        c_j = rama["cont"][claves[(s, j)]]
+        g = lambda a: rama["r_forzada"][claves[(s, a)]] + rama["cont"][claves[(s, a)]]
+        d, cj = esc.dist[i, j], esc.cost[i, j]
+        p_ab_real = (g(pr.alt_a) - c_j + cj) / d
+        p_ba_real = (g(pr.alt_b) - c_j + cj) / d
+        validas = all(rama["valida"][claves[(s, a)]] for a in {j, pr.alt_a, pr.alt_b})
+        reg.append(dict(
+            mundo=r["b"], paso=r["step"], i=i, j=j, dist_j=d, tramo=str(_tramo(d)), break_even=pr.break_even,
+            rate_j=float(r["rate"][j]), p_pred=pr.p, p_ab=pr.p_ab, p_ba=pr.p_ba, p_min=pr.p_min, p_max=pr.p_max,
+            alt_a=pr.alt_a, alt_b=pr.alt_b, p_real=(p_ab_real + p_ba_real) / 2, p_real_ab=p_ab_real,
+            p_real_ba=p_ba_real, ramas_validas=validas, c_j=c_j, g_j=g(j), g_alt_ab=g(pr.alt_a), g_alt_ba=g(pr.alt_b),
+        ))
+    df = pd.DataFrame(reg)
+    df["sesgo"] = df["p_pred"] - df["p_real"]
+    df["sesgo_usd_lane"] = df["sesgo"] * df["dist_j"]
+    df["ancho_rango"] = df["p_max"] - df["p_min"]
+
+    def resumen(g, nombre):
+        if len(g) == 0:
+            return dict(grupo=nombre, n_estados=0, n_mundos=0)
+        lo, hi = ic_bootstrap_cluster(g["sesgo"], g["mundo"])
+        lo_l, hi_l = ic_bootstrap_cluster(g["sesgo_usd_lane"], g["mundo"])
+        out = dict(
+            grupo=nombre, n_estados=len(g), n_mundos=g["mundo"].nunique(),
+            sesgo_usd_milla=g["sesgo"].mean(), sesgo_ic95_inf=lo, sesgo_ic95_sup=hi,
+            sesgo_usd_lane=g["sesgo_usd_lane"].mean(), sesgo_lane_ic95_inf=lo_l, sesgo_lane_ic95_sup=hi_l,
+            p_pred_medio=g["p_pred"].mean(), p_real_medio=g["p_real"].mean(),
+            ancho_rango_medio=g["ancho_rango"].mean(),
+            corr_pearson=float(np.corrcoef(g["p_pred"], g["p_real"])[0, 1]) if len(g) > 2 else float("nan"),
+            corr_spearman=float(spearmanr(g["p_pred"], g["p_real"])[0]) if len(g) > 2 else float("nan"),
+            sd_p_real=g["p_real"].std(),
+        )
+        out["sesgo_frac_disp_indice_inf"] = out["sesgo_usd_milla"] / INDICE_DISPERSION_SEMANAL[1]
+        out["sesgo_frac_disp_indice_sup"] = out["sesgo_usd_milla"] / INDICE_DISPERSION_SEMANAL[0]
+        return out
+
+    filas_r = [resumen(df, "global")]
+    lo, hi = _corr_cluster_ic(df["p_pred"], df["p_real"], df["mundo"])
+    filas_r[0]["corr_pearson_ic95_inf"], filas_r[0]["corr_pearson_ic95_sup"] = lo, hi
+    for nombre, _, _ in TRAMOS:
+        filas_r.append(resumen(df[df["tramo"] == nombre], nombre))
+    return df, pd.DataFrame(filas_r)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (c) y (d): arcos de las rutas de DRL-Q
+# ─────────────────────────────────────────────────────────────────────────────
+
+def arcos_drl_q(esc: Escenario, dis, k_arr) -> pd.DataFrame:
+    """Una fila por arco de las rutas de DRL-Q (también el retorno y los arcos sin carga, con p* = NaN): ruta, tarifa
+    de hoy, p*, rango, break-even, percentil histórico e índice de mercado del destino. Los arcos con p* definido
+    (con carga, no retorno, con alternativa) son los que entran en los resúmenes."""
+    recs = esc.recolectar(dis, k_arr, modo="q", con_indice=True)
+    rutas = {}
     for r in recs:
-        cand = np.where((r["mask"] == 1) & (r["loads"] > 0) & (np.arange(N) != r["start"])
-                        & (np.arange(N) != r["i"]) & (np.arange(N) != r["j"]))[0]
-        no_tomadas += [(r, int(j)) for j in cand]
-    ix = lambda lst, n: [lst[k] for k in rng.choice(len(lst), size=min(n, len(lst)), replace=False)]
-    estados = [(e, True) for e in ix(tomadas, n_estados)] + [(e, False) for e in ix(no_tomadas, n_no_tomadas)]
-    mc, se = esc.mc_valores([e for e, _ in estados], n_rollouts, rng)
+        rutas.setdefault(r["b"], [r["i"]]).append(r["j"])
+    margen = pd.Series({b: 0.0 for b in range(len(dis["nodo"]))})
     filas = []
-    for ((r, j), tomada), m, s_ in zip(estados, mc, se):
+    for r in recs:
+        margen[r["b"]] += r["r_raw"]
+        pr = esc.precio(r, r["j"])
+        i, j = r["i"], r["j"]
         filas.append(dict(
-            i=r["i"], j=j, tomada=tomada, tiempo_restante_h=MAX_DURATION - r["t"],
-            tiempo_restante_llegada_h=MAX_DURATION - r["t"] - esc.T[r["i"], j], dow=r["dow"],
-            v_pred_usd=float(r["v"][j]) * S, v_mc_usd=m * S, se_mc_usd=s_ * S,
-            v_real_usd=r["futuro_usd"] if tomada else np.nan,        # una realización del mismo episodio (chequeo del MC)
+            mundo=r["b"], paso=r["step"], ruta=" → ".join(str(n) for n in rutas[r["b"]]), i=i, j=j,
+            es_retorno=bool(j == r["start"]), tiene_carga=bool(pr.has_load), only_option=bool(pr.only_option),
+            dist_j=esc.dist[i, j], rate_j=float(r["rate"][j]), break_even=pr.break_even,
+            p=pr.p, p_min=pr.p_min, p_max=pr.p_max, ancho_rango=pr.p_max - pr.p_min,
+            percentil=percentil_historico(pr.p, esc.rate_hist[:, i, j], esc.loads_hist[:, i, j]) if pr.definido else float("nan"),
+            indice_j=float(r["idx"][j]),
         ))
     df = pd.DataFrame(filas)
-    df["error_usd"] = df["v_pred_usd"] - df["v_mc_usd"]
-    df["bucket"] = _bucket(df["tiempo_restante_llegada_h"], (-np.inf, 15.0, 30.0, 45.0, np.inf), BUCKET_LABELS_LLEGADA)
+    df["margen_mundo"] = df["mundo"].map(margen)                       # margen del tour completo (USD), repetido en cada arco
+    return df
 
-    def resumen(g, nombre, bucket):
-        return dict(grupo=nombre, bucket=bucket, n=len(g), sesgo_usd=g["error_usd"].mean(),
-                    sesgo_mc_vs_realizado_usd=(g["v_mc_usd"] - g["v_real_usd"]).mean(),
-                    rmse_usd=float(np.sqrt((g["error_usd"] ** 2).mean())),
-                    se_mc_medio_usd=g["se_mc_usd"].mean(), v_mc_medio_usd=g["v_mc_usd"].mean())
 
+def resumen_arcos(df: pd.DataFrame, nombre: str) -> dict:
+    """% de arcos con p* bajo el break-even y sobre break-even + BE_MARGEN; percentil y correlación con el índice.
+    Solo cuentan los arcos con p* definido."""
+    df = df[df["p"].notna()]
+    if len(df) == 0:
+        return dict(conjunto=nombre, n_arcos=0)
+    dif = df["p"] - df["break_even"]
+    ok = df["indice_j"].notna() & dif.notna()
+    pear = float(np.corrcoef(dif[ok], df["indice_j"][ok])[0, 1]) if ok.sum() > 2 else float("nan")
+    spear = float(spearmanr(dif[ok], df["indice_j"][ok])[0]) if ok.sum() > 2 else float("nan")
+    pc = df["percentil"].dropna()
+    lo_m, hi_m = ic_bootstrap_cluster(dif, df["mundo"])
+    return dict(
+        conjunto=nombre, n_arcos=len(df), n_mundos=df["mundo"].nunique(),
+        pct_p_bajo_breakeven=100.0 * (df["p"] < df["break_even"]).mean(),
+        pct_p_sobre_breakeven_mas_margen=100.0 * (df["p"] > df["break_even"] + BE_MARGEN).mean(),
+        p_menos_breakeven_medio=dif.mean(), p_menos_breakeven_ic95_inf=lo_m, p_menos_breakeven_ic95_sup=hi_m,
+        ancho_rango_medio=df["ancho_rango"].mean(),
+        percentil_medio=pc.mean(), percentil_mediana=pc.median(), n_percentil=len(pc),
+        pct_percentil_bajo_5=100.0 * (pc < 5).mean(), pct_percentil_sobre_95=100.0 * (pc > 95).mean(),
+        corr_pearson_dif_indice=pear, corr_spearman_dif_indice=spear,
+    )
+
+
+def utilidad_pareada(df_eval: pd.DataFrame) -> tuple:
+    """Diferencias pareadas de DRL-Q contra DRL, B1, B2, B2P y B3 (IC95 por mundo, Wilcoxon+Holm) y la diferencia
+    relativa al margen del actor con su IC95 (criterio de parada: límite superior < −2 %)."""
+    if df_eval is None or df_eval.empty or not (df_eval["metodo"] == "DRL-Q").any():
+        return pd.DataFrame(), pd.DataFrame()
+    pareada = comparar_con_baselines(df_eval, referencia="DRL-Q", baselines=BASELINES_Q)
     filas = []
-    for nombre, g0 in (("tomadas", df[df["tomada"]]), ("no tomadas", df[~df["tomada"]]), ("todas", df)):
-        if len(g0):
-            filas.append(resumen(g0, nombre, "global"))
-            for bk in BUCKET_LABELS_LLEGADA:
-                g = g0[g0["bucket"] == bk]
-                if len(g):
-                    filas.append(resumen(g, nombre, bk))
-    return df, pd.DataFrame(filas)
+    for (modo, K), g in df_eval.groupby(["modo", "K"], sort=False):
+        ancho = g.pivot(index="mundo", columns="metodo", values="margen")
+        par = ancho[["DRL-Q", "DRL"]].dropna()
+        punto, lo, hi = ic_bootstrap_cociente((par["DRL-Q"] - par["DRL"]).to_numpy(), par["DRL"].to_numpy())
+        filas.append(dict(modo=modo, K=K, n_mundos=len(par), margen_drl_q=par["DRL-Q"].mean(), margen_drl=par["DRL"].mean(),
+                          dif_usd=(par["DRL-Q"] - par["DRL"]).mean(), dif_rel_pct=100 * punto,
+                          dif_rel_ic95_inf_pct=100 * lo, dif_rel_ic95_sup_pct=100 * hi,
+                          alerta_parada=bool(hi < -0.02)))
+    return pareada, pd.DataFrame(filas)
 
 
-def validar_posicion(esc: Escenario, recs, rng, n_muestras=500) -> tuple:
-    """(b) Percentil de p* en la serie histórica de la lane. Retorna (muestras, pivot_percentil, pivot_n)."""
-    N = esc.N
-    ofertas = []
-    for r in recs:
-        cand = np.where((r["mask"] == 1) & (r["loads"] > 0) & (np.arange(N) != r["start"])
-                        & (np.arange(N) != r["i"]))[0]
-        ofertas += [(r, int(j)) for j in cand]
-    filas = []
-    for k in rng.choice(len(ofertas), size=min(n_muestras, len(ofertas)), replace=False):
-        r, j = ofertas[k]
-        i = r["i"]
-        p, only = esc.p_estrella(r, j)
-        serie = esc.rate_train[:, i, j]
-        filas.append(dict(
-            i=i, j=j, dow=r["dow"], tiempo_restante_h=MAX_DURATION - r["t"], p_estrella=p,
-            rate_hoy=float(r["rate"][j]), break_even=float(esc.cost[i, j] / esc.dist[i, j]),
-            only_option=only, percentil_p_estrella=percentil_historico(p, serie),
-            percentil_rate_hoy=percentil_historico(float(r["rate"][j]), serie),
-        ))
-    df = pd.DataFrame(filas)
-    df["posicion_valiosa"] = df["p_estrella"] < df["break_even"]
-    df["bucket"] = _bucket(df["tiempo_restante_h"])
-    df["dia"] = df["dow"].map(lambda d: DOW[d])
-    piv = lambda col, fn: df.pivot_table(index="dia", columns="bucket", values=col, aggfunc=fn,
-                                         observed=False).reindex(DOW).reindex(columns=BUCKET_LABELS)
-    return df, piv("percentil_p_estrella", "mean"), piv("percentil_p_estrella", "count")
-
-
-def validar_aceptacion(esc: Escenario, dis, k_arr, rng_seed) -> tuple:
-    """(c) Reglas de aceptación sobre los mismos mundos. Retorna (resumen, por_mundo)."""
-    reglas = [("drl", "Greedy del DRL (referencia)"), ("pstar", "Acepto si tarifa ≥ p*"),
-              ("mejor_tarifa", "Acepto la mejor tarifa"), ("siempre", "Acepto siempre que haya carga")]
-    por_mundo = {}
-    for clave, _ in reglas:
-        por_mundo[clave] = esc.aceptacion(dis, k_arr, clave, np.random.default_rng(rng_seed))
-    ref = por_mundo["pstar"]["margen"].to_numpy()
-    filas = []
-    for clave, nombre in reglas:
-        d = por_mundo[clave]
-        dif = d["margen"].to_numpy() - ref
+def comparar_umbral(esc: Escenario, dis, k_arr, nombre_modo: str) -> tuple:
+    """Regla de aceptación por umbral con los tres pisos; resumen y diferencias pareadas (p* − piso) por mundo."""
+    res = {t: esc.umbral(dis, k_arr, t) for t in ("be", "be+margen", "pstar")}
+    etiquetas = {"be": "break-even", "be+margen": f"break-even + {BE_MARGEN:.2f}", "pstar": "p* de DRL-Q"}
+    filas = [dict(conjunto=nombre_modo, umbral=etiquetas[t], margen_medio=d["margen"].mean(), validez=d["valido"].mean(),
+                  largo_tour_medio=d["n_arcos"].mean(), n_mundos=len(d)) for t, d in res.items()]
+    difs = []
+    for t in ("be", "be+margen"):
+        dif = res["pstar"]["margen"].to_numpy() - res[t]["margen"].to_numpy()
         lo, hi = ic_bootstrap_media(dif)
-        filas.append(dict(
-            regla=nombre, margen_medio_usd=d["margen"].mean(), dif_vs_pstar_usd=dif.mean(),
-            dif_ic95_bajo=lo, dif_ic95_alto=hi,
-            pct_ofertas_aceptadas=100.0 * d["n_aceptadas"].sum() / max(d["n_ofertas"].sum(), 1),
-            pct_ofertas_elegibles=(100.0 * d["n_elegibles"].sum() / max(d["n_ofertas"].sum(), 1)
-                                   if clave == "pstar" else float("nan")),
-            largo_tour_medio=d["n_arcos"].mean(), validez=d["valido"].mean(), n_mundos=len(d),
-        ))
-    resumen = pd.DataFrame(filas)
-    pm = pd.concat([d.assign(regla=c) for c, d in por_mundo.items()], ignore_index=True)
-    return resumen, pm
+        difs.append(dict(conjunto=nombre_modo, comparacion=f"p* − {etiquetas[t]}", dif_media_usd=dif.mean(),
+                         dif_ic95_inf=lo, dif_ic95_sup=hi, n_mundos=len(dif)))
+    pm = pd.concat([d.assign(umbral=etiquetas[t], conjunto=nombre_modo) for t, d in res.items()], ignore_index=True)
+    return pd.DataFrame(filas), pd.DataFrame(difs), pm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Figuras
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fig_calibracion(df, resumen, path):
-    fig, ax = plt.subplots(1, 2, figsize=(13, 5))
-    for tomada, color, lab in ((True, "tab:blue", "acción tomada"), (False, "tab:orange", "no tomada")):
-        g = df[df["tomada"] == tomada]
-        ax[0].errorbar(g["v_mc_usd"], g["v_pred_usd"], xerr=1.96 * g["se_mc_usd"], fmt="o", ms=3,
-                       alpha=0.5, color=color, elinewidth=0.5, label=f"{lab} (n={len(g)})")
-    lim = [min(df["v_mc_usd"].min(), df["v_pred_usd"].min()), max(df["v_mc_usd"].max(), df["v_pred_usd"].max())]
-    ax[0].plot(lim, lim, "k--", lw=0.8)
-    ax[0].set(xlabel="Ṽ Monte Carlo (USD)", ylabel="Ṽ cabeza (USD)", title="Calibración de Ṽ(s, j)")
-    ax[0].grid(alpha=0.3); ax[0].legend(fontsize=8)
-    g = resumen[(resumen["grupo"] == "todas") & (resumen["bucket"] != "global")]
-    x = np.arange(len(g))
-    ax[1].bar(x - 0.2, g["sesgo_usd"], 0.4, label="sesgo")
-    ax[1].bar(x + 0.2, g["rmse_usd"], 0.4, label="RMSE")
-    ax[1].set_xticks(x); ax[1].set_xticklabels([f"{b}\n(n={n})" for b, n in zip(g["bucket"], g["n"])])
-    ax[1].axhline(0, color="k", lw=0.6)
-    ax[1].set(xlabel="Tiempo restante a la llegada a j", ylabel="USD", title="Error de Ṽ por tiempo restante")
-    ax[1].legend(); ax[1].grid(alpha=0.3)
-    fig.tight_layout(); fig.savefig(path, dpi=130); plt.close(fig)
-
-
-def _fig_posicion(df, piv, path):
+def _fig_contrafactual(df, resumen, path):
     fig, ax = plt.subplots(1, 3, figsize=(17, 4.8))
-    ax[0].hist(df["percentil_p_estrella"].dropna(), bins=20, range=(0, 100), color="tab:green", alpha=0.8)
-    ax[0].set(xlabel="Percentil de p* en la serie histórica de la lane", ylabel="Frecuencia",
-              title=f"Posición de p* (n={len(df)})")
-    ax[1].scatter(df["break_even"], df["p_estrella"], s=8, alpha=0.5, c=df["posicion_valiosa"].map({True: "tab:red", False: "tab:blue"}))
-    lim = [df[["break_even", "p_estrella"]].min().min(), df[["break_even", "p_estrella"]].max().max()]
-    ax[1].plot(lim, lim, "k--", lw=0.8)
-    ax[1].set(xlabel="Break-even (USD/mi)", ylabel="p* (USD/mi)", title="p* vs break-even (rojo: posición valiosa)")
-    im = ax[2].imshow(piv.to_numpy(dtype=float), aspect="auto", cmap="viridis", vmin=0, vmax=100)
-    ax[2].set_xticks(range(len(piv.columns))); ax[2].set_xticklabels(piv.columns)
-    ax[2].set_yticks(range(len(piv.index))); ax[2].set_yticklabels(piv.index)
-    ax[2].set(xlabel="Tiempo restante", ylabel="Día de la semana", title="Percentil medio de p*")
-    fig.colorbar(im, ax=ax[2])
+    ax[0].scatter(df["p_real"], df["p_pred"], s=6, alpha=0.35)
+    lim = [min(df["p_real"].min(), df["p_pred"].min()), max(df["p_real"].max(), df["p_pred"].max())]
+    ax[0].plot(lim, lim, "k--", lw=0.8)
+    ax[0].set(xlabel="p* realizado (USD/mi)", ylabel="p* predicho (USD/mi)", title=f"Contrafactual (n={len(df)})")
+    ax[0].grid(alpha=0.3)
+    ax[1].hist(df["sesgo"].clip(-2, 2), bins=60, color="tab:purple", alpha=0.8)
+    ax[1].axvline(0, color="k", lw=0.8); ax[1].axvline(df["sesgo"].mean(), color="r", lw=1.2, label="media")
+    ax[1].set(xlabel="sesgo = predicho − realizado (USD/mi, recortado a ±2)", ylabel="Estados"); ax[1].legend()
+    t = resumen[resumen["grupo"] != "global"]
+    t = t[t["n_estados"] > 0]
+    ax[2].bar(t["grupo"], t["sesgo_usd_milla"], yerr=[t["sesgo_usd_milla"] - t["sesgo_ic95_inf"], t["sesgo_ic95_sup"] - t["sesgo_usd_milla"]], capsize=4)
+    for k, (g, n) in enumerate(zip(t["grupo"], t["n_estados"])):
+        ax[2].text(k, 0, f"n={n}", ha="center", va="bottom", fontsize=8)
+    ax[2].axhline(0, color="k", lw=0.6); ax[2].set(ylabel="Sesgo medio (USD/mi)", title="Por tramo de distancia")
     fig.tight_layout(); fig.savefig(path, dpi=130); plt.close(fig)
 
 
-def _fig_aceptacion(res, path):
-    fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
-    ax[0].barh(res["regla"], res["margen_medio_usd"], color="tab:blue")
-    ax[0].set(xlabel="Margen medio por tour (USD)", title="Margen por regla de aceptación")
-    ax[0].invert_yaxis(); ax[0].grid(alpha=0.3, axis="x")
-    ax[1].barh(res["regla"], res["pct_ofertas_aceptadas"], color="tab:orange")
-    ax[1].set(xlabel="% de ofertas aceptadas", title="Ofertas aceptadas")
-    ax[1].invert_yaxis(); ax[1].grid(alpha=0.3, axis="x")
+def _fig_plausibilidad(arcos, path):
+    fig, ax = plt.subplots(1, 3, figsize=(17, 4.8))
+    ax[0].hist(arcos["percentil"].dropna(), bins=20, range=(0, 100), color="tab:green", alpha=0.8)
+    ax[0].set(xlabel="Percentil de p* en las tarifas históricas de la lane", ylabel="Arcos", title=f"n={len(arcos)}")
+    ax[1].scatter(arcos["break_even"], arcos["p"], s=6, alpha=0.3)
+    lim = [arcos[["break_even", "p"]].min().min(), arcos[["break_even", "p"]].max().max()]
+    ax[1].plot(lim, lim, "k--", lw=0.8)
+    ax[1].set(xlabel="Break-even (USD/mi)", ylabel="p* (USD/mi)", title="p* vs break-even")
+    ax[2].scatter(arcos["indice_j"], arcos["p"] - arcos["break_even"], s=6, alpha=0.3)
+    ax[2].axhline(0, color="k", lw=0.6)
+    ax[2].set(xlabel="Índice de mercado del destino", ylabel="p* − break-even (USD/mi)")
     fig.tight_layout(); fig.savefig(path, dpi=130); plt.close(fig)
 
 
@@ -436,8 +544,7 @@ def _fig_aceptacion(res, path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_pricing_validation(*args, **kwargs) -> dict:
-    """Ver _run_pricing_validation. Siembra torch solo durante la validación (reproducible) y restaura el
-    RNG global al terminar, para no alterar lo que corra después en el mismo proceso (main.py)."""
+    """Ver _run_pricing_validation. Siembra torch solo durante la validación y restaura el RNG global al terminar."""
     devs = [torch.cuda.current_device()] if torch.cuda.is_available() else []
     with torch.random.fork_rng(devices=devs):
         torch.manual_seed(PRICING_VAL_SEED)
@@ -447,80 +554,197 @@ def run_pricing_validation(*args, **kwargs) -> dict:
 def _run_pricing_validation(
     agent, num_nodes, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
     ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95, market, ev_esperado=None,
-    output_dir=None, n_worlds=500, n_mc_states=300, n_mc_rollouts=50, n_pos=500, n_no_tomadas=100,
-    verbose=True,
+    output_dir=None, sim_df=None, replay_df=None, n_mundos_cf=N_MUNDOS_CONTRAFACTUAL,
+    n_estados_cf=N_EST_CONTRAFACTUAL, m_eval=MARKET_M_EVAL_WORLDS, semilla_eval=MARKET_SEED_EVAL, verbose=True,
 ) -> dict:
-    """Corre (a), (b) y (c); guarda tablas y figuras en <output_dir>/pricing_val y devuelve los DataFrames."""
+    """Corre (b), (c) y (d); guarda tablas y figuras en <output_dir>/pricing_val y devuelve los DataFrames.
+
+    sim_df / replay_df: salida de evaluation.evaluar_mundos_simulados / evaluar_replay (con DRL y DRL-Q) para las
+    diferencias pareadas de margen; sin ellos esa parte se omite.
+    """
+    if not getattr(agent, "post_entrenadas", False):
+        raise ValueError("el agente no trae las cabezas Ṽ A/B entrenadas (correr post_training.py)")
     t0 = time.time()
-    esc = Escenario(agent, num_nodes, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-                    ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95, market, ev_esperado)
+    esc_sim = Escenario(agent, num_nodes, time_matrix, rate_stack[:TRAIN_DAYS], loads_stack[:TRAIN_DAYS], distance_arr,
+                        diesel_arr, ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95, market, ev_esperado)
+    esc_rep = Escenario(agent, num_nodes, time_matrix, rate_stack[TRAIN_DAYS:], loads_stack[TRAIN_DAYS:], distance_arr,
+                        diesel_arr, ltr_stack[:, TRAIN_DAYS:], trucks_stack[:, TRAIN_DAYS:], avail_expected_arr,
+                        reward_global_p95, market, ev_esperado, modo="replay",
+                        rate_hist=rate_stack[:TRAIN_DAYS], loads_hist=loads_stack[:TRAIN_DAYS])
     out = output_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "results",
                                      f"{num_nodes}nodes" + (f"_{RUN_TAG}" if RUN_TAG else ""))
     d_tab, d_fig = (os.path.join(out, "pricing_val", s) for s in ("tables", "figures"))
     os.makedirs(d_tab, exist_ok=True); os.makedirs(d_fig, exist_ok=True)
-
     rng = np.random.default_rng(PRICING_VAL_SEED)
-    dis = disenar_mundos(num_nodes, n_worlds, market, num_dias=esc.rate_train.shape[0], semilla=MARKET_SEED_VAL)
-    niveles = list(K_TRAINING_LEVELS)
-    k_arr = [niveles[m % len(niveles)] for m in range(n_worlds)]
+    tablas = {}
 
-    if verbose:
-        print(f"\n--- Validación del precio de reserva ({num_nodes} nodos, {n_worlds} mundos de validación) ---")
-    recs = esc.recolectar(dis, k_arr, sample=True)
-    if verbose:
-        print(f"  trayectorias: {len(recs)} estados")
+    # ── (b) contrafactual ─────────────────────────────────────────────────
+    for K in K_TRAINING_LEVELS:
+        cf, cf_res = validar_contrafactual(esc_sim, n_mundos_cf, n_estados_cf, rng, k_nivel=K)
+        sfx = "" if len(K_TRAINING_LEVELS) == 1 else f"_K{_etiqueta_k(K)}"
+        tablas[f"contrafactual_estados{sfx}"], tablas[f"contrafactual_resumen{sfx}"] = cf, cf_res
+        if verbose:
+            print(f"\n  (b) contrafactual K={_etiqueta_k(K)} ({len(cf)} estados, {cf['mundo'].nunique()} mundos; "
+                  f"{time.time() - t0:.0f} s)")
+            with pd.option_context("display.width", 220, "display.max_columns", None):
+                print(cf_res[["grupo", "n_estados", "sesgo_usd_milla", "sesgo_ic95_inf", "sesgo_ic95_sup", "sesgo_usd_lane",
+                              "corr_pearson", "ancho_rango_medio"]].to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+    _fig_contrafactual(tablas[next(k for k in tablas if k.startswith("contrafactual_estados"))],
+                       tablas[next(k for k in tablas if k.startswith("contrafactual_resumen"))],
+                       os.path.join(d_fig, "contrafactual.png"))
 
-    cal, cal_res = validar_calibracion(esc, recs, rng, n_mc_states, n_mc_rollouts, n_no_tomadas)
+    # ── (c) y (d): arcos de DRL-Q y regla por umbral, en simulado y en replay ──
+    dis_sim = disenar_mundos(num_nodes, m_eval, market, num_dias=TRAIN_DAYS, semilla=semilla_eval)
+    nodos_r, dias_r = casos_replay(num_nodes, rate_stack[TRAIN_DAYS:].shape[0])
+    dis_rep = dict(nodo=nodos_r.astype(np.int64), start_day=dias_r.astype(np.int64), world_seed=None)
+    resumenes, arcos_sim, arcos_rep = [], None, None
+    for K in K_TRAINING_LEVELS:
+        k_sim, k_rep = [K] * m_eval, [K] * len(nodos_r)
+        arcos_sim = arcos_drl_q(esc_sim, dis_sim, k_sim)
+        arcos_rep = arcos_drl_q(esc_rep, dis_rep, k_rep)
+        etq = f"simulado K={_etiqueta_k(K)}", f"replay K={_etiqueta_k(K)}"
+        resumenes += [resumen_arcos(arcos_sim, etq[0]), resumen_arcos(arcos_rep, etq[1])]
+        u_res_s, u_dif_s, u_pm_s = comparar_umbral(esc_sim, dis_sim, k_sim, etq[0])
+        u_res_r, u_dif_r, u_pm_r = comparar_umbral(esc_rep, dis_rep, k_rep, etq[1])
+        sfx = "" if len(K_TRAINING_LEVELS) == 1 else f"_K{_etiqueta_k(K)}"
+        tablas[f"umbral_resumen{sfx}"] = pd.concat([u_res_s, u_res_r], ignore_index=True)
+        tablas[f"umbral_diferencias{sfx}"] = pd.concat([u_dif_s, u_dif_r], ignore_index=True)
+        tablas[f"umbral_por_mundo{sfx}"] = pd.concat([u_pm_s, u_pm_r], ignore_index=True)
+        tablas[f"arcos_drl_q_simulado{sfx}"], tablas[f"arcos_drl_q_replay{sfx}"] = arcos_sim, arcos_rep
+        if verbose:
+            print(f"\n  (c)/(d) arcos de DRL-Q y regla por umbral, K={_etiqueta_k(K)} ({time.time() - t0:.0f} s)")
+            print(tablas[f"umbral_resumen{sfx}"].to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+            print(tablas[f"umbral_diferencias{sfx}"].to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+    tablas["arcos_resumen"] = pd.DataFrame(resumenes)
     if verbose:
-        print(f"  (a) calibración de Ṽ ({len(cal)} pares, {n_mc_rollouts} rollouts c/u): "
-              f"{time.time() - t0:.0f} s")
-        print(cal_res[cal_res["bucket"] == "global"].to_string(index=False, float_format=lambda x: f"{x:.2f}"))
-    pos, piv_pct, piv_n = validar_posicion(esc, recs, rng, n_pos)
-    if verbose:
-        print(f"  (b) posición de p* ({len(pos)} ofertas): percentil medio {pos['percentil_p_estrella'].mean():.1f}, "
-              f"posición valiosa en {100 * pos['posicion_valiosa'].mean():.1f} %")
-    acep, acep_mundo = validar_aceptacion(esc, dis, k_arr, PRICING_VAL_SEED)
-    if verbose:
-        print("  (c) política de aceptación:")
-        print(acep.to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+        with pd.option_context("display.width", 250, "display.max_columns", None):
+            print(tablas["arcos_resumen"].T.to_string(float_format=lambda x: f"{x:.3f}"))
+    _fig_plausibilidad(arcos_sim, os.path.join(d_fig, "plausibilidad.png"))
 
-    tablas = {
-        "mc_calibracion_muestras": cal, "mc_calibracion_resumen": cal_res,
-        "posicion_muestras": pos, "posicion_pivot_percentil_dia_tiempo": piv_pct.reset_index(),
-        "posicion_pivot_n_dia_tiempo": piv_n.reset_index(),
-        "aceptacion_resumen": acep, "aceptacion_por_mundo": acep_mundo,
-    }
+    # ── (c) márgenes pareados desde el arnés ───────────────────────────────
+    eval_df = pd.concat([d for d in (sim_df, replay_df) if d is not None and not d.empty], ignore_index=True) \
+        if (sim_df is not None or replay_df is not None) else None
+    if eval_df is not None:
+        pareada, relativa = utilidad_pareada(eval_df)
+        tablas["utilidad_pareada"], tablas["utilidad_relativa_actor"] = pareada, relativa
+        if verbose and len(relativa):
+            print("\n  (c) DRL-Q frente al actor (relativa al margen del actor):")
+            print(relativa.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+    curva_csv = os.path.join(out, "post_training_curva.csv")
+    if os.path.exists(curva_csv):
+        tablas["post_curva"] = pd.read_csv(curva_csv)                      # error de Ṽ en validación (post_training.py)
     for nombre, df in tablas.items():
         df.to_csv(os.path.join(d_tab, f"{nombre}.csv"), index=False)
-    _fig_calibracion(cal, cal_res, os.path.join(d_fig, "mc_calibracion.png"))
-    _fig_posicion(pos, piv_pct, os.path.join(d_fig, "posicion_p_estrella.png"))
-    _fig_aceptacion(acep, os.path.join(d_fig, "aceptacion.png"))
     if verbose:
         print(f"  tablas y figuras → {os.path.join(out, 'pricing_val')}  ({time.time() - t0:.0f} s)")
     return tablas
 
 
+def _hoja_arcos(tablas: dict) -> pd.DataFrame:
+    """Una fila por arco de las rutas de DRL-Q (simulado y replay), lista para la hoja "Pricing arcos"."""
+    partes = []
+    for k, nombre in (("arcos_drl_q_simulado", "simulado"), ("arcos_drl_q_replay", "replay (días 90-119)")):
+        for clave in [c for c in tablas if c.startswith(k)]:
+            d = tablas[clave].copy()
+            sufijo = clave[len(k):].replace("_K", " K=")
+            d.insert(0, "conjunto", nombre + sufijo)
+            partes.append(d)
+    if not partes:
+        return pd.DataFrame()
+    d = pd.concat(partes, ignore_index=True)
+    d["posicion_valiosa"] = (d["p"] < d["break_even"]).where(d["p"].notna())
+    d["nota"] = np.select([d["es_retorno"], ~d["tiene_carga"], d["only_option"]],
+                          ["retorno al depot (sin p*)", "sin carga: reposicionamiento (sin p*)",
+                           "única acción factible (sin p*)"], "")
+    cols = ["conjunto", "mundo", "paso", "ruta", "i", "j", "dist_j", "rate_j", "p", "p_min", "p_max", "break_even",
+            "percentil", "posicion_valiosa", "indice_j", "margen_mundo", "nota"]
+    d = d[cols].rename(columns={"i": "desde", "j": "hacia", "dist_j": "distancia_mi", "rate_j": "rate_hoy",
+                                "p": "p_estrella", "p_min": "p_estrella_min", "p_max": "p_estrella_max",
+                                "percentil": "percentil_historico", "indice_j": "indice_mercado_destino",
+                                "margen_mundo": "margen_tour_usd"})
+    return d
+
+
 def append_pricing_sheet(excel_path: str, tablas: dict) -> None:
-    """Agrega la pestaña "Pricing" al Excel de resultados (sin tocar las demás hojas)."""
-    secciones = [
-        ("Calibración de Ṽ(s, j) contra Monte Carlo (USD) — sesgo = Ṽ cabeza − Ṽ MC", tablas["mc_calibracion_resumen"]),
-        ("Posición de p* — percentil medio de p* en la serie histórica de la lane, por día y tiempo restante",
-         tablas["posicion_pivot_percentil_dia_tiempo"]),
-        ("Posición de p* — nº de ofertas por celda", tablas["posicion_pivot_n_dia_tiempo"]),
-        ("Política de aceptación (supuesto: toda carga ofrecida está disponible a su tarifa observada)",
-         tablas["aceptacion_resumen"]),
-    ]
+    """Agrega al Excel de resultados la hoja "Pricing" (resúmenes de la validación) y la hoja "Pricing arcos" (el
+    precio de reserva de cada arco de las rutas de DRL-Q: p*, rango, tarifa de hoy, break-even y percentil), sin
+    tocar las demás hojas."""
+    secciones = []
+    if "post_curva" in tablas and len(tablas["post_curva"]):
+        c = tablas["post_curva"]
+        cols = [x for x in ("n_total", "n_val", "sd_objetivo_usd", "rmse_A_usd", "rmse_B_usd", "rmse_promedio_usd",
+                            "sesgo_promedio_usd", "r2_promedio", "rmse_dif_AB_usd") if x in c]
+        secciones.append(("Ṽ — error en ejemplos de validación (USD) por nº de ejemplos de entrenamiento", c[cols]))
+    for k in tablas:
+        if k.startswith("contrafactual_resumen"):
+            secciones.append(("Contrafactual — sesgo = p* predicho − p* realizado (USD/mi y USD/lane); IC95 por bootstrap de mundos", tablas[k]))
+    secciones.append(("Arcos de DRL-Q: p* vs break-even, percentil histórico y correlación con el índice del destino", tablas["arcos_resumen"]))
+    for k in tablas:
+        if k.startswith("umbral_resumen"):
+            secciones.append(("Regla de aceptación por umbral (pisos: break-even, break-even + margen, p*)", tablas[k]))
+        elif k.startswith("umbral_diferencias"):
+            secciones.append(("Regla por umbral — diferencias pareadas de margen (p* − piso), IC95 por mundo", tablas[k]))
+    for k in ("utilidad_relativa_actor", "utilidad_pareada"):
+        if k in tablas and len(tablas[k]):
+            secciones.append(("DRL-Q frente al actor y los baselines (diferencias pareadas, IC95 por mundo)" if k == "utilidad_pareada"
+                              else "DRL-Q − DRL relativa al margen del actor (alerta_parada: límite superior del IC95 < −2 %)", tablas[k]))
     nota = ("p* es el costo de oportunidad del transportista (tarifa mínima por milla a la que aceptar la lane "
-            "iguala a su mejor alternativa); no es una probabilidad de aceptación del cliente.")
+            "iguala a su mejor alternativa); no es una probabilidad de aceptación del cliente. Su rango [mín, máx] "
+            "(parejas AB/BA) mide la variabilidad del estimador, no es un intervalo de confianza. "
+            "El detalle por arco de cada ruta está en la hoja \"Pricing arcos\".")
+    arcos = _hoja_arcos(tablas)
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    def valor(v):
+        if v is None or (isinstance(v, float) and not np.isfinite(v)) or v is pd.NaT:
+            return None
+        if isinstance(v, np.generic):
+            v = v.item()
+        return round(v, 4) if isinstance(v, float) else v
+
+    def escribir(ws, df, fila):
+        """Encabezado en negrita + valores desde `fila` (1-indexada); devuelve la siguiente fila libre."""
+        for c, col in enumerate(df.columns, 1):
+            ws.cell(fila, c).value = str(col)
+            ws.cell(fila, c).font = Font(bold=True)
+        for r, vals in enumerate(df.itertuples(index=False), fila + 1):
+            for c, v in enumerate(vals, 1):
+                ws.cell(r, c).value = valor(v)
+        return fila + len(df) + 1
+
+    # Se escribe con openpyxl y no con DataFrame.to_excel: con if_sheet_exists="replace" pandas recrea la hoja en cada
+    # llamada y solo sobreviviría la última sección.
     with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-        fila = 0
-        pd.DataFrame({"Nota": [nota]}).to_excel(writer, sheet_name="Pricing", index=False, startrow=fila)
-        fila += 3
+        wb = writer.book
+        for nombre in ("Pricing", "Pricing arcos"):
+            if nombre in wb.sheetnames:
+                del wb[nombre]
+        ws = wb.create_sheet("Pricing")
+        ws.cell(1, 1).value = "Nota"; ws.cell(1, 1).font = Font(bold=True)
+        ws.cell(2, 1).value = nota
+        fila = 4
         for titulo, df in secciones:
-            pd.DataFrame({titulo: []}).to_excel(writer, sheet_name="Pricing", index=False, startrow=fila)
-            df.to_excel(writer, sheet_name="Pricing", index=False, startrow=fila + 1)
-            fila += len(df) + 4
-    print(f"Pestaña Pricing agregada → {excel_path}")
+            ws.cell(fila, 1).value = titulo
+            ws.cell(fila, 1).font = Font(bold=True, size=12)
+            fila = escribir(ws, df, fila + 1) + 2
+        ws.column_dimensions["A"].width = 26
+        for c in range(2, 24):
+            ws.column_dimensions[get_column_letter(c)].width = 16
+        if len(arcos):
+            wa = wb.create_sheet("Pricing arcos")
+            escribir(wa, arcos, 1)
+            for c, col in enumerate(arcos.columns, 1):
+                wa.column_dimensions[get_column_letter(c)].width = 34 if col in ("ruta", "nota") else 20 if col == "conjunto" else 14
+                if col in ("rate_hoy", "p_estrella", "p_estrella_min", "p_estrella_max", "break_even", "indice_mercado_destino"):
+                    for r in range(2, len(arcos) + 2):
+                        wa.cell(r, c).number_format = "0.00"
+                elif col == "percentil_historico":
+                    for r in range(2, len(arcos) + 2):
+                        wa.cell(r, c).number_format = "0"
+            wa.freeze_panes = "A2"
+            wa.auto_filter.ref = wa.dimensions
+    print(f"Pestañas Pricing y Pricing arcos agregadas → {excel_path}")
 
 
 def cargar_datos(num_nodes):
@@ -539,24 +763,42 @@ def cargar_datos(num_nodes):
 
 def main():
     from transfer_learning import checkpoint_tiene_post_head, load_checkpoint_compatible
+    from dp_relajada import cargar_o_calcular_tabla
+    from evaluation import evaluar_mundos_simulados, evaluar_replay
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--num-nodes", type=int, default=10)
-    ap.add_argument("--checkpoint", help="ruta del .pt (default: checkpoints[/RUN_TAG]/am_checkpoint_<N>nodes[_best].pt)")
-    ap.add_argument("--best", action="store_true", help="usa el checkpoint *_best.pt")
+    ap.add_argument("--checkpoint", help="ruta del .pt con las cabezas Ṽ (default: checkpoints[/RUN_TAG]/am_checkpoint_<N>nodes_pricing.pt)")
     ap.add_argument("--restringido", action="store_true", help="valida con K libre y K = K_MAX (default: solo K libre)")
     ap.add_argument("--output-dir", help="carpeta de salida (default: results/<N>nodes[_<RUN_TAG>])")
     ap.add_argument("--quick", action="store_true", help="tamaños reducidos para una prueba rápida")
+    ap.add_argument("--sin-arnes", action="store_true", help="no corre el arnés de evaluación (omite las diferencias pareadas de margen)")
     a = ap.parse_args()
 
     configurar_k(a.restringido)
     cwd = os.path.dirname(os.path.abspath(__file__))
-    path = a.checkpoint or os.path.join(cwd, "checkpoints", RUN_TAG, f"am_checkpoint_{a.num_nodes}nodes{'_best' if a.best else ''}.pt")
+    path = a.checkpoint or os.path.join(cwd, "checkpoints", RUN_TAG, f"am_checkpoint_{a.num_nodes}nodes_pricing.pt")
     if not checkpoint_tiene_post_head(path):
-        raise SystemExit(f"{path} no trae post_value: reentrena con USE_POST_HEAD=True antes de validar el pricing.")
+        raise SystemExit(f"{path} no trae las cabezas Ṽ A/B: corre post_training.py antes de validar el pricing.")
     agent, _ = load_checkpoint_compatible(path, a.num_nodes, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, verbose=False)
     agent.eval()
-    tam = dict(n_worlds=60, n_mc_states=30, n_mc_rollouts=20, n_pos=60, n_no_tomadas=10) if a.quick else {}
-    run_pricing_validation(agent, a.num_nodes, **cargar_datos(a.num_nodes), output_dir=a.output_dir, **tam)
+    d = cargar_datos(a.num_nodes)
+    tam = dict(n_mundos_cf=200, n_estados_cf=100, m_eval=60) if a.quick else {}
+    sim_df = replay_df = None
+    if not a.sin_arnes:
+        tabla = cargar_o_calcular_tabla(d["market"], d["time_matrix"], d["distance_arr"], d["diesel_arr"])
+        cache = os.path.join(cwd, "datos", "cache_eval")
+        sim_df = evaluar_mundos_simulados(
+            agent, d["market"], tabla, d["time_matrix"], d["rate_stack"][:TRAIN_DAYS], d["loads_stack"][:TRAIN_DAYS],
+            d["distance_arr"], d["diesel_arr"], a.num_nodes, d["ltr_stack"], d["trucks_stack"],
+            d["avail_expected_arr"], d["reward_global_p95"], k_levels=tuple(K_TRAINING_LEVELS),
+            M=tam.get("m_eval", MARKET_M_EVAL_WORLDS),
+            cache_path=None if a.quick else os.path.join(cache, f"baselines_simulado_{a.num_nodes}nodos.pkl"))
+        replay_df = evaluar_replay(
+            agent, d["market"], tabla, d["time_matrix"], d["rate_stack"][TRAIN_DAYS:], d["loads_stack"][TRAIN_DAYS:],
+            d["distance_arr"], d["diesel_arr"], a.num_nodes, d["ltr_stack"][:, TRAIN_DAYS:], d["trucks_stack"][:, TRAIN_DAYS:],
+            d["avail_expected_arr"], d["reward_global_p95"], k_levels=tuple(K_TRAINING_LEVELS),
+            cache_path=None if a.quick else os.path.join(cache, f"baselines_replay_{a.num_nodes}nodos.pkl"))
+    run_pricing_validation(agent, a.num_nodes, **d, output_dir=a.output_dir, sim_df=sim_df, replay_df=replay_df, **tam)
 
 
 if __name__ == "__main__":

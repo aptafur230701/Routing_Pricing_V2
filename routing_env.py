@@ -876,6 +876,21 @@ class VectorRoutingEnv:
         return self._current_rate_row
 
     @property
+    def rate_row_obs(self) -> np.ndarray:
+        """(B, N) tarifa por milla observada al llegar al nodo actual: la sorteada (market_process) o, en replay,
+        la del stack histórico en el día actual. Es la que paga la recompensa del paso (junto con loads_row_obs)."""
+        if self._market is not None:
+            return self._current_rate_row
+        return self._rate_stack[self.current_day_idx, self._current_node, :]
+
+    @property
+    def loads_row_obs(self) -> np.ndarray:
+        """(B, N) cargas observadas al llegar al nodo actual (sorteadas, o del stack histórico en replay)."""
+        if self._market is not None:
+            return self._current_loads_row
+        return self._loads_stack[self.current_day_idx, self._current_node, :]
+
+    @property
     def index_std(self) -> float:
         """Desviación del índice histórico (normaliza la feature de índice del agente)."""
         if self._indice_std is None:

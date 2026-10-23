@@ -69,14 +69,26 @@ PPO_WEIGHT_DECAY          = 6.093123878168306e-05  # Weight decay (AdamW) del ac
                                     # dropout en el path de logits.
 
 # ── Precio de reserva (PRICING_PLAN.md) ───────────────────────
-# Cabeza de valor post-decisión Ṽ(s, j) sobre el estado congelado (h_t y embeddings con detach):
-# no cambia la política ni el PPO. Con ella se calcula p*, el precio mínimo por milla al que
-# conviene aceptar una lane (pricing.py).
-USE_POST_HEAD = True      # activa la cabeza de valor post-decisión
+# Valor post-decisión Ṽ(s, a): margen esperado desde la llegada a `a` hasta volver a casa siguiendo el actor
+# greedy. Dos cabezas A y B (estimador doble) sobre el estado congelado (h_t y embeddings con detach), entrenadas
+# DESPUÉS del PPO (post_training.py) con retornos reales del actor: no cambian la política ni el PPO.
+USE_POST_HEAD = True      # crea las cabezas post_value_a / post_value_b en el agente
 POST_HIDDEN   = AM_D_H    # tamaño oculto del MLP (igual al encoder)
-POST_COEF     = 1.0       # peso de loss_post. Con detach() no afecta a la política, así que 1.0 es seguro.
-                          # Bajar solo si post_mse explota.
-PRICING_VAL_SEED = 20261022   # semilla del muestreo de validate_pricing.py (estados de Monte Carlo, ofertas, azar de "acepto siempre")
+POST_SEED_A   = 20261021  # semillas de inicialización de las cabezas (distintas: si no nacerían idénticas)
+POST_SEED_B   = 20261023
+POST_N_EJEMPLOS = 200_000 # ejemplos de entrenamiento de Ṽ (mitad a A y mitad a B, repartidos por mundo)
+POST_N_VAL      = 40_000  # ejemplos de validación de Ṽ (mundos retenidos)
+POST_LR         = 1e-3    # Adam
+POST_BATCH      = 1024
+POST_EPOCHS     = 60      # tope de épocas (con parada temprana)
+POST_PACIENCIA  = 6       # épocas sin mejorar el error de validación antes de parar
+MARKET_SEED_POST_TRAIN = 20261031   # mundos de entrenamiento de Ṽ (≠ entrenamiento PPO, validación y evaluación)
+MARKET_SEED_POST_VAL   = 20261032   # mundos retenidos para el error de validación de Ṽ
+PRICING_VAL_SEED = 20261022   # semilla del muestreo de validate_pricing.py (estados del contrafactual, azar)
+N_EST_CONTRAFACTUAL = 2000    # estados de la prueba contrafactual (4b)
+N_MUNDOS_CONTRAFACTUAL = 1000 # mundos por bloque de validación (se añaden bloques hasta reunir los estados)
+BE_MARGEN       = 0.30        # USD/milla sobre el break-even que marca un p* "alto" (validación c)
+INDICE_DISPERSION_SEMANAL = (0.10, 0.12)   # USD/milla: dispersión semanal del índice de mercado (referencia del sesgo)
 
 # ── Self-critical baseline (híbrido sobre actor-critic) ────────────
 USE_SELF_CRITICAL            = True   # término self-critical sobre el argmax greedy
@@ -222,7 +234,26 @@ def hp(nombre: str, default):
     return HP_OVERRIDES.get(nombre, default)
 
 # ── Device ───────────────────────────────────────────────────
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+GPU_PREFERIDA = "3070 Ti"   # Subcadena del nombre de la GPU a usar; si no está, cuda:0.
+
+
+def _elegir_device() -> torch.device:
+    """GPU cuyo nombre contiene GPU_PREFERIDA (por nombre, no por índice: el orden de CUDA
+    puede diferir del de nvidia-smi). Se fija además como dispositivo por defecto, para que
+    torch.cuda.manual_seed y current_device() apunten a la misma GPU."""
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    for i in range(torch.cuda.device_count()):
+        if GPU_PREFERIDA in torch.cuda.get_device_name(i):
+            torch.cuda.set_device(i)
+            return torch.device(f"cuda:{i}")
+    import warnings
+    warnings.warn(f"GPU '{GPU_PREFERIDA}' no visible (CUDA_VISIBLE_DEVICES="
+                  f"{os.environ.get('CUDA_VISIBLE_DEVICES')!r}); usando {torch.cuda.get_device_name(0)}.")
+    return torch.device("cuda:0")
+
+
+DEVICE = _elegir_device()
 
 
 def get_episodes_per_node(num_nodes: int) -> int:

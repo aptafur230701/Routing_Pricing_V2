@@ -1,0 +1,7 @@
+conjunto,umbral,margen_medio,validez,largo_tour_medio,n_mundos
+simulado K=libre,break-even,434.62,1.0,2.0,1000
+simulado K=libre,break-even + 0.30,446.878,1.0,2.0,1000
+simulado K=libre,p* de DRL-Q,568.002,1.0,2.0,1000
+replay K=libre,break-even,532.2566666666667,1.0,2.0,300
+replay K=libre,break-even + 0.30,614.3333333333334,1.0,2.0,300
+replay K=libre,p* de DRL-Q,658.8666666666667,1.0,2.0,300

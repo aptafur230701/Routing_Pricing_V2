@@ -20,7 +20,9 @@ Interfaz análoga a run_training() de training.py:
 """
 
 import math
-from collections import deque
+import time
+from collections import defaultdict, deque
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -44,7 +46,6 @@ from config import (
     MARKET_SEED_TRAIN,
     USE_CONTINUATION_FEATURES,
     CKPT_SELECTION, CKPT_WINDOW, USE_LR_COSINE, LR_FINAL_FRAC, hp,
-    USE_POST_HEAD, POST_COEF,
 )
 from routing_env import VectorRoutingEnv, max_pasos
 from greedy_rollout import greedy_rollout
@@ -123,13 +124,11 @@ class RolloutBuffer:
         self.old_log_probs = []   # list of float
         self.old_values    = []   # list of float
         self.dones         = []   # list of bool
-        self.is_return     = []   # list of bool — la acción cierra el tour en el depot (ancla Ṽ(s, depot) = 0)
         # (start_idx, end_idx) por episodio
         self.episode_boundaries = []
         # Calculados por compute_gae_per_episode()
         self.returns       = None
         self.advantages    = None
-        self.target_post   = None   # (n,) retorno − recompensa del paso (valor post-decisión), ver compute_target_post
         # Self-critical — poblados solo si USE_SELF_CRITICAL
         self.sc_advantage  = None   # (n_episodes,) ventaja normalizada por episodio
         self.episode_idx   = None   # (n_transitions,) índice de episodio por transición
@@ -148,7 +147,6 @@ class RolloutBuffer:
         market_feats:  np.ndarray = None,   # (1,)
         budget_feats:  np.ndarray = None,   # (2,)
         dow_feats:     np.ndarray = None,   # (7,)
-        is_return:     bool = False,
     ):
         self.node_feats.append(node_feats)
         self.temporal_feats.append(temporal)
@@ -165,7 +163,6 @@ class RolloutBuffer:
         self.old_log_probs.append(log_prob)
         self.old_values.append(value)
         self.dones.append(done)
-        self.is_return.append(is_return)
 
     def __len__(self):
         return len(self.actions)
@@ -210,16 +207,6 @@ class RolloutBuffer:
 
         self.returns    = returns
         self.advantages = advantages
-        self.target_post = self.compute_target_post()
-
-    def compute_target_post(self) -> np.ndarray:
-        """Objetivo de la cabeza post-decisión: target_post[t] = G_t − r_t (ambos ya divididos por S).
-
-        Es el retorno que queda DESPUÉS de cobrar la lane de t, es decir, el valor de llegar a
-        la acción tomada a_t antes de ver su tablero. En el paso que cierra el tour (o que
-        termina el episodio) no queda nada por cobrar y el objetivo es 0.
-        """
-        return (self.returns - np.asarray(self.rewards, dtype=np.float32)).astype(np.float32)
 
     def get_batches(self, batch_size: int):
         """
@@ -247,7 +234,6 @@ def _forward(
     market_feats_t: torch.Tensor = None,   # (B, 1)
     budget_feats_t: torch.Tensor = None,   # (B, 2)
     dow_feats_t:    torch.Tensor = None,   # (B, 7)
-    with_post:      bool = False,
 ):
     """
     Ejecuta encoder → context → decoder → critic para un batch.
@@ -261,8 +247,6 @@ def _forward(
     log_probs : Tensor (B,)
     entropies : Tensor (B,)
     values    : Tensor (B,)
-    post_values : Tensor (B, N) — Ṽ(s, j) por candidato (agent.post_value; sin gradiente hacia
-                la política). Solo se devuelve, como quinto elemento, si with_post=True.
     """
     B = node_feats_t.shape[0]
 
@@ -301,16 +285,36 @@ def _forward(
 
     check_tensor("log_probs", log_probs)
 
-    if with_post:
-        post_values = agent.post_value(h_t, embeddings)                # (B, N)
-        check_tensor("post_values", post_values)
-        return actions, log_probs, entropies, values, post_values
     return actions, log_probs, entropies, values
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Evaluación greedy periódica (observacional, no afecta gradientes)
 # ─────────────────────────────────────────────────────────────────────────────
+
+class _Fases:
+    """Cronómetro por fase del update. `sync=True` espera a la GPU antes de leer el reloj
+    (los kernels son asíncronos); las fases que ya terminan en .cpu()/.item() no lo necesitan."""
+
+    def __init__(self):
+        self.t = defaultdict(float)
+
+    @contextmanager
+    def __call__(self, nombre: str, sync: bool = False):
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if sync and DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+            self.t[nombre] += time.perf_counter() - t0
+
+
+_FASES_ORDEN = (
+    "rollout_features", "rollout_gpu", "rollout_env", "rollout_buffer", "greedy",
+    "aplanar_gae", "ppo_armado", "ppo_calculo", "validacion",
+)
+
 
 def _evaluate_greedy(
     agent,
@@ -529,7 +533,7 @@ def run_am_training(
     agent  = pretrained_agent  if pretrained_agent  is not None \
              else AMRoutingAgent(
                  num_nodes, d_h, n_heads, n_layers, d_ff, device=DEVICE,
-                 pre_norm=AM_PRE_NORM, dropout=AM_DROPOUT, use_post_head=USE_POST_HEAD,
+                 pre_norm=AM_PRE_NORM, dropout=AM_DROPOUT, use_post_head=False,
              )
     critic = pretrained_critic if pretrained_critic is not None \
              else CriticHead(d_h).to(DEVICE)
@@ -542,15 +546,13 @@ def run_am_training(
     # corrompe el ratio de importancia como lo haría dropout en el path de logits).
     # Critic se deja en Adam puro (sin weight decay): su objetivo es MSE de
     # regresión, no política, y no comparte el problema de corrupción del ratio.
-    # Cabeza post-decisión (PRICING_PLAN.md): sus parámetros viven en el agente pero NO son de la
-    # política. Van al optimizer del crítico y quedan fuera del actor (ni AdamW, ni weight decay,
-    # ni la norma del clipping), para que el PPO sea el mismo con o sin ella.
-    use_post     = USE_POST_HEAD and getattr(agent, "post_value", None) is not None
-    post_params  = list(agent.post_value.parameters()) if use_post else []
-    post_ids     = {id(p) for p in post_params}
+    # Las cabezas post-decisión (PRICING_PLAN.md), si el agente las trae, NO son de la política y el PPO no las
+    # toca: se entrenan después (post_training.py). Quedan fuera del actor para que el PPO sea el mismo con o sin ellas.
+    post_ids     = {id(p) for h in (getattr(agent, "post_value_a", None), getattr(agent, "post_value_b", None))
+                    if h is not None for p in h.parameters()}
     actor_params = [p for p in agent.parameters() if id(p) not in post_ids]
     actor_optimizer  = torch.optim.AdamW(actor_params, lr=lr, weight_decay=PPO_WEIGHT_DECAY)
-    critic_optimizer = torch.optim.Adam(list(critic.parameters()) + post_params, lr=lr * 10)
+    critic_optimizer = torch.optim.Adam(critic.parameters(), lr=lr * 10)
 
     # LR con decaimiento coseno: cada LR baja desde su valor inicial hasta LR_FINAL_FRAC de ese valor
     # al terminar n_updates (un scheduler.step() al final de cada update).
@@ -665,8 +667,14 @@ def run_am_training(
     episode_losses  = []
     training_log    = []
 
+    # Tiempos por fase acumulados desde el último log (se imprimen y reinician en log_freq).
+    fases_acum  = defaultdict(float)
+    updates_acum = 0
+
     # ── Loop principal ────────────────────────────────────────────────────────
     for update in range(n_updates):
+        t_update0    = time.perf_counter()
+        fases        = _Fases()
         progress     = update / max(1, n_updates - 1)
         entropy_coef = entropy_start + (entropy_end - entropy_start) * progress
 
@@ -721,62 +729,65 @@ def run_am_training(
                 day_idx   = vec_env.current_day_idx  # (B,) int64
 
                 # Feature construction — no Python loops over N or B
-                node_feats = build_node_features_batch(
-                    cur_nodes, start_nodes_arr,
-                    rm_pen_stack, time_matrix_arr, distance_arr,
-                    day_idx, num_nodes, MAX_DURATION,
-                    trucks_stack_raw=trucks_stack,
-                    reward_global_p95=reward_global_p95,
-                    avail_expected_arr=avail_expected_arr,
-                    reward_rows=vec_env.reward_rows,
-                    ev=ev_esperado, time_elapsed=time_el, dow0=vec_env.start_dow,
-                    market_index=vec_env.market_index, index_std=vec_env.index_std,
-                )   # (B, N, N_NODE_FEATURES)
-                temporal = build_temporal_features_batch(time_el, step_cnt, MAX_DURATION, num_nodes)   # (B, 3)
-                market   = build_market_features_batch(cur_nodes, day_idx, ltr_stack) if ltr_stack is not None \
-                           else np.zeros((B, 1), dtype=np.float32)                                     # (B, 1)
-                budget   = build_budget_features_batch(vec_env.k_remaining, vec_env.k_restricted)      # (B, 2)
-                dow      = build_dow_features_batch(vec_env.current_dow)                               # (B, 7)
+                with fases("rollout_features"):
+                    node_feats = build_node_features_batch(
+                        cur_nodes, start_nodes_arr,
+                        rm_pen_stack, time_matrix_arr, distance_arr,
+                        day_idx, num_nodes, MAX_DURATION,
+                        trucks_stack_raw=trucks_stack,
+                        reward_global_p95=reward_global_p95,
+                        avail_expected_arr=avail_expected_arr,
+                        reward_rows=vec_env.reward_rows,
+                        ev=ev_esperado, time_elapsed=time_el, dow0=vec_env.start_dow,
+                        market_index=vec_env.market_index, index_std=vec_env.index_std,
+                    )   # (B, N, N_NODE_FEATURES)
+                    temporal = build_temporal_features_batch(time_el, step_cnt, MAX_DURATION, num_nodes)   # (B, 3)
+                    market   = build_market_features_batch(cur_nodes, day_idx, ltr_stack) if ltr_stack is not None \
+                               else np.zeros((B, 1), dtype=np.float32)                                     # (B, 1)
+                    budget   = build_budget_features_batch(vec_env.k_remaining, vec_env.k_restricted)      # (B, 2)
+                    dow      = build_dow_features_batch(vec_env.current_dow)                               # (B, 7)
 
                 # Single forward pass over the full batch
-                node_feats_t = torch.from_numpy(node_feats).to(DEVICE)
-                temporal_t   = torch.from_numpy(temporal).to(DEVICE)
-                market_t     = torch.from_numpy(market).to(DEVICE)
-                budget_t     = torch.from_numpy(budget).to(DEVICE)
-                dow_t        = torch.from_numpy(dow).to(DEVICE)
-                cur_nodes_t  = torch.tensor(cur_nodes, dtype=torch.long, device=DEVICE)
-                mask_t       = torch.from_numpy(masks).to(DEVICE)
+                with fases("rollout_gpu"):
+                    node_feats_t = torch.from_numpy(node_feats).to(DEVICE)
+                    temporal_t   = torch.from_numpy(temporal).to(DEVICE)
+                    market_t     = torch.from_numpy(market).to(DEVICE)
+                    budget_t     = torch.from_numpy(budget).to(DEVICE)
+                    dow_t        = torch.from_numpy(dow).to(DEVICE)
+                    cur_nodes_t  = torch.tensor(cur_nodes, dtype=torch.long, device=DEVICE)
+                    mask_t       = torch.from_numpy(masks).to(DEVICE)
 
-                actions_t, log_probs_t, _, values_t = _forward(
-                    agent, critic, node_feats_t, temporal_t, cur_nodes_t, mask_t,
-                    market_feats_t=market_t, budget_feats_t=budget_t, dow_feats_t=dow_t,
-                )
-                actions   = actions_t.cpu().numpy()    # (B,) int64
-                log_probs = log_probs_t.cpu().numpy()  # (B,)
-                values    = values_t.cpu().numpy()     # (B,)
+                    actions_t, log_probs_t, _, values_t = _forward(
+                        agent, critic, node_feats_t, temporal_t, cur_nodes_t, mask_t,
+                        market_feats_t=market_t, budget_feats_t=budget_t, dow_feats_t=dow_t,
+                    )
+                    actions   = actions_t.cpu().numpy()    # (B,) int64
+                    log_probs = log_probs_t.cpu().numpy()  # (B,)
+                    values    = values_t.cpu().numpy()     # (B,)
 
                 # Vectorized environment step
-                rewards, terminated, next_masks = vec_env.step(actions)
-                time_violation = vec_env.last_time_violation   # (B,) bool — instrumentación de diagnósticos de K
+                with fases("rollout_env"):
+                    rewards, terminated, next_masks = vec_env.step(actions)
+                    time_violation = vec_env.last_time_violation   # (B,) bool — instrumentación de diagnósticos de K
 
                 # Write transitions — only for rows active BEFORE this step
-                for b in np.where(active)[0]:
-                    ep_bufs[b].append({
-                        "node_feats":   node_feats[b],        # (N, N_NODE_FEATURES)
-                        "temporal":     temporal[b],           # (3,)
-                        "market_feats": market[b],             # (1,)
-                        "budget_feats": budget[b],              # (2,)
-                        "dow_feats":    dow[b],                 # (7,)
-                        "current_node": int(cur_nodes[b]),
-                        "mask":         masks[b],              # (N,) int8
-                        "action":       int(actions[b]),
-                        "reward":       float(rewards[b]),
-                        "log_prob":     float(log_probs[b]),
-                        "value":        float(values[b]),
-                        "done":         bool(terminated[b]),
-                        "is_return":    bool(actions[b] == start_nodes_arr[b]),
-                        "time_violation": bool(time_violation[b]),
-                    })
+                with fases("rollout_buffer"):
+                    for b in np.where(active)[0]:
+                        ep_bufs[b].append({
+                            "node_feats":   node_feats[b],        # (N, N_NODE_FEATURES)
+                            "temporal":     temporal[b],           # (3,)
+                            "market_feats": market[b],             # (1,)
+                            "budget_feats": budget[b],              # (2,)
+                            "dow_feats":    dow[b],                 # (7,)
+                            "current_node": int(cur_nodes[b]),
+                            "mask":         masks[b],              # (N,) int8
+                            "action":       int(actions[b]),
+                            "reward":       float(rewards[b]),
+                            "log_prob":     float(log_probs[b]),
+                            "value":        float(values[b]),
+                            "done":         bool(terminated[b]),
+                            "time_violation": bool(time_violation[b]),
+                        })
 
                 active = active & ~terminated
                 masks  = next_masks
@@ -794,82 +805,83 @@ def run_am_training(
         # para comparar en las mismas unidades y la misma realización del mundo.
         # Resetea vec_env (su estado post-rollout muestreado ya no se necesita).
         if USE_SELF_CRITICAL:
-            greedy_ep_rewards = greedy_rollout(
-                agent, vec_env, start_nodes_arr, start_day_idxs,
-                time_matrix_arr, distance_arr, trucks_stack, ltr_stack,
-                reward_global_p95, num_nodes,
-                k_max_arr=k_max_arr,
-                avail_expected_arr=avail_expected_arr,
-                world_seeds=world_seeds,
-                ev_esperado=ev_esperado,
-            ).env_reward
+            with fases("greedy"):
+                greedy_ep_rewards = greedy_rollout(
+                    agent, vec_env, start_nodes_arr, start_day_idxs,
+                    time_matrix_arr, distance_arr, trucks_stack, ltr_stack,
+                    reward_global_p95, num_nodes,
+                    k_max_arr=k_max_arr,
+                    avail_expected_arr=avail_expected_arr,
+                    world_seeds=world_seeds,
+                    ev_esperado=ev_esperado,
+                ).env_reward
         else:
             greedy_ep_rewards = None
 
-        # Flatten per-episode accumulators into the main RolloutBuffer
-        # Episodes are written sequentially so compute_gae_per_episode sees
-        # contiguous segments — its logic is unchanged.
-        update_r_greedy = []
-        # Diagnósticos de K: longitud realizada y violación temporal en
-        # retorno forzado, agrupadas por nivel de K asignado al episodio.
-        k_diag = {lvl: {"lengths": [], "time_violations": 0} for lvl in K_TRAINING_LEVELS}
-        for b in range(B):
-            if not ep_bufs[b]:
-                continue
-            ep_start = len(buffer)
-            for trans in ep_bufs[b]:
-                buffer.add(
-                    node_feats=trans["node_feats"],
-                    temporal=trans["temporal"],
-                    current_node=trans["current_node"],
-                    mask=trans["mask"],
-                    action=trans["action"],
-                    reward=trans["reward"],
-                    log_prob=trans["log_prob"],
-                    value=trans["value"],
-                    done=trans["done"],
-                    is_return=trans["is_return"],
-                    market_feats=trans["market_feats"],
-                    budget_feats=trans["budget_feats"],
-                    dow_feats=trans["dow_feats"],
+        with fases("aplanar_gae"):
+            # Flatten per-episode accumulators into the main RolloutBuffer
+            # Episodes are written sequentially so compute_gae_per_episode sees
+            # contiguous segments — its logic is unchanged.
+            update_r_greedy = []
+            # Diagnósticos de K: longitud realizada y violación temporal en
+            # retorno forzado, agrupadas por nivel de K asignado al episodio.
+            k_diag = {lvl: {"lengths": [], "time_violations": 0} for lvl in K_TRAINING_LEVELS}
+            for b in range(B):
+                if not ep_bufs[b]:
+                    continue
+                ep_start = len(buffer)
+                for trans in ep_bufs[b]:
+                    buffer.add(
+                        node_feats=trans["node_feats"],
+                        temporal=trans["temporal"],
+                        current_node=trans["current_node"],
+                        mask=trans["mask"],
+                        action=trans["action"],
+                        reward=trans["reward"],
+                        log_prob=trans["log_prob"],
+                        value=trans["value"],
+                        done=trans["done"],
+                        market_feats=trans["market_feats"],
+                        budget_feats=trans["budget_feats"],
+                        dow_feats=trans["dow_feats"],
+                    )
+                ep_end = len(buffer)
+                buffer.episode_boundaries.append(
+                    (ep_start, ep_end)
                 )
-            ep_end = len(buffer)
-            buffer.episode_boundaries.append(
-                (ep_start, ep_end)
-            )
-            ep_reward = sum(t["reward"] for t in ep_bufs[b])
-            update_ep_rewards.append(ep_reward)
-            episode_rewards.append(ep_reward)
+                ep_reward = sum(t["reward"] for t in ep_bufs[b])
+                update_ep_rewards.append(ep_reward)
+                episode_rewards.append(ep_reward)
+                if USE_SELF_CRITICAL:
+                    update_r_greedy.append(float(greedy_ep_rewards[b]))
+
+                k_lvl = k_max_arr[b]
+                k_diag[k_lvl]["lengths"].append(len(ep_bufs[b]))
+                if ep_bufs[b][-1]["time_violation"]:
+                    k_diag[k_lvl]["time_violations"] += 1
+
+            buffer.compute_gae_per_episode(gamma=gamma, gae_lambda=gae_lambda)
+
+            # ── Ventaja self-critical por episodio ──────────────────────
+            sc_adv_raw_mean = 0.0
+            r_greedy_avg    = 0.0
             if USE_SELF_CRITICAL:
-                update_r_greedy.append(float(greedy_ep_rewards[b]))
+                sc_advantage_raw = np.array(update_ep_rewards, dtype=np.float32) \
+                                  - np.array(update_r_greedy,  dtype=np.float32)
+                sc_adv_raw_mean = float(sc_advantage_raw.mean())
+                r_greedy_avg    = float(np.mean(update_r_greedy))
 
-            k_lvl = k_max_arr[b]
-            k_diag[k_lvl]["lengths"].append(len(ep_bufs[b]))
-            if ep_bufs[b][-1]["time_violation"]:
-                k_diag[k_lvl]["time_violations"] += 1
+                sc_advantage_norm = (
+                    (sc_advantage_raw - sc_advantage_raw.mean())
+                    / (sc_advantage_raw.std() + 1e-8)
+                )
 
-        buffer.compute_gae_per_episode(gamma=gamma, gae_lambda=gae_lambda)
+                episode_idx_arr = np.zeros(len(buffer), dtype=np.int64)
+                for k, (s, e) in enumerate(buffer.episode_boundaries):
+                    episode_idx_arr[s:e] = k
 
-        # ── Ventaja self-critical por episodio ──────────────────────
-        sc_adv_raw_mean = 0.0
-        r_greedy_avg    = 0.0
-        if USE_SELF_CRITICAL:
-            sc_advantage_raw = np.array(update_ep_rewards, dtype=np.float32) \
-                              - np.array(update_r_greedy,  dtype=np.float32)
-            sc_adv_raw_mean = float(sc_advantage_raw.mean())
-            r_greedy_avg    = float(np.mean(update_r_greedy))
-
-            sc_advantage_norm = (
-                (sc_advantage_raw - sc_advantage_raw.mean())
-                / (sc_advantage_raw.std() + 1e-8)
-            )
-
-            episode_idx_arr = np.zeros(len(buffer), dtype=np.int64)
-            for k, (s, e) in enumerate(buffer.episode_boundaries):
-                episode_idx_arr[s:e] = k
-
-            buffer.sc_advantage = sc_advantage_norm
-            buffer.episode_idx  = episode_idx_arr
+                buffer.sc_advantage = sc_advantage_norm
+                buffer.episode_idx  = episode_idx_arr
 
         # ── Fase 2: Actualización PPO ─────────────────────────────────────────
         agent.train()
@@ -882,8 +894,6 @@ def run_am_training(
         batch_kl_divs       = []
         batch_clip_fracs    = []
         batch_sc_losses     = []
-        batch_post_losses   = []
-        post_pred_ep0, post_tgt_ep0 = [], []   # predicciones/objetivos de la primera época (para post_ev)
         apply_self_critical = USE_SELF_CRITICAL and update >= SELF_CRITICAL_WARMUP_UPDATES
 
         for epoch_i in range(n_ppo_epochs):
@@ -893,169 +903,148 @@ def run_am_training(
             for _batch_idx, idx_batch in enumerate(buffer.get_batches(ppo_batch_size)):
                 B = len(idx_batch)
 
-                # Reconstruir tensores del batch
-                nf_b   = torch.from_numpy(
-                    np.stack([buffer.node_feats[i] for i in idx_batch])
-                ).to(DEVICE)                                           # (B, N, N_NODE_FEATURES)
-                tf_b   = torch.from_numpy(
-                    np.stack([buffer.temporal_feats[i] for i in idx_batch])
-                ).to(DEVICE)                                           # (B, 3)
-                mf_b   = torch.from_numpy(
-                    np.stack([buffer.market_feats[i] for i in idx_batch])
-                ).to(DEVICE)                                           # (B, 1)
-                bf_b   = torch.from_numpy(
-                    np.stack([buffer.budget_feats[i] for i in idx_batch])
-                ).to(DEVICE)                                           # (B, 2)
-                dw_b   = torch.from_numpy(
-                    np.stack([buffer.dow_feats[i] for i in idx_batch])
-                ).to(DEVICE)                                           # (B, 7)
-                cn_b   = torch.tensor(
-                    [buffer.current_nodes[i] for i in idx_batch],
-                    dtype=torch.long
-                ).to(DEVICE)                                           # (B,)
-                mask_b = torch.from_numpy(
-                    np.stack([buffer.masks[i] for i in idx_batch])
-                ).to(DEVICE)                                           # (B, N)
-                act_b  = torch.tensor(
-                    [buffer.actions[i] for i in idx_batch],
-                    dtype=torch.long
-                ).to(DEVICE)                                           # (B,)
-                old_lp = torch.tensor(
-                    [buffer.old_log_probs[i] for i in idx_batch],
-                    dtype=torch.float32
-                ).to(DEVICE)                                           # (B,)
-                ret_b  = torch.tensor(
-                    buffer.returns[idx_batch], dtype=torch.float32
-                ).to(DEVICE)                                           # (B,)
-                adv_b  = torch.tensor(
-                    buffer.advantages[idx_batch], dtype=torch.float32
-                ).to(DEVICE)                                           # (B,)
+                with fases("ppo_armado", sync=True):
+                    # Reconstruir tensores del batch
+                    nf_b   = torch.from_numpy(
+                        np.stack([buffer.node_feats[i] for i in idx_batch])
+                    ).to(DEVICE)                                           # (B, N, N_NODE_FEATURES)
+                    tf_b   = torch.from_numpy(
+                        np.stack([buffer.temporal_feats[i] for i in idx_batch])
+                    ).to(DEVICE)                                           # (B, 3)
+                    mf_b   = torch.from_numpy(
+                        np.stack([buffer.market_feats[i] for i in idx_batch])
+                    ).to(DEVICE)                                           # (B, 1)
+                    bf_b   = torch.from_numpy(
+                        np.stack([buffer.budget_feats[i] for i in idx_batch])
+                    ).to(DEVICE)                                           # (B, 2)
+                    dw_b   = torch.from_numpy(
+                        np.stack([buffer.dow_feats[i] for i in idx_batch])
+                    ).to(DEVICE)                                           # (B, 7)
+                    cn_b   = torch.tensor(
+                        [buffer.current_nodes[i] for i in idx_batch],
+                        dtype=torch.long
+                    ).to(DEVICE)                                           # (B,)
+                    mask_b = torch.from_numpy(
+                        np.stack([buffer.masks[i] for i in idx_batch])
+                    ).to(DEVICE)                                           # (B, N)
+                    act_b  = torch.tensor(
+                        [buffer.actions[i] for i in idx_batch],
+                        dtype=torch.long
+                    ).to(DEVICE)                                           # (B,)
+                    old_lp = torch.tensor(
+                        [buffer.old_log_probs[i] for i in idx_batch],
+                        dtype=torch.float32
+                    ).to(DEVICE)                                           # (B,)
+                    ret_b  = torch.tensor(
+                        buffer.returns[idx_batch], dtype=torch.float32
+                    ).to(DEVICE)                                           # (B,)
+                    adv_b  = torch.tensor(
+                        buffer.advantages[idx_batch], dtype=torch.float32
+                    ).to(DEVICE)                                           # (B,)
 
-                if use_post:
-                    tp_b  = torch.tensor(buffer.target_post[idx_batch], dtype=torch.float32).to(DEVICE)   # (B,)
-                    nr_b  = torch.tensor(
-                        [not buffer.is_return[i] for i in idx_batch], dtype=torch.float32
-                    ).to(DEVICE)                                       # (B,) 0 en el retorno al depot (ancla Ṽ = 0)
-
-                if apply_self_critical:
-                    sc_adv_b = torch.tensor(
-                        buffer.sc_advantage[buffer.episode_idx[idx_batch]],
-                        dtype=torch.float32,
-                    ).to(DEVICE)                                       # (B,)
-
-                # Normalización por mini-batch: cada gradiente ve ventajas
-                # con media=0, std=1, independiente del resto del buffer.
-                # Más estable que normalizar el buffer completo una sola vez
-                # porque evita que outliers de otros mini-batches contaminen
-                # la escala de la actualización actual.
-                adv_b = (adv_b - adv_b.mean()) / (adv_b.std(unbiased=False) + 1e-8)
-
-                # Clipping de ventajas: limita casos extremos sin afectar
-                # la dirección del gradiente (solo la magnitud).
-                adv_b = torch.clamp(adv_b, -5.0, 5.0)
-
-                check_tensor("advantages adv_b", adv_b)
-
-                # Sentinelas para el bloque except (pueden no existir si el
-                # error ocurre antes de que se calculen)
-                new_lp = ratio = None
-
-                try:
-                    # Forward con gradientes
-                    fwd = _forward(
-                        agent, critic, nf_b, tf_b, cn_b, mask_b,
-                        actions_t=act_b, market_feats_t=mf_b, budget_feats_t=bf_b, dow_feats_t=dw_b,
-                        with_post=use_post,
-                    )
-                    _, new_lp, entropy, new_val = fwd[:4]
-
-                    # ── Loss del actor (PPO-Clip) ────────────────────────────
-                    ratio       = torch.exp(new_lp - old_lp)
-                    check_tensor("PPO ratio", ratio)
-
-                    surr1       = ratio * adv_b
-                    surr2       = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv_b
-                    actor_loss  = -torch.min(surr1, surr2).mean()
-
-                    # ── Loss del critic (MSE) ────────────────────────────────
-                    value_loss  = nn.functional.mse_loss(new_val, ret_b)
-
-                    # ── Loss de la cabeza post-decisión (MSE solo sobre la acción tomada) ──
-                    # El retorno al depot queda fuera: Ṽ(s, depot) = 0 se impone, no se aprende.
-                    if use_post:
-                        post_taken = fwd[4].gather(1, act_b.unsqueeze(1)).squeeze(1)       # (B,)
-                        loss_post  = (((post_taken - tp_b) ** 2) * nr_b).sum() / nr_b.sum().clamp(min=1.0)
-                        if epoch_i == 0:
-                            keep = nr_b.bool()
-                            post_pred_ep0.append(post_taken.detach()[keep].cpu().numpy())
-                            post_tgt_ep0.append(tp_b[keep].cpu().numpy())
-
-                    # ── Bonus de entropía (exploración) ─────────────────────
-                    entropy_loss = -entropy.mean()
-
-                    actor_loss_total = actor_loss + entropy_coef * entropy_loss
-
-                    # ── Self-critical: término REINFORCE adicional ──
-                    # No toca el critic — sc_loss depende solo de new_lp (actor).
                     if apply_self_critical:
-                        sc_loss = -(SELF_CRITICAL_COEF * sc_adv_b * new_lp).mean()
-                        actor_loss_total = actor_loss_total + sc_loss
+                        sc_adv_b = torch.tensor(
+                            buffer.sc_advantage[buffer.episode_idx[idx_batch]],
+                            dtype=torch.float32,
+                        ).to(DEVICE)                                       # (B,)
 
-                except RuntimeError as e:
-                    sep = "=" * 60
-                    print(f"\n{sep}")
-                    print(f"NaN/Inf ABORT  update={update + 1}  batch={_batch_idx}")
-                    print(f"  error        : {e}")
-                    print(f"  avg reward   : {float(np.mean(update_ep_rewards)):.4f}")
-                    print(f"  mask valid   : {mask_b.sum(dim=-1).tolist()}")
-                    print(f"  action mask  :\n{mask_b.cpu().numpy()}")
-                    print(
-                        f"  adv_b        : min={adv_b.min():.4f}  max={adv_b.max():.4f}"
-                        f"  mean={adv_b.mean():.4f}  std={adv_b.std():.4f}"
-                    )
-                    print(
-                        f"  old_lp       : min={old_lp.min():.4f}  max={old_lp.max():.4f}"
-                        f"  mean={old_lp.mean():.4f}"
-                    )
-                    if new_lp is not None:
-                        print(
-                            f"  new_lp       : min={new_lp.min():.4f}  max={new_lp.max():.4f}"
-                            f"  mean={new_lp.mean():.4f}"
+                with fases("ppo_calculo", sync=True):
+                    # Normalización por mini-batch: cada gradiente ve ventajas
+                    # con media=0, std=1, independiente del resto del buffer.
+                    # Más estable que normalizar el buffer completo una sola vez
+                    # porque evita que outliers de otros mini-batches contaminen
+                    # la escala de la actualización actual.
+                    adv_b = (adv_b - adv_b.mean()) / (adv_b.std(unbiased=False) + 1e-8)
+
+                    # Clipping de ventajas: limita casos extremos sin afectar
+                    # la dirección del gradiente (solo la magnitud).
+                    adv_b = torch.clamp(adv_b, -5.0, 5.0)
+
+                    check_tensor("advantages adv_b", adv_b)
+
+                    # Sentinelas para el bloque except (pueden no existir si el
+                    # error ocurre antes de que se calculen)
+                    new_lp = ratio = None
+
+                    try:
+                        # Forward con gradientes
+                        _, new_lp, entropy, new_val = _forward(
+                            agent, critic, nf_b, tf_b, cn_b, mask_b,
+                            actions_t=act_b, market_feats_t=mf_b, budget_feats_t=bf_b, dow_feats_t=dw_b,
                         )
-                    if ratio is not None:
+
+                        # ── Loss del actor (PPO-Clip) ────────────────────────────
+                        ratio       = torch.exp(new_lp - old_lp)
+                        check_tensor("PPO ratio", ratio)
+
+                        surr1       = ratio * adv_b
+                        surr2       = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv_b
+                        actor_loss  = -torch.min(surr1, surr2).mean()
+
+                        # ── Loss del critic (MSE) ────────────────────────────────
+                        value_loss  = nn.functional.mse_loss(new_val, ret_b)
+
+                        # ── Bonus de entropía (exploración) ─────────────────────
+                        entropy_loss = -entropy.mean()
+
+                        actor_loss_total = actor_loss + entropy_coef * entropy_loss
+
+                        # ── Self-critical: término REINFORCE adicional ──
+                        # No toca el critic — sc_loss depende solo de new_lp (actor).
+                        if apply_self_critical:
+                            sc_loss = -(SELF_CRITICAL_COEF * sc_adv_b * new_lp).mean()
+                            actor_loss_total = actor_loss_total + sc_loss
+
+                    except RuntimeError as e:
+                        sep = "=" * 60
+                        print(f"\n{sep}")
+                        print(f"NaN/Inf ABORT  update={update + 1}  batch={_batch_idx}")
+                        print(f"  error        : {e}")
+                        print(f"  avg reward   : {float(np.mean(update_ep_rewards)):.4f}")
+                        print(f"  mask valid   : {mask_b.sum(dim=-1).tolist()}")
+                        print(f"  action mask  :\n{mask_b.cpu().numpy()}")
                         print(
-                            f"  ratio        : min={ratio.min():.4f}  max={ratio.max():.4f}"
-                            f"  mean={ratio.mean():.4f}"
+                            f"  adv_b        : min={adv_b.min():.4f}  max={adv_b.max():.4f}"
+                            f"  mean={adv_b.mean():.4f}  std={adv_b.std():.4f}"
                         )
-                    print(sep)
-                    raise
+                        print(
+                            f"  old_lp       : min={old_lp.min():.4f}  max={old_lp.max():.4f}"
+                            f"  mean={old_lp.mean():.4f}"
+                        )
+                        if new_lp is not None:
+                            print(
+                                f"  new_lp       : min={new_lp.min():.4f}  max={new_lp.max():.4f}"
+                                f"  mean={new_lp.mean():.4f}"
+                            )
+                        if ratio is not None:
+                            print(
+                                f"  ratio        : min={ratio.min():.4f}  max={ratio.max():.4f}"
+                                f"  mean={ratio.mean():.4f}"
+                            )
+                        print(sep)
+                        raise
 
-                # ── Update actor & critic ─────────────────────────────────
-                # value_loss también backpropaga hacia el encoder/context_net
-                # del actor (h_t no se detacha antes del critic), así que un
-                # solo backward sobre la suma evita recorrer ese tramo
-                # compartido dos veces — los gradientes resultantes son
-                # idénticos a hacer backward por separado (gradiente de la
-                # suma = suma de gradientes), pero ~1.3x más rápido.
-                actor_optimizer.zero_grad()
-                critic_optimizer.zero_grad()
-                # loss_post solo llega a la cabeza post_value (detach de h_t y embeddings).
-                total_loss = actor_loss_total + value_loss
-                if use_post:
-                    total_loss = total_loss + POST_COEF * loss_post
-                total_loss.backward()
-                nn.utils.clip_grad_norm_(actor_params, grad_clip)
-                actor_optimizer.step()
-                nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
-                if use_post:
-                    nn.utils.clip_grad_norm_(post_params, grad_clip)
-                critic_optimizer.step()
+                    # ── Update actor & critic ─────────────────────────────────
+                    # value_loss también backpropaga hacia el encoder/context_net
+                    # del actor (h_t no se detacha antes del critic), así que un
+                    # solo backward sobre la suma evita recorrer ese tramo
+                    # compartido dos veces — los gradientes resultantes son
+                    # idénticos a hacer backward por separado (gradiente de la
+                    # suma = suma de gradientes), pero ~1.3x más rápido.
+                    actor_optimizer.zero_grad()
+                    critic_optimizer.zero_grad()
+                    total_loss = actor_loss_total + value_loss
+                    total_loss.backward()
+                    nn.utils.clip_grad_norm_(actor_params, grad_clip)
+                    actor_optimizer.step()
+                    nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
+                    critic_optimizer.step()
 
-                with torch.no_grad():
-                    # KL aproximada: E[log π_old - log π_new]
-                    approx_kl  = (old_lp - new_lp).mean().item()
-                    # Fracción de ratios que el clip PPO recortó
-                    clip_frac  = ((ratio - 1).abs() > clip_eps).float().mean().item()
+                    with torch.no_grad():
+                        # KL aproximada: E[log π_old - log π_new]
+                        approx_kl  = (old_lp - new_lp).mean().item()
+                        # Fracción de ratios que el clip PPO recortó
+                        clip_frac  = ((ratio - 1).abs() > clip_eps).float().mean().item()
 
                 if approx_kl > 0.05:
                     kl_too_high = True                   # ← marca la bandera
@@ -1071,8 +1060,6 @@ def run_am_training(
                 batch_clip_fracs.append(clip_frac)
                 if apply_self_critical:
                     batch_sc_losses.append(sc_loss.item())
-                if use_post:
-                    batch_post_losses.append(loss_post.item())
 
             if kl_too_high:  # sale también de n_ppo_epochs
                 break
@@ -1085,15 +1072,6 @@ def run_am_training(
             float(1.0 - np.var(ret_all - val_all) / (var_ret + 1e-8))
             if var_ret > 1e-8 else 0.0
         )
-
-        # Explained variance de la cabeza post-decisión sobre target_post (predicciones de la primera
-        # época, antes de que el mini-batch se use para actualizar), sin los retornos al depot.
-        avg_post_mse, post_ev = 0.0, 0.0
-        if use_post:
-            avg_post_mse = float(np.mean(batch_post_losses)) if batch_post_losses else 0.0
-            if post_tgt_ep0:
-                tg, pr = np.concatenate(post_tgt_ep0), np.concatenate(post_pred_ep0)
-                post_ev = float(1.0 - np.var(tg - pr) / (np.var(tg) + 1e-8)) if np.var(tg) > 1e-8 else 0.0
 
         avg_reward    = float(np.mean(update_ep_rewards))
         avg_loss      = float(np.mean(batch_total_losses))  if batch_total_losses  else 0.0
@@ -1144,9 +1122,6 @@ def run_am_training(
             "entropy_coef":     entropy_coef,
             "k_diagnostics":    k_diagnostics,
         }
-        if use_post:
-            log_entry["post_mse"] = avg_post_mse
-            log_entry["post_ev"]  = post_ev
         if USE_SELF_CRITICAL:
             log_entry["r_greedy_avg"]      = r_greedy_avg
             log_entry["sc_advantage_mean"] = sc_adv_raw_mean
@@ -1157,53 +1132,55 @@ def run_am_training(
         val_freq = max(1, n_updates // VAL_CHECKS)
         es_log = (update + 1) % log_freq == 0
 
-        # Validación en mundos simulados (observacional); guarda el mejor update.
-        v = None
-        if val is not None and (es_log or (update + 1) % val_freq == 0 or update == n_updates - 1):
-            v = val.evaluar(agent)
-            log_entry["val"]               = v["por_k"]
-            log_entry["greedy_reward"]     = v["margen"]
-            log_entry["greedy_valid_rate"] = v["valid_rate"]
-            log_entry["val_score"] = v["score"]
-            if CKPT_SELECTION == "moving_avg":
-                ventana.append({
-                    "update": update + 1, "score": v["score"],
-                    "agent":  {k: t.detach().cpu().clone() for k, t in agent.state_dict().items()},
-                    "critic": {k: t.detach().cpu().clone() for k, t in critic.state_dict().items()},
-                })
-                ma = float(np.mean([w["score"] for w in ventana])) if len(ventana) == CKPT_WINDOW else None
-                if ma is not None and ma > best_ma:
-                    best_ma = ma
-                    centro = ventana[len(ventana) // 2]         # update CENTRAL de la ventana, no el último
-                    ckpt_update, ckpt_score = centro["update"], centro["score"]
+        with fases("validacion"):
+            # Validación en mundos simulados (observacional); guarda el mejor update.
+            v = None
+            if val is not None and (es_log or (update + 1) % val_freq == 0 or update == n_updates - 1):
+                v = val.evaluar(agent)
+                log_entry["val"]               = v["por_k"]
+                log_entry["greedy_reward"]     = v["margen"]
+                log_entry["greedy_valid_rate"] = v["valid_rate"]
+                log_entry["val_score"] = v["score"]
+                if CKPT_SELECTION == "moving_avg":
+                    ventana.append({
+                        "update": update + 1, "score": v["score"],
+                        "agent":  {k: t.detach().cpu().clone() for k, t in agent.state_dict().items()},
+                        "critic": {k: t.detach().cpu().clone() for k, t in critic.state_dict().items()},
+                    })
+                    ma = float(np.mean([w["score"] for w in ventana])) if len(ventana) == CKPT_WINDOW else None
+                    if ma is not None and ma > best_ma:
+                        best_ma = ma
+                        centro = ventana[len(ventana) // 2]         # update CENTRAL de la ventana, no el último
+                        ckpt_update, ckpt_score = centro["update"], centro["score"]
+                        log_entry["val_best"] = True
+                        if best_checkpoint_path:
+                            torch.save({"agent": centro["agent"], "critic": centro["critic"]}, best_checkpoint_path)
+                    log_entry["val_ma"] = ma
+                    log_entry["ckpt_update"] = ckpt_update
+                    log_entry["ckpt_score"] = ckpt_score
+                elif v["score"] > best_score:
+                    best_score = v["score"]
                     log_entry["val_best"] = True
+                    ckpt_update, ckpt_score = update + 1, v["score"]
                     if best_checkpoint_path:
-                        torch.save({"agent": centro["agent"], "critic": centro["critic"]}, best_checkpoint_path)
-                log_entry["val_ma"] = ma
-                log_entry["ckpt_update"] = ckpt_update
-                log_entry["ckpt_score"] = ckpt_score
-            elif v["score"] > best_score:
-                best_score = v["score"]
-                log_entry["val_best"] = True
-                ckpt_update, ckpt_score = update + 1, v["score"]
-                if best_checkpoint_path:
-                    torch.save({"agent": agent.state_dict(), "critic": critic.state_dict()}, best_checkpoint_path)
-            if CKPT_SELECTION != "moving_avg":
-                log_entry["ckpt_update"] = ckpt_update
-                log_entry["ckpt_score"] = ckpt_score
+                        torch.save({"agent": agent.state_dict(), "critic": critic.state_dict()}, best_checkpoint_path)
+                if CKPT_SELECTION != "moving_avg":
+                    log_entry["ckpt_update"] = ckpt_update
+                    log_entry["ckpt_score"] = ckpt_score
 
         if es_log:
             if val is None:
-                greedy_reward, greedy_valid_rate = _evaluate_greedy(
-                    agent, eval_env, eval_start_nodes, eval_start_days,
-                    time_matrix_arr, distance_arr, ltr_stack, trucks_stack,
-                    reward_global_p95, num_nodes,
-                    eval_k_levels=eval_k_levels,
-                    avail_expected_arr=avail_expected_arr,
-                    ev_esperado=ev_esperado,
-                )
-                log_entry["greedy_reward"]     = greedy_reward
-                log_entry["greedy_valid_rate"] = greedy_valid_rate
+                with fases("validacion"):
+                    greedy_reward, greedy_valid_rate = _evaluate_greedy(
+                        agent, eval_env, eval_start_nodes, eval_start_days,
+                        time_matrix_arr, distance_arr, ltr_stack, trucks_stack,
+                        reward_global_p95, num_nodes,
+                        eval_k_levels=eval_k_levels,
+                        avail_expected_arr=avail_expected_arr,
+                        ev_esperado=ev_esperado,
+                    )
+                    log_entry["greedy_reward"]     = greedy_reward
+                    log_entry["greedy_valid_rate"] = greedy_valid_rate
             else:
                 greedy_reward, greedy_valid_rate = v["margen"], v["valid_rate"]
 
@@ -1227,7 +1204,6 @@ def run_am_training(
                 f"| ent {avg_entropy:.3f} "
                 f"| kl {avg_kl:.4f} "
                 f"| ev {explained_var:.3f}"
-                + (f" | post_mse {avg_post_mse:.4f} post_ev {post_ev:.3f}" if use_post else "")
             )
 
             # Resumen compacto de diagnósticos de K — conformidad debe ser
@@ -1254,6 +1230,25 @@ def run_am_training(
         log_entry["lr_actor"] = actor_optimizer.param_groups[0]["lr"]
         for sch in schedulers:
             sch.step()
+
+        # ── Tiempos por fase (s). "otro" = lo que no cae en ninguna fase medida.
+        t_total = time.perf_counter() - t_update0
+        for nombre in _FASES_ORDEN:
+            log_entry[f"t_{nombre}"] = fases.t.get(nombre, 0.0)
+            fases_acum[nombre] += fases.t.get(nombre, 0.0)
+        log_entry["t_otro"]  = t_total - sum(fases.t.values())
+        log_entry["t_total"] = t_total
+        fases_acum["otro"]  += log_entry["t_otro"]
+        fases_acum["total"] += t_total
+        updates_acum += 1
+        if es_log:
+            partes = " | ".join(
+                f"{n} {fases_acum[n] / updates_acum:.2f}s ({100 * fases_acum[n] / fases_acum['total']:.0f}%)"
+                for n in (*_FASES_ORDEN, "otro") if fases_acum[n] > 0
+            )
+            print(f"    tiempos/update ({updates_acum} upd): total {fases_acum['total'] / updates_acum:.2f}s | {partes}")
+            fases_acum.clear()
+            updates_acum = 0
 
         training_log.append(log_entry)
         if stop_now:

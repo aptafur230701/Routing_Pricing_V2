@@ -5,8 +5,10 @@ Entry point for the AM-PPO pipeline.
 
   1. Load data          (problem_data.py)
   2. Training           (am_training.py)
-  3. Evaluation         (evaluation.py: mundos simulados + replay; baselines B1-B3, UB-PI, UB-DP)
-  4. Save results       (evaluation.py, excel_report.py, stats_analysis.py)
+  3. Ṽ posterior al PPO (post_training.py: cabezas A/B del precio de reserva, actor congelado)
+  4. Evaluation         (evaluation.py: mundos simulados + replay; DRL, DRL-Q, baselines B1-B3, UB-PI, UB-DP)
+  5. Save results       (evaluation.py, excel_report.py, stats_analysis.py)
+  6. Validación del pricing (validate_pricing.py: contrafactual de p*, utilidad, plausibilidad)
 
 Uso
 ---
@@ -48,6 +50,7 @@ from evaluation import (
 from market_process import MarketProcess, asegurar_parametros
 from stats_analysis import append_stats_sheets_to_excel, NOTA_REPLAY
 from transfer_learning import build_agent_for_training, checkpoint_tiene_post_head, load_checkpoint_compatible
+from post_training import entrenar_cabezas_post, ruta_checkpoint_pricing, pricing_vigente
 from validate_pricing import run_pricing_validation, append_pricing_sheet
 
 
@@ -215,8 +218,8 @@ def _evaluate_and_report(
 
 
 def main():
-    NUM_NODES       = 10      # opciones: 10 · 20 · 35 · 50 · 75 · 100
-    EVAL_ONLY       = False   # True: carga checkpoint y salta entrenamiento
+    NUM_NODES       = 20      # opciones: 10 · 20 · 35 · 50 · 75 · 100
+    EVAL_ONLY       = os.environ.get("EVAL_ONLY", "0") == "1"   # True (EVAL_ONLY=1): carga checkpoint y salta entrenamiento
     USE_TRANSFER    = True   # True: warm-start desde el checkpoint del tamaño anterior en
                               # NODE_SEQUENCE (requiere mismo AM_D_H/AM_N_LAYERS que la fuente).
                               # False: entrena desde pesos aleatorios con la arquitectura de config.py.
@@ -239,9 +242,10 @@ def main():
     K_RESTRINGIDO = False      # True: entrena, valida y evalúa con K libre y K = K_MAX (5).
                                 # False: solo K libre (sin presupuesto de cardinalidad). Sirve para
                                 # pulir el método contra los baselines antes de añadir la restricción.
-    RUN_PRICING_VALIDATION = True   # True (y USE_POST_HEAD activo): al terminar, valida el precio de reserva p*
-                                     # (validate_pricing.py: Monte Carlo de Ṽ, posición de p*, política de aceptación)
-                                     # con el agente evaluado y agrega la pestaña "Pricing" al Excel. ~10-20 min a 35 nodos.
+    RUN_PRICING = True       # True (y USE_POST_HEAD activo): entrena las cabezas Ṽ A/B con el actor congelado (si el
+                              # checkpoint *_pricing.pt no existe), evalúa también DRL-Q (argmax de Q) y valida el precio
+                              # de reserva p* (validate_pricing.py), con la pestaña "Pricing" del Excel.
+    RETRAIN_POST = False     # True: reentrena las cabezas Ṽ aunque ya exista el checkpoint *_pricing.pt
     # ──────────────────────────────────────────────────────────────────────────
 
     configurar_k(K_RESTRINGIDO)    # antes de entrenar/evaluar: fija K_TRAINING_LEVELS en el sitio
@@ -281,6 +285,7 @@ def main():
     loads_train = loads_stack[:TRAIN_DAYS]
 
 
+    usar_best = False
     if EVAL_ONLY:
         usar_best = EVAL_BEST_CHECKPOINT and os.path.exists(_checkpoint_path(checkpoint_dir, NUM_NODES, True))
         agent_am, critic  = _load_agent(checkpoint_dir, NUM_NODES, best=usar_best)
@@ -303,6 +308,7 @@ def main():
         )
         best_path = _checkpoint_path(checkpoint_dir, NUM_NODES, True)
         if EVAL_BEST_CHECKPOINT and USE_MARKET_PROCESS and os.path.exists(best_path):
+            usar_best = True
             print("Se evalúa el mejor update de validación (EVAL_BEST_CHECKPOINT).")
             agent_am, critic = _load_agent(checkpoint_dir, NUM_NODES, best=True)
         else:
@@ -320,7 +326,27 @@ def main():
         pd.DataFrame(training_log).to_excel(tlog_xlsx_path, index=False)
         print(f"training_log (Excel) guardado en: {tlog_xlsx_path}")
 
-    _evaluate_and_report(
+    # ── Ṽ posterior al PPO: cabezas A/B con el actor congelado (checkpoint nuevo *_pricing.pt) ──
+    con_pricing = RUN_PRICING and USE_POST_HEAD
+    if con_pricing:
+        pricing_path = ruta_checkpoint_pricing(_checkpoint_path(checkpoint_dir, NUM_NODES, usar_best))
+        # Se reutiliza el checkpoint *_pricing.pt solo si sus cabezas se entrenaron contra ESTE actor (huella de pesos):
+        # tras reentrenar el PPO, o con otro checkpoint, se reentrenan.
+        if RETRAIN_POST or not pricing_vigente(pricing_path, agent_am):
+            datos = dict(
+                time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack, distance_arr=distance_arr,
+                diesel_arr=diesel_arr, ltr_stack=ltr_stack, trucks_stack=trucks_stack,
+                avail_expected_arr=avail_expected_arr, reward_global_p95=reward_global_p95, market=market_process,
+                ev_esperado=ev_esperado,
+            )
+            entrenar_cabezas_post(agent_am, critic, datos, NUM_NODES, pricing_path, output_dir=output_dir)
+        else:
+            agent_am, critic = load_checkpoint_compatible(
+                pricing_path, NUM_NODES, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, verbose=False)
+            agent_am.eval()
+            print(f"Cabezas Ṽ cargadas de {pricing_path}")
+
+    sim_df, replay_df = _evaluate_and_report(
         agent_am, NUM_NODES, time_matrix, rate_stack, loads_stack,
         distance_arr, diesel_arr, ep_r, ep_l, t,
         summary_rows, output_dir, label="AM" if EVAL_SET == "dev" else "AM_final",
@@ -332,19 +358,15 @@ def main():
         sufijo_cache="" if EVAL_SET == "dev" else "_final",
     )
 
-    if RUN_PRICING_VALIDATION and USE_POST_HEAD:
-        if getattr(agent_am, "post_value", None) is None or (
-            EVAL_ONLY and not checkpoint_tiene_post_head(_checkpoint_path(checkpoint_dir, NUM_NODES, usar_best))
-        ):
-            print("\nValidación del pricing omitida: el checkpoint no trae post_value (reentrena con USE_POST_HEAD=True).")
-        else:
-            tablas = run_pricing_validation(
-                agent_am, NUM_NODES, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-                ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95, market_process,
-                ev_esperado=ev_esperado, output_dir=output_dir,
-            )
-            label = "AM" if EVAL_SET == "dev" else "AM_final"
-            append_pricing_sheet(os.path.join(output_dir, f"DRL_Routing_Summary_{label}.xlsx"), tablas)
+    if con_pricing and getattr(agent_am, "post_entrenadas", False):
+        tablas = run_pricing_validation(
+            agent_am, NUM_NODES, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
+            ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95, market_process,
+            ev_esperado=ev_esperado, output_dir=output_dir, sim_df=sim_df, replay_df=replay_df,
+            semilla_eval=MARKET_SEED_EVAL if EVAL_SET == "dev" else MARKET_SEED_EVAL_FINAL,
+        )
+        label = "AM" if EVAL_SET == "dev" else "AM_final"
+        append_pricing_sheet(os.path.join(output_dir, f"DRL_Routing_Summary_{label}.xlsx"), tablas)
 
     print(f"\nDone! Checkpoint guardado en: checkpoints/am_checkpoint_{NUM_NODES}nodes.pt")
 

@@ -150,6 +150,9 @@ def load_checkpoint_compatible(
 
     agent.load_state_dict(agent_sd)
     critic.load_state_dict(critic_sd)
+    # ¿las cabezas Ṽ del checkpoint están entrenadas? (si no, DRL-Q y p* no tienen sentido)
+    agent.post_entrenadas = bool(agent.has_post_heads) and any(k.startswith("post_value_a.") for k in checkpoint["agent"]) \
+        and any(k.startswith("post_value_b.") for k in checkpoint["agent"])
 
     if verbose:
         total = len(transferred_a) + len(skipped_a) + len(transferred_c) + len(skipped_c)
@@ -163,15 +166,17 @@ def load_checkpoint_compatible(
 
 
 def checkpoint_tiene_post_head(checkpoint_path: str) -> bool:
-    """True si el checkpoint trae los pesos de agent.post_value (cabeza de valor post-decisión).
+    """True si el checkpoint trae los pesos de las dos cabezas de valor post-decisión (post_value_a/b).
 
-    Los checkpoints anteriores al precio de reserva no la traen: al cargarlos la cabeza arranca
-    desde cero (_reconcile_state_dict omite lo que falta) y p* no tendría sentido.
+    Los checkpoints del PPO no las traen: las agrega post_training.py en un checkpoint nuevo
+    (am_checkpoint_<N>nodes_pricing.pt). Al cargar uno sin ellas las cabezas arrancan sin entrenar
+    (_reconcile_state_dict omite lo que falta) y ni p* ni DRL-Q tendrían sentido.
     """
     if not os.path.exists(checkpoint_path):
         return False
     ckpt = torch.load(checkpoint_path, map_location="cpu")
-    return any(k.startswith("post_value.") for k in ckpt["agent"])
+    return (any(k.startswith("post_value_a.") for k in ckpt["agent"])
+            and any(k.startswith("post_value_b.") for k in ckpt["agent"]))
 
 
 def get_source_checkpoint(base_dir: str, target_num_nodes: int) -> str | None:

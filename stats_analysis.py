@@ -1,7 +1,7 @@
 """
 stats_analysis.py
 =================
-Comparación estadística pareada del DRL contra los baselines B1, B2, B2P y B3, mundo a mundo
+Comparación estadística pareada del DRL (y de DRL-Q) contra los baselines B1, B2, B2P y B3, mundo a mundo
 (baselines_drl_ruteo_estocastico.md, sección Pruebas estadísticas).
 
 Unidad de análisis: la diferencia de margen (USD) DRL − baseline en un mismo mundo.
@@ -26,6 +26,7 @@ from config import BOOTSTRAP_B, BOOTSTRAP_SEED
 
 REFERENCIA = "DRL"
 BASELINES = ("B1", "B2", "B2P", "B3")
+BASELINES_Q = ("DRL",) + BASELINES   # contra qué se compara DRL-Q (el actor y los baselines)
 NOTA_REPLAY = "replay, fuera de muestra (días 90-119)"
 
 
@@ -78,6 +79,39 @@ def ic_bootstrap_media(valores, B: int = BOOTSTRAP_B, rng=None, semilla: int = B
     rng = rng if rng is not None else np.random.Generator(np.random.PCG64(semilla))
     medias = v[_indices_bootstrap(len(v), B, rng)].mean(axis=1)
     return float(np.percentile(medias, 2.5)), float(np.percentile(medias, 97.5))
+
+
+def ic_bootstrap_cluster(valores, grupos, B: int = BOOTSTRAP_B, semilla: int = BOOTSTRAP_SEED) -> tuple:
+    """IC del 95 % de la media por bootstrap de conglomerados: remuestrea GRUPOS (p. ej. mundos) con reemplazo.
+
+    Los estados de un mismo mundo no son independientes, así que se remuestrean mundos enteros y la media de cada
+    réplica es la de todos los valores de los mundos sorteados (suma / cuenta). Devuelve (bajo, alto); NaN si vacío.
+    """
+    v, g = np.asarray(valores, dtype=float), np.asarray(grupos)
+    ok = ~np.isnan(v)
+    v, g = v[ok], g[ok]
+    if len(v) == 0:
+        return float("nan"), float("nan")
+    _, inv = np.unique(g, return_inverse=True)
+    suma, cuenta = np.bincount(inv, weights=v), np.bincount(inv).astype(float)
+    rng = np.random.Generator(np.random.PCG64(semilla))
+    idx = rng.integers(0, len(suma), size=(B, len(suma)))
+    medias = suma[idx].sum(axis=1) / cuenta[idx].sum(axis=1)
+    return float(np.percentile(medias, 2.5)), float(np.percentile(medias, 97.5))
+
+
+def ic_bootstrap_cociente(dif, ref, B: int = BOOTSTRAP_B, semilla: int = BOOTSTRAP_SEED) -> tuple:
+    """IC del 95 % de media(dif) / media(ref) (p. ej. (DRL-Q − DRL) / margen del actor) remuestreando mundos
+    (pares dif[i], ref[i]). Devuelve (punto, bajo, alto)."""
+    d, r = np.asarray(dif, dtype=float), np.asarray(ref, dtype=float)
+    ok = ~np.isnan(d) & ~np.isnan(r)
+    d, r = d[ok], r[ok]
+    if len(d) == 0 or r.mean() == 0:
+        return float("nan"), float("nan"), float("nan")
+    rng = np.random.Generator(np.random.PCG64(semilla))
+    idx = _indices_bootstrap(len(d), B, rng)
+    q = d[idx].mean(axis=1) / r[idx].mean(axis=1)
+    return float(d.mean() / r.mean()), float(np.percentile(q, 2.5)), float(np.percentile(q, 97.5))
 
 
 def holm(p: np.ndarray) -> np.ndarray:
@@ -144,6 +178,14 @@ def comparar_con_baselines(df: pd.DataFrame, referencia: str = REFERENCIA, basel
     return pd.DataFrame(filas)
 
 
+def comparar_referencias(df: pd.DataFrame) -> pd.DataFrame:
+    """comparar_con_baselines con el actor (DRL) y con DRL-Q como referencia; DRL-Q contra el actor y los baselines."""
+    partes = [comparar_con_baselines(df)]
+    if (df["metodo"] == "DRL-Q").any():
+        partes.append(comparar_con_baselines(df, referencia="DRL-Q", baselines=BASELINES_Q))
+    return pd.concat(partes, ignore_index=True)
+
+
 def gaps_contra_cotas(df: pd.DataFrame, B: int = BOOTSTRAP_B, semilla: int = BOOTSTRAP_SEED) -> pd.DataFrame:
     """Gap (%) de cada método contra UB-DP y UB-PI, con intervalo bootstrap del 95 % sobre mundos."""
     rng = np.random.Generator(np.random.PCG64(semilla))
@@ -171,7 +213,7 @@ def gaps_contra_cotas(df: pd.DataFrame, B: int = BOOTSTRAP_B, semilla: int = BOO
 def append_stats_sheets_to_excel(excel_path: str, sim_df: pd.DataFrame, replay_df: pd.DataFrame = None) -> None:
     """Agrega 'Comparación pareada' y 'Gaps vs cotas' al Excel existente sin tocar las hojas previas."""
     df = sim_df if replay_df is None or replay_df.empty else pd.concat([sim_df, replay_df], ignore_index=True)
-    pareada = comparar_con_baselines(df)
+    pareada = comparar_referencias(df)
     gaps = gaps_contra_cotas(df)
     with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
         pareada.to_excel(writer, sheet_name="Comparación pareada", index=False)
