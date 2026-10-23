@@ -65,7 +65,7 @@ def greedy_rollout(
                                              # rollout muestreado hacen que ambos vean el mismo mundo
     max_duration:       float      = MAX_DURATION,
     device:             torch.device = None,   # dispositivo del agente (default: DEVICE de config)
-    ev_esperado:        np.ndarray = None,   # (7, N, N) calcular_ev_esperado (baselines.py); obligatorio con
+    ev_esperado:        np.ndarray = None,   # EvEsperado, calcular_ev_pronostico (baselines.py); obligatorio con
                                              # USE_CONTINUATION_FEATURES (features de continuación f7–f10)
     step_hook:          callable   = None,   # fn(dict) invocada en cada paso ANTES de env.step, para inspeccionar la
                                              # decisión sin alterarla (p. ej. el precio de reserva en inference.py).

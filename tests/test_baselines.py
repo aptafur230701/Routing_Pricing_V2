@@ -200,7 +200,7 @@ def test_politicas_respetan_mascara_y_son_deterministas(inst10):
     # ejecutar_politica lanza RuntimeError si una política elige fuera de la máscara.
     a = inst10.simular(M=8)
     b = inst10.simular(M=8)
-    assert set(a["metodo"]) == {"DRL", "B1", "B2", "B3"}
+    assert set(a["metodo"]) == {"DRL", "B1", "B2", "B2P", "B3"}
     assert ((a["metodo"] == "B2") & (a["K"] == "libre")).any()          # B2 también con K libre
     pd.testing.assert_frame_equal(_sin_tiempos(a), _sin_tiempos(b))
 

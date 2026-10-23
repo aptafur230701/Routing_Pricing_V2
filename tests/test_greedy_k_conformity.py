@@ -22,6 +22,7 @@ from config import DEVICE, K_LEVELS, REWARD_SCALE_FACTOR, TIME_VIOLATION_PENALTY
 from am_agent import AMRoutingAgent
 from greedy_rollout import greedy_rollout
 from problem_data import build_rm_pen_stack
+from baselines import EvEsperado
 from routing_env import RoutingEnv, VectorRoutingEnv
 
 N = 9   # el camión puede revisitar nodos, así que con MAX_DURATION_SYN holgado cualquier K de K_LEVELS
@@ -45,7 +46,9 @@ def synthetic():
         time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack,
         distance_arr=distance_arr, diesel_arr=diesel_arr,
         trucks_stack=trucks_stack, ltr_stack=ltr_stack, rm_pen_stack=rm_pen_stack,
-        ev_esperado=np.random.RandomState(0).uniform(-50, 200, size=(7, N, N)),   # features de continuación
+        ev_esperado=EvEsperado(                                                    # features de continuación
+            ev=np.random.RandomState(0).uniform(-50, 200, size=(7, N, N)),
+            q=np.random.RandomState(2).uniform(0, 50, size=(6, 7, N, N)), b=np.linspace(1.0, 0.5, 6)),
         indice_stack=np.random.RandomState(1).normal(0.0, 0.1, size=(3, N)),      # índice de mercado por día
     )
 

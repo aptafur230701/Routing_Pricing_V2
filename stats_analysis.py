@@ -1,7 +1,7 @@
 """
 stats_analysis.py
 =================
-Comparación estadística pareada del DRL contra los baselines B1, B2 y B3, mundo a mundo
+Comparación estadística pareada del DRL contra los baselines B1, B2, B2P y B3, mundo a mundo
 (baselines_drl_ruteo_estocastico.md, sección Pruebas estadísticas).
 
 Unidad de análisis: la diferencia de margen (USD) DRL − baseline en un mismo mundo.
@@ -25,7 +25,7 @@ from scipy.stats import wilcoxon
 from config import BOOTSTRAP_B, BOOTSTRAP_SEED
 
 REFERENCIA = "DRL"
-BASELINES = ("B1", "B2", "B3")
+BASELINES = ("B1", "B2", "B2P", "B3")
 NOTA_REPLAY = "replay, fuera de muestra (días 90-119)"
 
 

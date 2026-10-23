@@ -59,7 +59,7 @@ from attention_encoder import (
 )
 from am_agent import AMRoutingAgent
 from critic_head import CriticHead
-from baselines import calcular_ev_esperado
+from baselines import calcular_ev_pronostico
 from debug_utils import check_tensor
 from dp_relajada import cargar_o_calcular_tabla, PoliticaB3
 from evaluation import disenar_mundos, ejecutar_politica
@@ -325,7 +325,7 @@ def _evaluate_greedy(
     num_nodes:        int,
     eval_k_levels:    list = None,   # niveles de K por episodio (None ⇒ todos libres)
     avail_expected_arr: np.ndarray = None,
-    ev_esperado:      np.ndarray = None,   # (7, N, N) para las features de continuación
+    ev_esperado:      np.ndarray = None,   # EvEsperado (calcular_ev_pronostico) para las features de continuación
 ) -> tuple:
     """
     Recompensa promedio en modo greedy (argmax en cada nodo, sin búsqueda) sobre
@@ -460,7 +460,7 @@ def run_am_training(
                                        # (True = detener el entrenamiento ya, p.ej. Optuna pruning).
                                        # Solo se invoca en los updates de log_freq (donde greedy_reward
                                        # está disponible). No acopla este módulo a Optuna.
-    ev_esperado: np.ndarray = None,   # (7, N, N) calcular_ev_esperado. Para las features de continuación;
+    ev_esperado: np.ndarray = None,   # EvEsperado, calcular_ev_pronostico. Para las features de continuación;
                                        # si es None se calcula una vez desde market_process (obligatorio
                                        # en ese caso con USE_CONTINUATION_FEATURES).
 ) -> tuple:
@@ -578,7 +578,7 @@ def run_am_training(
     if ev_esperado is None and USE_CONTINUATION_FEATURES:
         if market_process is None:
             raise ValueError("USE_CONTINUATION_FEATURES requiere ev_esperado o market_process")
-        ev_esperado = calcular_ev_esperado(market_process, distance_arr, diesel_arr)
+        ev_esperado = calcular_ev_pronostico(market_process, distance_arr, diesel_arr)
 
     # ── Entorno vectorizado (una sola instancia, reutilizada en cada update) ──
     # Índice de mercado observado de los días de entrenamiento (194 nodos, recortado a N): lo ven los entornos

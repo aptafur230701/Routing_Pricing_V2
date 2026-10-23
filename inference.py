@@ -31,7 +31,7 @@ from config import (
     REWARD_SCALE_FACTOR,
 )
 from am_agent import AMRoutingAgent
-from baselines import calcular_ev_esperado
+from baselines import calcular_ev_pronostico
 from evaluation import make_replay_env, rollout_drl_env
 from greedy_rollout import greedy_rollout
 from market_process import MarketProcess, asegurar_parametros
@@ -88,7 +88,7 @@ def load_latest_day():
         time_matrix, rate_stack[last:], loads_stack[last:], distance_arr, diesel_arr, NUM_NODES,
         day_offset=last, market=market,
     )
-    ev_esperado = calcular_ev_esperado(market, distance_arr, diesel_arr)   # una vez
+    ev_esperado = calcular_ev_pronostico(market, distance_arr, diesel_arr)   # una vez
     return dict(
         env=env,
         ev_esperado=ev_esperado,

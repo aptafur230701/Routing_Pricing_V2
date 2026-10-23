@@ -3,7 +3,7 @@ evaluation.py
 =============
 Evaluación posterior al entrenamiento (baselines_drl_ruteo_estocastico.md):
   · rollout_drl_env              — rollout greedy (argmax por nodo) del agente en el entorno
-  · evaluar_mundos_simulados     — DRL, B1, B2, B3 sobre los mismos mundos simulados + UB-PI (cota) y UB-DP
+  · evaluar_mundos_simulados     — DRL, B1, B2, B2P, B3 sobre los mismos mundos simulados + UB-PI (cota) y UB-DP
                                    (referencia: valor de la política que ignora el mercado, no es cota)
   · evaluar_replay               — el mismo arnés sobre los días reales de evaluación (market_process=None)
   · resumen_metodos              — márgenes, gaps y métricas operativas por método
@@ -33,7 +33,7 @@ from config import (
     MAX_DURATION, K_MAX, TRAIN_DAYS, MARKET_DIAS_EPISODIO,
     MARKET_SEED_EVAL, MARKET_M_EVAL_WORLDS, REPLAY_MAX_CASOS,
 )
-from baselines import Observacion, PoliticaB1, PoliticaB2, calcular_ev_esperado
+from baselines import Observacion, PoliticaB1, PoliticaB2, PoliticaB2P, calcular_ev_pronostico
 from dp_relajada import PoliticaB3
 from greedy_rollout import greedy_rollout
 from problem_data import build_rm_pen_stack, lane_reward
@@ -42,7 +42,7 @@ from Solvers import solve_ub_pi
 from stats_analysis import gap_pct, ic_bootstrap_media, ub_dp_floja, NOTA_UB_DP_FLOJA
 
 _DIAS_SIMULADOS_UB_PI = MARKET_DIAS_EPISODIO   # días del mundo que cubren cualquier ruta (6: 77 h = 5,5 días de mercado)
-_METODOS = ("DRL", "B1", "B2", "B3")
+_METODOS = ("DRL", "B1", "B2", "B2P", "B3")
 
 
 # ── DRL env-based rollout ─────────────────────────────────────
@@ -104,7 +104,7 @@ def rollout_drl_env(
     avail_expected_arr: np.ndarray = None,
     world_seed:     int        = None,
     device:         torch.device = None,
-    ev_esperado:    np.ndarray = None,   # (7, N, N) calcular_ev_esperado; obligatorio con USE_CONTINUATION_FEATURES
+    ev_esperado:    np.ndarray = None,   # EvEsperado, calcular_ev_pronostico; obligatorio con USE_CONTINUATION_FEATURES
 ) -> tuple:
     """Una ruta del agente: paso a paso en el entorno, argmax en cada nodo.
 
@@ -263,10 +263,11 @@ class ContextoEval:
         self.dist, self.diesel, self.N = distance_arr, diesel_arr, num_nodes
         self.ltr, self.trucks = ltr_stack, trucks_stack
         self.avail, self.p95 = avail_expected_arr, reward_global_p95
-        self.ev = calcular_ev_esperado(market, distance_arr, diesel_arr)   # una vez por evaluación
+        self.ev = calcular_ev_pronostico(market, distance_arr, diesel_arr)   # una vez por evaluación
         self.politicas = {
             "B1": PoliticaB1(distance_arr, diesel_arr),
             "B2": PoliticaB2(market, self.T, distance_arr, diesel_arr),
+            "B2P": PoliticaB2P(market, self.T, distance_arr, diesel_arr),
             "B3": PoliticaB3(tabla, distance_arr, diesel_arr),
         }
 
@@ -361,7 +362,7 @@ def _firma_cache(ctx, *partes) -> str:
     """Huella de lo que determina los baselines y las cotas: los parámetros del mercado, el ev, la tabla V
     de UB-DP y el diseño de la evaluación. Si cambia algo de eso, el caché no se reutiliza."""
     h = hashlib.sha1(ctx.market.firma_params().encode())
-    h.update(np.ascontiguousarray(ctx.ev).tobytes())
+    h.update(np.ascontiguousarray(ctx.ev.ev).tobytes())   # q y b salen de los parámetros del mercado (ya en firma_params)
     h.update(np.ascontiguousarray(ctx.tabla.V_k).tobytes())
     h.update(np.ascontiguousarray(ctx.tabla.V_libre).tobytes())
     h.update(repr((partes, MAX_DURATION)).encode())
@@ -369,13 +370,13 @@ def _firma_cache(ctx, *partes) -> str:
 
 
 def _faltantes(df: pd.DataFrame, k_levels) -> set:
-    """Pares (K, método) de B1, B2, B3 que `df` no trae para los niveles de K pedidos."""
+    """Pares (K, método) de B1, B2, B2P, B3 que `df` no trae para los niveles de K pedidos."""
     hay = set(zip(df["K"], df["metodo"]))
     return {(K, nombre) for K in k_levels for nombre in _METODOS[1:] if (_etiqueta_k(K), nombre) not in hay}
 
 
 def _filas_con_cache(cache_path, firma, calcular, verbose=True, completar=None) -> pd.DataFrame:
-    """Filas de B1, B2, B3 y cotas (no dependen del DRL): se calculan una vez y se reusan.
+    """Filas de B1, B2, B2P, B3 y cotas (no dependen del DRL): se calculan una vez y se reusan.
 
     cache_path None ⇒ sin caché. Un caché con otra firma se recalcula y se sobrescribe.
     completar : función df → df que añade lo que le falte al caché vigente (p. ej. B2 con K libre,
@@ -416,7 +417,7 @@ def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, load
                              avail_expected_arr, reward_global_p95,
                              M=MARKET_M_EVAL_WORLDS, k_levels=(K_MAX, None), verbose=True,
                              cache_path=None, semilla_eval=MARKET_SEED_EVAL) -> pd.DataFrame:
-    """DRL, B1, B2 y B3 sobre los mismos M mundos simulados, por nivel de K.
+    """DRL, B1, B2, B2P y B3 sobre los mismos M mundos simulados, por nivel de K.
 
     Los mismos mundos (nodo, día, world_seed) se usan en todos los niveles de K. Devuelve un
     DataFrame largo: una fila por (K, mundo, método) con el margen en USD, la factibilidad,
@@ -424,7 +425,7 @@ def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, load
 
     semilla_eval : semilla del diseño de los M mundos (MARKET_SEED_EVAL = conjunto de desarrollo;
         MARKET_SEED_EVAL_FINAL = conjunto B, test final). Usar un cache_path distinto por semilla.
-    cache_path : B1, B2, B3, UB-PI y UB-DP no dependen del DRL, así que con una ruta se calculan una
+    cache_path : B1, B2, B2P, B3, UB-PI y UB-DP no dependen del DRL, así que con una ruta se calculan una
         sola vez y se reusan entre corridas (mientras no cambie el proceso, la tabla V ni el diseño).
     """
     ctx = ContextoEval(agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
@@ -514,7 +515,7 @@ def evaluar_replay(agent, market, tabla, time_matrix, rate_eval, loads_eval,
     Fuera de muestra respecto del proceso (se ajusta solo con los TRAIN_DAYS de
     entrenamiento). ltr_eval / trucks_eval deben estar recortados a los mismos días que rate_eval.
     UB-PI se resuelve sobre el histórico; UB-DP no aplica (es la referencia del proceso simulado).
-    cache_path : como en evaluar_mundos_simulados, para B1, B2, B3 y UB-PI.
+    cache_path : como en evaluar_mundos_simulados, para B1, B2, B2P, B3 y UB-PI.
     """
     ctx = ContextoEval(agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
                        ltr_eval, trucks_eval, avail_expected_arr, reward_global_p95)

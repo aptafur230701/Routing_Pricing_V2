@@ -16,7 +16,7 @@ import pytest
 
 import am_training
 from config import K_TRAINING_LEVELS
-from baselines import calcular_ev_esperado
+from baselines import calcular_ev_pronostico
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
 
@@ -35,7 +35,7 @@ def small_run(monkeypatch):
     agent, critic, ep_rewards, ep_losses, training_log = am_training.run_am_training(
         time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, NUM_NODES,
         ltr_stack=ltr_stack, trucks_stack=trucks_stack, reward_global_p95=reward_global_p95,
-        ev_esperado=calcular_ev_esperado(MarketProcess(NUM_NODES), distance_arr, diesel_arr),
+        ev_esperado=calcular_ev_pronostico(MarketProcess(NUM_NODES), distance_arr, diesel_arr),
     )
     return training_log
 

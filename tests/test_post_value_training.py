@@ -9,7 +9,7 @@ import pytest
 
 import am_training
 from am_training import RolloutBuffer
-from baselines import calcular_ev_esperado
+from baselines import calcular_ev_pronostico
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
 
@@ -38,7 +38,7 @@ def data():
     asegurar_parametros()
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
      ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95) = load_matrices(NUM_NODES)
-    ev = calcular_ev_esperado(MarketProcess(NUM_NODES), distance_arr, diesel_arr)
+    ev = calcular_ev_pronostico(MarketProcess(NUM_NODES), distance_arr, diesel_arr)
     return dict(
         args=(time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, NUM_NODES),
         kwargs=dict(ltr_stack=ltr_stack, trucks_stack=trucks_stack,

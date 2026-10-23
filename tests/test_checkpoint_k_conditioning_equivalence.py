@@ -34,7 +34,7 @@ import pytest
 import numpy as np
 
 from config import TRAIN_DAYS
-from baselines import calcular_ev_esperado
+from baselines import calcular_ev_pronostico
 from evaluation import make_replay_env, rollout_drl_env, ub_pi
 from market_process import MarketProcess, asegurar_parametros
 from transfer_learning import load_checkpoint_compatible
@@ -79,7 +79,7 @@ def test_free_case_rollout_quality_vs_exact_optimum(loaded):
     asegurar_parametros()
     market = MarketProcess(NUM_NODES)
     env = make_replay_env(time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, NUM_NODES, market=market)
-    ev_esperado = calcular_ev_esperado(market, distance_arr, diesel_arr)
+    ev_esperado = calcular_ev_pronostico(market, distance_arr, diesel_arr)
 
     drl_rewards, opt_rewards = [], []
     for day in range(TRAIN_DAYS, num_days):

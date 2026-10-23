@@ -7,7 +7,9 @@ calcular_ev_esperado y la expansión del checkpoint a más columnas de entrada.
   · calcular_ev_esperado da exactamente el (7, N, N) que PoliticaB2 tenía en __init__ (con media_lane).
   · (B, N, 12), sin NaN/Inf; f7–f10 coinciden con una referencia escalar con loops.
   · f11 = índice de mercado del nodo en el día actual / desviación del índice histórico.
-  · f9 coincide con PoliticaB2._ev en 5 estados elegidos al azar.
+  · f7–f10 usan el valor esperado AJUSTADO por el índice (el de B2P): ev + índice(origen) · q[h, dow];
+    con índice cero dan EXACTAMENTE lo de antes (copia congelada de la función anterior).
+  · f9 coincide con el ev ajustado de PoliticaB2P en 5 estados elegidos al azar.
   · casos especiales: j == i (todo 0) y j == h (f7 = f9 = f10 = 0, f8 = holgura del retorno directo).
   · la versión escalar build_node_features coincide con la batcheada.
   · start_dow del entorno; transfer de 7 → 11 y de 11 → 12 columnas (nuevas en cero, misma salida que antes).
@@ -18,9 +20,9 @@ import pytest
 import torch
 
 from attention_encoder import (
-    N_NODE_FEATURES, build_node_features, build_node_features_batch,
+    N_NODE_FEATURES, build_continuation_features_batch, build_node_features, build_node_features_batch,
 )
-from baselines import PoliticaB2, calcular_ev_esperado
+from baselines import PoliticaB2, PoliticaB2P, calcular_ev_esperado, calcular_ev_pronostico
 from config import (
     MAX_DURATION, MPG, MARGINAL_COST_SIN_DIESEL, USE_CONTINUATION_FEATURES, TRAIN_DAYS,
 )
@@ -40,7 +42,7 @@ def datos():
     market = MarketProcess(N)
     return dict(tm=tm, T=np.asarray(tm, dtype=float), rate=rate[:TRAIN_DAYS], loads=loads[:TRAIN_DAYS],
                 dist=dist, diesel=diesel, ltr=ltr, trucks=trucks, avail=avail, p95=p95, market=market,
-                ev=calcular_ev_esperado(market, dist, diesel))
+                ev=calcular_ev_pronostico(market, dist, diesel))
 
 
 def _estados(d, B=60, pasos=2, semilla=0):
@@ -72,27 +74,34 @@ def _features(d, env, starts):
 
 def _referencia(d, env, starts, b):
     """f7–f10 de la fila b con loops de Python (definición literal de la especificación)."""
-    T, ev, p95 = d["T"], d["ev"], d["p95"]
+    T, tab, p95 = d["T"], d["ev"], d["p95"]
+    ev, q, H = tab.ev, tab.q, tab.h_max
+    idx = env.market_index[b]
     i, h, t = int(env.current_node[b]), int(starts[b]), float(env.time_elapsed[b])
-    dow0 = int(env.start_dow[b])
+    dow0, hoy = int(env.start_dow[b]), int(t // 14)
+
+    def ev_aj(origen, destino, t_salida):
+        """ev + índice(origen) · q[h, dow] para un arco que sale en t_salida (h = días desde hoy)."""
+        dia = int(t_salida // 14)
+        dow, hh = (dow0 + dia) % 7, min(max(dia - hoy, 0), H)
+        return ev[dow, origen, destino] + idx[origen] * q[hh, dow, origen, destino]
+
     out = np.zeros((N, 4))
     for j in range(N):
         if j == i:
             continue
         tj = t + T[i, j]
-        dj = (dow0 + int(tj // 14)) % 7
         if j == h:
             out[j, 1] = np.clip((MAX_DURATION - tj) / MAX_DURATION, 0, 1)
             continue
         out[j, 0] = T[j, h] / MAX_DURATION
         out[j, 1] = np.clip((MAX_DURATION - tj - T[j, h]) / MAX_DURATION, 0, 1)
-        out[j, 2] = np.clip(ev[dj, j, h] / p95, -1, 1)
-        mejor = ev[dj, j, h]
+        out[j, 2] = np.clip(ev_aj(j, h, tj) / p95, -1, 1)
+        mejor = ev_aj(j, h, tj)
         for l in range(N):
             if l in (i, j, h) or tj + T[j, l] + T[l, h] > MAX_DURATION:
                 continue
-            dl = (dow0 + int((tj + T[j, l]) // 14)) % 7
-            mejor = max(mejor, ev[dj, j, l] + ev[dl, l, h])
+            mejor = max(mejor, ev_aj(j, l, tj) + ev_aj(l, h, tj + T[j, l]))
         out[j, 3] = np.clip(mejor / p95, -1, 1)
     return out
 
@@ -109,8 +118,8 @@ def test_ev_esperado_identico_al_de_b2(datos):
     m = p.mu[None, :, :] * p.s[:, None, None]
     prob = 1.0 - (phi[None] / (phi[None] + m)) ** phi[None]
     ev_original = prob * p.media_lane[None] * d["dist"][None] - costo[None]
-    assert d["ev"].shape == (7, N, N)
-    assert np.array_equal(d["ev"], ev_original)
+    assert d["ev"].ev.shape == (7, N, N)
+    assert np.array_equal(d["ev"].ev, ev_original)
 
     b2 = PoliticaB2(d["market"], d["T"], d["dist"], d["diesel"])
     assert np.array_equal(b2._ev, ev_original)
@@ -136,19 +145,19 @@ def test_f7_a_f10_coinciden_con_referencia_con_loops(datos, pasos):
         np.testing.assert_allclose(feats[b, :, 7:11], _referencia(datos, env, starts, b), atol=1e-6)
 
 
-def test_f9_coincide_con_ev_de_b2_en_5_estados_al_azar(datos):
+def test_f9_coincide_con_el_ev_ajustado_de_b2p_en_5_estados_al_azar(datos):
     env, activas, starts = _estados(datos, B=80, pasos=1, semilla=5)
     feats = _features(datos, env, starts)
-    b2 = PoliticaB2(datos["market"], datos["T"], datos["dist"], datos["diesel"])
+    b2p = PoliticaB2P(datos["market"], datos["T"], datos["dist"], datos["diesel"])
     rng = np.random.default_rng(123)
     for b in rng.choice(activas, size=5, replace=False):
         i, h, t = int(env.current_node[b]), int(starts[b]), float(env.time_elapsed[b])
+        dow0, hoy, idx = int(env.start_dow[b]), int(t // 14), env.market_index[b]
         for j in range(N):
             if j in (i, h):
                 continue
-            llegada = t + datos["T"][i, j]
-            dj = (int(env.start_dow[b]) + int(llegada // 14)) % 7           # mismo indexado que B2._continuacion
-            esperado = np.clip(b2._ev[dj, j, h] / datos["p95"], -1, 1)
+            dia = int((t + datos["T"][i, j]) // 14)                         # día en que sale el arco j→casa
+            esperado = np.clip(b2p._ev_dia({}, dow0, hoy, dia, idx)[j, h] / datos["p95"], -1, 1)   # el mismo de B2P
             assert feats[b, j, 9] == pytest.approx(float(esperado), abs=1e-6)
 
 
@@ -275,3 +284,115 @@ def test_transfer_rechaza_forma_incompatible_con_error_claro():
     # Claves que el destino no tiene se omiten (no es un error); las que faltan en el checkpoint se conservan.
     sd, transferidos, omitidos = _reconcile_state_dict({"a": torch.zeros(2)}, {"a": torch.ones(2), "extra": torch.ones(3)})
     assert omitidos == ["extra"] and torch.equal(sd["a"], torch.ones(2))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Valor esperado ajustado por el índice (el de B2P) en las features de continuación
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Copia congelada de build_continuation_features_batch ANTES de usar el índice (ev sin ajustar), para comprobar
+# que con índice cero las features de continuación valen exactamente lo de siempre.
+def _continuacion_sin_indice(
+    current_node:      np.ndarray,   # (B,) int64 — i
+    start_node:        np.ndarray,   # (B,) int64 — casa h
+    time_elapsed:      np.ndarray,   # (B,) horas transcurridas t
+    dow0:              np.ndarray,   # (B,) día de la semana (lunes = 0) del día de salida
+    time_matrix_arr:   np.ndarray,   # (N, N) T
+    ev:                np.ndarray,   # (7, N, N) calcular_ev_esperado
+    max_duration:      float,
+    reward_global_p95: float,
+) -> np.ndarray:                     # (B, N, 4) float32: f7, f8, f9, f10
+    """Features de continuación por nodo j (ver docstring del módulo), sin loops sobre B ni N.
+
+    f10 se calcula con un tensor (B, N, N) indexado por (episodio, j, l).
+    """
+    N    = np.asarray(time_matrix_arr).shape[0]
+    T    = np.asarray(time_matrix_arr, dtype=np.float64)
+    i    = np.asarray(current_node, dtype=np.int64)
+    h    = np.asarray(start_node, dtype=np.int64)
+    t    = np.asarray(time_elapsed, dtype=np.float64)
+    dow0 = np.asarray(dow0, dtype=np.int64)
+    MAX  = max(float(max_duration), 1e-6)
+    p95  = max(float(reward_global_p95), 1e-6)
+    jj   = np.arange(N)
+
+    t_j  = t[:, None] + T[i, :]                              # (B, N) llegada a j
+    T_jh = T[:, h].T                                         # (B, N) tiempo de j a casa
+    is_h = jj[None, :] == h[:, None]                         # (B, N)
+    is_i = jj[None, :] == i[:, None]                         # (B, N)
+    T_jh = np.where(is_h, 0.0, T_jh)                         # casa → casa: sin tiempo
+
+    f7 = T_jh / MAX
+    f8 = np.clip((MAX - t_j - T_jh) / MAX, 0.0, 1.0)
+
+    dow_j = (dow0[:, None] + (t_j // 14.0).astype(np.int64)) % 7          # (B, N)
+    ev_jh = ev[dow_j, jj[None, :], h[:, None]]                            # (B, N) ev[dow_j, j, h]
+    f9 = np.clip(ev_jh / p95, -1.0, 1.0)
+
+    # Continuación a 2 saltos: j → l → casa, con l ∉ {i, j, h} y retorno factible.
+    t_l    = t_j[:, :, None] + T[None, :, :]                              # (B, N, N) llegada a l desde j
+    T_lh   = T[:, h].T[:, None, :]                                        # (B, 1, N) T[l, h]
+    valid  = (
+        (jj[None, None, :] != jj[None, :, None])                          # l ≠ j
+        & (jj[None, None, :] != i[:, None, None])                         # l ≠ i
+        & (jj[None, None, :] != h[:, None, None])                         # l ≠ h
+        & (t_l + T_lh <= max_duration)
+    )
+    dow_l = (dow0[:, None, None] + (t_l // 14.0).astype(np.int64)) % 7    # (B, N, N)
+    ev_jl = ev[dow_j[:, :, None], jj[None, :, None], jj[None, None, :]]   # (B, N, N) ev[dow_j, j, l]
+    ev_lh = ev[dow_l, jj[None, None, :], h[:, None, None]]                # (B, N, N) ev[dow_l, l, h]
+    dos   = np.where(valid, ev_jl + ev_lh, -np.inf).max(axis=2)           # (B, N); -inf si no hay l
+    f10 = np.clip(np.maximum(ev_jh, dos) / p95, -1.0, 1.0)
+
+    # Casos especiales: j == h → f7 = f9 = f10 = 0 (f8 = holgura del retorno directo);
+    # j == i (self-loop) → las cuatro en 0 (tiene precedencia si i == h).
+    f7[is_h] = 0.0
+    f9[is_h] = 0.0
+    f10[is_h] = 0.0
+    for f in (f7, f8, f9, f10):
+        f[is_i] = 0.0
+
+    return np.stack([f7, f8, f9, f10], axis=-1).astype(np.float32)
+
+
+def _argumentos_continuacion(d, env, starts):
+    return (env.current_node, starts, env.time_elapsed, env.start_dow, d["T"], None, MAX_DURATION, d["p95"])
+
+
+@pytest.mark.parametrize("pasos,semilla", [(0, 0), (1, 1), (2, 2)])
+def test_con_indice_cero_las_features_de_continuacion_son_identicas_a_las_de_antes(datos, pasos, semilla):
+    env, activas, starts = _estados(datos, B=120, pasos=pasos, semilla=semilla)
+    cur, st, t, dow0, T, _, mx, p95 = _argumentos_continuacion(datos, env, starts)
+    nuevo = build_continuation_features_batch(cur, st, t, dow0, T, datos["ev"], mx, p95, np.zeros((len(st), N)))
+    anterior = _continuacion_sin_indice(cur, st, t, dow0, T, datos["ev"].ev, mx, p95)
+    assert np.array_equal(nuevo, anterior)
+
+
+def test_estados_que_cruzan_el_limite_de_un_dia_y_valores_de_h_distintos(datos):
+    """Con tiempos cerca de múltiplos de 14 h el h de los arcos cambia: coincide con la referencia con loops,
+    y se ven h = 0 y h > 0."""
+    env, activas, starts = _estados(datos, B=200, pasos=1, semilla=11)
+    t = env.time_elapsed
+    cerca = np.flatnonzero((np.abs(t - 14.0 * np.round(t / 14.0)) < 4.0) & (t > 0))
+    assert len(cerca) > 3
+    feats = _features(datos, env, starts)
+    for b in cerca[:10]:
+        np.testing.assert_allclose(feats[b, :, 7:11], _referencia(datos, env, starts, b), atol=1e-6)
+    llegadas = t[:, None] + datos["T"][env.current_node, :]
+    h = (llegadas // 14).astype(int) - (t // 14).astype(int)[:, None]
+    assert (h == 0).any() and (h >= 1).any()
+
+
+def test_subir_el_indice_de_un_nodo_sube_su_valor_esperado_de_volver_a_casa(datos):
+    env, activas, starts = _estados(datos, B=60, pasos=1, semilla=6)
+    cur, st, t, dow0, T, _, mx, p95 = _argumentos_continuacion(datos, env, starts)
+    bajo = build_continuation_features_batch(cur, st, t, dow0, T, datos["ev"], mx, p95, np.full((len(st), N), -0.05))
+    alto = build_continuation_features_batch(cur, st, t, dow0, T, datos["ev"], mx, p95, np.full((len(st), N), 0.05))
+    assert (alto[:, :, 2] >= bajo[:, :, 2] - 1e-7).all() and (alto[:, :, 3] >= bajo[:, :, 3] - 1e-7).all()
+    assert (alto[:, :, 2] > bajo[:, :, 2]).any()
+
+
+def test_la_tabla_q_es_la_misma_de_b2p(datos):
+    b2p = PoliticaB2P(datos["market"], datos["T"], datos["dist"], datos["diesel"])
+    assert np.array_equal(b2p._Q, datos["ev"].q) and np.array_equal(b2p._E0, datos["ev"].ev)
+    assert np.array_equal(b2p.b, datos["ev"].b) and datos["ev"].q.shape[0] == datos["ev"].h_max + 1

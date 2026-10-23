@@ -64,6 +64,39 @@ def calcular_ev_esperado(market, distance_arr, diesel_arr) -> np.ndarray:
     return prob * q_medio[None] * distance_arr[None] - costo[None]    # (7, N, N)
 
 
+@dataclass(frozen=True)
+class EvEsperado:
+    """Valor esperado por lane con pronóstico del índice de mercado (tabla compartida por B2P y el encoder).
+
+    Para un arco j→l que sale de j un día de mercado `dow` de la semana, h días de mercado después de hoy:
+
+        ev_ajustado(h, dow)[j, l] = ev[dow, j, l] + índice(j, hoy) · q[h, dow, j, l]
+
+    ev (7, N, N)      : calcular_ev_esperado (tarifa media de la lane; el valor con índice cero)
+    q  (H+1, 7, N, N) : b_h · P(N_jl ≥ 1) · dist_jl, con b_h = f + (1 − f) · ρ^h
+    b  (H+1,)         : los coeficientes b_h (f = fracción de varianza lenta del índice, ρ = persistencia del rápido)
+    """
+    ev: np.ndarray
+    q:  np.ndarray
+    b:  np.ndarray
+
+    @property
+    def h_max(self) -> int:
+        return self.q.shape[0] - 1
+
+
+def calcular_ev_pronostico(market, distance_arr, diesel_arr) -> EvEsperado:
+    """Tabla de valores esperados por lane con pronóstico del índice (ver EvEsperado); una vez por nº de nodos."""
+    p = market.params
+    ev = calcular_ev_esperado(market, distance_arr, diesel_arr)
+    b = p.frac_var_lento + (1.0 - p.frac_var_lento) * p.rho ** np.arange(MARKET_DIAS_EPISODIO)   # h = 0 … H
+    phi = p.phi[p.grupo]
+    m = p.mu[None, :, :] * p.s[:, None, None]
+    prob = 1.0 - (phi[None] / (phi[None] + m)) ** phi[None]                                        # P(N ≥ 1) (7, N, N)
+    q = b[:, None, None, None] * (prob * distance_arr[None])[None]                                 # (H+1, 7, N, N)
+    return EvEsperado(ev=ev, q=q, b=b)
+
+
 class PoliticaB1:
     """B1, greedy miope (PFA): arco válido de mayor `lane_reward` según la fila observada.
 
@@ -170,7 +203,8 @@ class PoliticaB2P(PoliticaB2):
 
         E[r_jl | h] = P(N_jl ≥ 1) · (q̄_jl + b_h · índice_j) · dist_jl − c_jl
 
-    es lineal en el índice, así que se precalculan las tablas por h y día de la semana:
+    es lineal en el índice, así que se precalculan las tablas por h y día de la semana
+    (`calcular_ev_pronostico`, compartida con las features de continuación del DRL):
     E0[dow] = ev de B2 (b = 0) y Q[h, dow] = b_h · P(N ≥ 1) · dist; por decisión, ev(h, dow) =
     E0[dow] + índice[:, None] · Q[h, dow] (N×N). Con b_h = 0 (índice cero) B2P coincide con B2.
 
@@ -186,13 +220,11 @@ class PoliticaB2P(PoliticaB2):
         super().__init__(market, time_matrix, distance_arr, diesel_arr, max_duration, dt)
         p = market.params
         self.f, self.rho = float(p.frac_var_lento), float(p.rho)
-        self._h_max = MARKET_DIAS_EPISODIO - 1
-        self.b = self.f + (1.0 - self.f) * self.rho ** np.arange(self._h_max + 1)         # (H+1,)
-        phi = p.phi[p.grupo]
-        m = p.mu[None, :, :] * p.s[:, None, None]
-        prob = 1.0 - (phi[None] / (phi[None] + m)) ** phi[None]                            # P(N ≥ 1) (7, N, N)
-        self._E0 = self._ev                                                                # b = 0
-        self._Q = self.b[:, None, None, None] * (prob * distance_arr[None])[None]          # (H+1, 7, N, N)
+        tabla = calcular_ev_pronostico(market, distance_arr, diesel_arr)                   # la misma que usa el encoder
+        self._h_max = tabla.h_max
+        self.b = tabla.b                                                                   # (H+1,)
+        self._E0 = tabla.ev                                                                # b = 0
+        self._Q = tabla.q                                                                  # (H+1, 7, N, N)
         self._casa = {}                                                                    # h → (f_jl + f_lh, l ∉ {j, h})
 
     def _tabla_casa(self, h):

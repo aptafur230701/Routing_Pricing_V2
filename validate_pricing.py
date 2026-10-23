@@ -44,7 +44,7 @@ from attention_encoder import (
     build_node_features_batch, build_temporal_features_batch, build_market_features_batch,
     build_budget_features_batch, build_dow_features_batch,
 )
-from baselines import calcular_ev_esperado
+from baselines import calcular_ev_pronostico
 from evaluation import disenar_mundos, make_sim_env
 from market_process import MarketProcess, asegurar_parametros
 from pricing import lane_cost_row, percentil_historico, reservation_price
@@ -80,7 +80,7 @@ class Escenario:
         self.rate_train, self.loads_train = rate_stack[:TRAIN_DAYS], loads_stack[:TRAIN_DAYS]
         self.time_matrix = time_matrix
         self.ltr, self.trucks, self.avail, self.p95 = ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95
-        self.ev = ev_esperado if ev_esperado is not None else calcular_ev_esperado(market, distance_arr, diesel_arr)
+        self.ev = ev_esperado if ev_esperado is not None else calcular_ev_pronostico(market, distance_arr, diesel_arr)
         self.device = next(agent.parameters()).device
 
     def make_env(self):
@@ -533,7 +533,7 @@ def cargar_datos(num_nodes):
         time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack, distance_arr=distance_arr,
         diesel_arr=diesel_arr, ltr_stack=ltr_stack, trucks_stack=trucks_stack,
         avail_expected_arr=avail_expected_arr, reward_global_p95=reward_global_p95, market=market,
-        ev_esperado=calcular_ev_esperado(market, distance_arr, diesel_arr),
+        ev_esperado=calcular_ev_pronostico(market, distance_arr, diesel_arr),
     )
 
 

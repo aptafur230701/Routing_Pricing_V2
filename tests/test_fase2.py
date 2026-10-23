@@ -14,7 +14,7 @@ import torch
 
 import am_training
 from am_agent import AMRoutingAgent
-from baselines import calcular_ev_esperado
+from baselines import calcular_ev_pronostico
 from config import TRAIN_DAYS, K_MAX, PPO_LR, LR_FINAL_FRAC, CKPT_WINDOW, DEVICE
 import evaluation as ev
 from market_process import MarketProcess, asegurar_parametros
@@ -94,7 +94,7 @@ def test_validacion_reporta_diferencia_pareada_contra_b3(datos):
     val = am_training.ValidacionSimulada(
         d["market"], d["tm"], d["rate"][:TRAIN_DAYS], d["loads"][:TRAIN_DAYS], d["dist"], d["diesel"], N,
         np.asarray(d["tm"], dtype=float), d["ltr"], d["trucks"], d["p95"], d["avail"],
-        ev_esperado=calcular_ev_esperado(d["market"], d["dist"], d["diesel"]),
+        ev_esperado=calcular_ev_pronostico(d["market"], d["dist"], d["diesel"]),
     )
     for K, arr in val.b3_mundos.items():
         assert arr.shape == (val.M,)

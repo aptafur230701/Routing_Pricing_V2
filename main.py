@@ -38,7 +38,7 @@ from config import (
     get_episodes_per_node, TRAIN_DAYS,
     AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, USE_POST_HEAD,
 )
-from baselines import calcular_ev_esperado
+from baselines import calcular_ev_pronostico
 from problem_data import load_matrices
 from dp_relajada import cargar_o_calcular_tabla
 from evaluation import (
@@ -158,12 +158,12 @@ def _evaluate_and_report(
 ):
     """Evaluación en mundos simulados y replay + resumen + guardado de archivos.
 
-    Mundos simulados: DRL, B1, B2 y B3 sobre M mundos por nivel de K, con UB-PI y
+    Mundos simulados: DRL, B1, B2, B2P y B3 sobre M mundos por nivel de K, con UB-PI y
     UB-DP. Replay: el mismo arnés sobre los días reales de evaluación (TRAIN_DAYS en adelante),
     fuera de muestra: ni el entrenamiento ni el ajuste del proceso exógeno usaron esos días.
     """
     tabla = cargar_o_calcular_tabla(market_process, time_matrix, distance_arr, diesel_arr)
-    # B1, B2, B3, UB-PI y UB-DP no dependen del DRL: se calculan una vez por nº de nodos y se reusan
+    # B1, B2, B2P, B3, UB-PI y UB-DP no dependen del DRL: se calculan una vez por nº de nodos y se reusan
     # entre corridas (semillas, ablaciones) mientras no cambien el proceso, la tabla V ni el diseño.
     cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos", "cache_eval")
 
@@ -274,7 +274,7 @@ def main():
     # el entrenamiento lo usa solo si USE_MARKET_PROCESS.
     asegurar_parametros()
     market_process = MarketProcess(NUM_NODES)
-    ev_esperado = calcular_ev_esperado(market_process, distance_arr, diesel_arr)   # una vez por nº de nodos
+    ev_esperado = calcular_ev_pronostico(market_process, distance_arr, diesel_arr)   # una vez por nº de nodos
 
     # ── Train / eval split (temporal — el modelo no ve los días de eval) ──────
     rate_train  = rate_stack[:TRAIN_DAYS]

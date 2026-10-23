@@ -81,7 +81,7 @@ import optuna
 import torch
 
 import am_training
-from baselines import calcular_ev_esperado
+from baselines import calcular_ev_pronostico
 from config import SEED
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
@@ -209,7 +209,7 @@ def run(num_nodes: int, n_trials: int, updates_per_trial: int,
     )
     # HPO entrena con días reales (sin market_process): el ev sale del proceso ajustado, una vez.
     asegurar_parametros()
-    data["ev_esperado"] = calcular_ev_esperado(MarketProcess(num_nodes), distance_arr, diesel_arr)
+    data["ev_esperado"] = calcular_ev_pronostico(MarketProcess(num_nodes), distance_arr, diesel_arr)
 
     n_episodes_per_update = _BASELINE["PPO_N_EPISODES_PER_UPDATE"]
     episodes_per_node_trial = int(np.ceil(updates_per_trial * n_episodes_per_update / num_nodes))
