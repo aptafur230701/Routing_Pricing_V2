@@ -58,7 +58,7 @@ _TAG_MUNDO = 1_000_000_007
 _VERSION_GENERADOR = "mercado-v1"          # entra en la firma: cambiar al modificar el generador
 _CACHE_MUNDOS_BYTES = 256_000_000          # tope del caché de mundos (LRU)
 _CLAVES_AJUSTE = ("media_lane", "min_lane", "lento_escenarios", "rho", "sigma", "residuos", "indice_std",
-                  "universo_indice", "ventana_lento")
+                  "universo_indice", "ventana_lento", "frac_var_lento")
 
 
 @dataclass
@@ -75,6 +75,7 @@ class MarketParams:
     rho:        float       # persistencia del rápido
     sigma:      np.ndarray  # (N,)       desviación de la innovación del rápido por nodo
     indice_std: float       # desviación del índice histórico (normaliza la feature del agente)
+    frac_var_lento: float   # fracción de la varianza del índice que es lento (ajuste)
     fecha_inicio: str
 
 
@@ -116,6 +117,7 @@ class MarketProcess:
                 rho=float(z["rho"]),
                 sigma=z["sigma"][:n].astype(np.float64),
                 indice_std=float(z["indice_std"]),
+                frac_var_lento=float(z["frac_var_lento"]),
                 fecha_inicio=str(z["fecha_inicio"]),
             )
             # Arreglos de los 194 nodos: el mundo se genera completo y se recorta a n (ver _mundo) y el
@@ -152,7 +154,7 @@ class MarketProcess:
         datos o el generador."""
         p, h = self.params, hashlib.sha256()
         for a in (p.s, p.mu, p.phi, p.grupo, p.media_lane, p.min_lane, p.residuos, p.lento_escenarios,
-                  p.sigma, np.array([p.rho, p.indice_std])):
+                  p.sigma, np.array([p.rho, p.indice_std, p.frac_var_lento])):
             h.update(np.ascontiguousarray(a).tobytes())
         h.update(repr((_VERSION_GENERADOR, self.num_nodes, self._n_total, self.n_dias_mundo,
                        p.fecha_inicio)).encode())

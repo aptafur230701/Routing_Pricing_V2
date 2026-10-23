@@ -211,6 +211,7 @@ def ejecutar_politica(politica, env, start_node, start_day_idx, k_max, world_see
             k_restante=int(env.k_remaining[0]) if env.k_restricted[0] else None,
             mascara=mascara.copy(),
             loads_row=loads_row, rate_row=rate_row, dia_semana_salida=int(dow0),
+            indice=env.market_index[0].copy() if getattr(politica, "usa_indice", False) else None,
         )
         t0 = time.perf_counter()
         a = int(politica.actuar(obs))

@@ -1,7 +1,8 @@
 """
 baselines.py
 ============
-Políticas baseline no anticipativas B1 y B2 (baselines_drl_ruteo_estocastico.md).
+Políticas baseline no anticipativas B1 y B2 (baselines_drl_ruteo_estocastico.md) y B2P (B2 con
+pronósticos del índice de mercado).
 B3 (política sobre la tabla V de la DP) vive en dp_relajada.py.
 
 Todas se ejecutan paso a paso en el entorno con la misma interfaz que el DRL: en cada
@@ -15,7 +16,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from config import MAX_DURATION, MPG, MARGINAL_COST_SIN_DIESEL, UBDP_DT_HORAS
+from config import (
+    MAX_DURATION, MPG, MARGINAL_COST_SIN_DIESEL, UBDP_DT_HORAS, MARKET_DIAS_EPISODIO,
+)
 from problem_data import lane_reward
 
 _DIA_HORAS = 14.0   # un día de mercado = 14 h (igual que RoutingEnv)
@@ -40,6 +43,7 @@ class Observacion:
     loads_row: np.ndarray
     rate_row: np.ndarray
     dia_semana_salida: int
+    indice: np.ndarray = None
 
 
 def calcular_ev_esperado(market, distance_arr, diesel_arr) -> np.ndarray:
@@ -149,3 +153,111 @@ class PoliticaB2:
                     mejor = v
         memo[clave] = float(mejor)
         return memo[clave]
+
+
+class PoliticaB2P(PoliticaB2):
+    """B2P, B2 con pronósticos del índice de mercado.
+
+    Igual que PoliticaB2 salvo en los valores esperados de los arcos futuros. Para un arco futuro j→l al
+    que se llega h días de mercado después de hoy, la tarifa esperada es
+
+        media_lane(jl) + b_h · índice(j, hoy),     b_h = f + (1 − f) · ρ^h
+
+    con f la fracción de varianza lenta del índice y ρ la persistencia del rápido (ambas del ajuste): la
+    mejor predicción lineal del índice de j h días adelante, dado el de hoy (el lento no decae y el rápido
+    decae como ρ^h). El índice de hoy es el que observa el camión (`Observacion.indice`). El arco actual
+    usa la fila observada, como en B2.
+
+        E[r_jl | h] = P(N_jl ≥ 1) · (q̄_jl + b_h · índice_j) · dist_jl − c_jl
+
+    es lineal en el índice, así que se precalculan las tablas por h y día de la semana:
+    E0[dow] = ev de B2 (b = 0) y Q[h, dow] = b_h · P(N ≥ 1) · dist; por decisión, ev(h, dow) =
+    E0[dow] + índice[:, None] · Q[h, dow] (N×N). Con b_h = 0 (índice cero) B2P coincide con B2.
+
+    Como los valores esperados dependen del índice de hoy, la mejor continuación no se puede memorizar
+    entre decisiones: se recalcula en cada nodo con una recursión hacia atrás sobre las franjas, vectorizada
+    sobre los nodos (misma regla de factibilidad, franjas y retorno que B2).
+    """
+    nombre = "B2P"
+    usa_indice = True            # el arnés le pasa Observacion.indice
+
+    def __init__(self, market, time_matrix, distance_arr, diesel_arr, max_duration=MAX_DURATION,
+                 dt=UBDP_DT_HORAS):
+        super().__init__(market, time_matrix, distance_arr, diesel_arr, max_duration, dt)
+        p = market.params
+        self.f, self.rho = float(p.frac_var_lento), float(p.rho)
+        self._h_max = MARKET_DIAS_EPISODIO - 1
+        self.b = self.f + (1.0 - self.f) * self.rho ** np.arange(self._h_max + 1)         # (H+1,)
+        phi = p.phi[p.grupo]
+        m = p.mu[None, :, :] * p.s[:, None, None]
+        prob = 1.0 - (phi[None] / (phi[None] + m)) ** phi[None]                            # P(N ≥ 1) (7, N, N)
+        self._E0 = self._ev                                                                # b = 0
+        self._Q = self.b[:, None, None, None] * (prob * distance_arr[None])[None]          # (H+1, 7, N, N)
+        self._casa = {}                                                                    # h → (f_jl + f_lh, l ∉ {j, h})
+
+    def _tabla_casa(self, h):
+        if h not in self._casa:
+            base = self._f + self._f[:, h][None, :]                                        # (j, l): f_jl + f_lh
+            ok = (self._nodos[None, :] != self._nodos[:, None]) & (self._nodos[None, :] != h)
+            self._casa[h] = (base, ok)
+        return self._casa[h]
+
+    def _ev_dia(self, cache, dow0, dia_hoy, dia, indice):
+        """(N, N) valor esperado de los arcos que salen de un nodo al que se llega el día `dia` (h = dia − hoy)."""
+        if dia not in cache:
+            dow = (dow0 + dia) % 7
+            hh = min(max(dia - dia_hoy, 0), self._h_max)
+            cache[dia] = self._E0[dow] + indice[:, None] * self._Q[hh, dow]
+        return cache[dia]
+
+    def _valores(self, h, dow0, dia_hoy, indice, s_lo, k) -> np.ndarray:
+        """V[j, s] para s ≥ s_lo: mejor valor esperado de seguir desde j (llegada en la franja s, k arcos restantes
+        incluido el retorno; None = libre), con los pronósticos del índice de hoy."""
+        N, smax, dt = self.N, self._smax, self._dt
+        F, nodos = self._f, self._nodos
+        base, ok = self._tabla_casa(h)
+        cache = {}
+        dia_de = lambda s: int(s * dt / _DIA_HORAS + 1e-9)
+
+        def paso(s, V_sig, ev):
+            """V[:, s] a partir de V_sig[l, s'] (V_sig es la tabla del nivel k−1, o la propia en el caso libre)."""
+            mejor = ev[:, h].copy()                                                        # cerrar el ciclo desde j
+            factible = ok & (s + base <= smax)
+            if factible.any():
+                s_sig = np.minimum(s + F, smax)
+                cand = np.where(factible, ev + V_sig[nodos[None, :], s_sig], -np.inf)
+                mejor = np.maximum(mejor, cand.max(axis=1))
+            return mejor
+
+        if k is None:                                                                      # caso libre: s hacia atrás
+            V = np.zeros((N, smax + 1))
+            for s in range(smax, s_lo - 1, -1):
+                V[:, s] = paso(s, V, self._ev_dia(cache, dow0, dia_hoy, dia_de(s), indice))
+            return V
+        V = np.zeros((N, smax + 1))
+        for s in range(s_lo, smax + 1):                                                    # k = 1: solo el retorno
+            V[:, s] = self._ev_dia(cache, dow0, dia_hoy, dia_de(s), indice)[:, h]
+        for _ in range(2, int(k) + 1):                                                     # k ≥ 2: un nivel por arco
+            V_ant, V = V, np.zeros((N, smax + 1))
+            for s in range(s_lo, smax + 1):
+                V[:, s] = paso(s, V_ant, self._ev_dia(cache, dow0, dia_hoy, dia_de(s), indice))
+        return V
+
+    def actuar(self, obs: Observacion) -> int:
+        if obs.indice is None:
+            raise ValueError("B2P necesita Observacion.indice (el índice de mercado de hoy)")
+        i, h, dow0 = obs.nodo, obs.casa, obs.dia_semana_salida
+        acts = np.flatnonzero(obs.mascara)
+        r = lane_reward(obs.rate_row[acts], obs.loads_row[acts], self._dist[i, acts], self._diesel[i, acts])
+        k_sig = None if obs.k_restante is None else obs.k_restante - 1
+        s_a = np.minimum(np.floor((obs.tiempo + self._T[i, acts]) / self._dt + 1e-9).astype(np.int64), self._smax)
+        sigue = acts != h
+        if sigue.any():
+            dia_hoy = int(np.floor(obs.tiempo / self._dt + 1e-9) * self._dt / _DIA_HORAS + 1e-9)
+            V = self._valores(h, dow0, dia_hoy, np.asarray(obs.indice, dtype=float), int(s_a[sigue].min()), k_sig)
+        mejor, mejor_a = -np.inf, -1
+        for a, ra, sa, cont in zip(acts, r, s_a, sigue):
+            v = float(ra) + (float(V[a, sa]) if cont else 0.0)
+            if v > mejor:
+                mejor, mejor_a = v, int(a)
+        return mejor_a
