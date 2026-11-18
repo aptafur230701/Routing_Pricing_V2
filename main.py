@@ -40,9 +40,9 @@ from config import (
     get_episodes_per_node, TRAIN_DAYS,
     AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, USE_POST_HEAD,
 )
-from baselines import calcular_ev_pronostico
+from baselines.politicas import calcular_ev_pronostico
 from problem_data import load_matrices
-from dp_relajada import cargar_o_calcular_tabla
+from baselines.dp_relajada import cargar_o_calcular_tabla
 from evaluation import (
     evaluar_mundos_simulados, evaluar_replay, resumen_metodos,
     save_results, plot_diagnostics, plot_ppo_diagnostics,
@@ -66,7 +66,7 @@ def _run_am(
     NUM_NODES, time_matrix, rate_stack, loads_stack,
     distance_arr, diesel_arr, cwd,
     pretrained_agent=None, pretrained_critic=None,
-    ltr_stack=None, trucks_stack=None,
+    ltr_stack=None,
     reward_global_p95=1.0, avail_expected_arr=None,
     market_process=None, best_checkpoint_path=None, ev_esperado=None,
 ):
@@ -90,7 +90,7 @@ def _run_am(
         distance_arr, diesel_arr, NUM_NODES,
         pretrained_agent=pretrained_agent,
         pretrained_critic=pretrained_critic,
-        ltr_stack=ltr_stack, trucks_stack=trucks_stack,
+        ltr_stack=ltr_stack,
         reward_global_p95=reward_global_p95,
         avail_expected_arr=avail_expected_arr,
         market_process=market_process,
@@ -155,7 +155,7 @@ def _evaluate_and_report(
     agent, NUM_NODES, time_matrix, rate_stack, loads_stack,
     distance_arr, diesel_arr, ep_rewards, ep_losses,
     train_time, summary_rows, cwd, label,
-    ltr_stack=None, trucks_stack=None,
+    ltr_stack=None,
     avail_expected_arr=None, reward_global_p95=1.0, market_process=None,
     semilla_eval=MARKET_SEED_EVAL, sufijo_cache="",
 ):
@@ -174,7 +174,7 @@ def _evaluate_and_report(
     sim_df = evaluar_mundos_simulados(
         agent, market_process, tabla, time_matrix,
         rate_stack[:TRAIN_DAYS], loads_stack[:TRAIN_DAYS], distance_arr, diesel_arr, NUM_NODES,
-        ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95,
+        ltr_stack, avail_expected_arr, reward_global_p95,
         k_levels=tuple(K_TRAINING_LEVELS),
         cache_path=os.path.join(cache_dir, f"baselines_simulado_{NUM_NODES}nodos{sufijo_cache}.pkl"),
         semilla_eval=semilla_eval,
@@ -183,7 +183,7 @@ def _evaluate_and_report(
     replay_df = evaluar_replay(
         agent, market_process, tabla, time_matrix,
         rate_stack[TRAIN_DAYS:], loads_stack[TRAIN_DAYS:], distance_arr, diesel_arr, NUM_NODES,
-        ltr_stack[:, TRAIN_DAYS:], trucks_stack[:, TRAIN_DAYS:], avail_expected_arr, reward_global_p95,
+        ltr_stack[:, TRAIN_DAYS:], avail_expected_arr, reward_global_p95,
         k_levels=tuple(K_TRAINING_LEVELS),
         cache_path=os.path.join(cache_dir, f"baselines_replay_{NUM_NODES}nodos.pkl"),
     )
@@ -271,7 +271,7 @@ def main():
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
-        ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
+        ltr_stack, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
 
     # ── Proceso exógeno de cargas y tarifas ──────────────────────────────────
     # La evaluación (UB-PI, UB-DP, B2, B3 y los mundos simulados) lo necesita siempre;
@@ -299,7 +299,7 @@ def main():
             NUM_NODES, time_matrix, rate_train, loads_train,
             distance_arr, diesel_arr, checkpoint_dir,
             agent_pretrained, critic_pretrained,
-            ltr_stack=ltr_stack, trucks_stack=trucks_stack,
+            ltr_stack=ltr_stack,
             reward_global_p95=reward_global_p95,
             avail_expected_arr=avail_expected_arr,
             market_process=market_process if USE_MARKET_PROCESS else None,
@@ -335,7 +335,7 @@ def main():
         if RETRAIN_POST or not pricing_vigente(pricing_path, agent_am):
             datos = dict(
                 time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack, distance_arr=distance_arr,
-                diesel_arr=diesel_arr, ltr_stack=ltr_stack, trucks_stack=trucks_stack,
+                diesel_arr=diesel_arr, ltr_stack=ltr_stack,
                 avail_expected_arr=avail_expected_arr, reward_global_p95=reward_global_p95, market=market_process,
                 ev_esperado=ev_esperado,
             )
@@ -350,7 +350,7 @@ def main():
         agent_am, NUM_NODES, time_matrix, rate_stack, loads_stack,
         distance_arr, diesel_arr, ep_r, ep_l, t,
         summary_rows, output_dir, label="AM" if EVAL_SET == "dev" else "AM_final",
-        ltr_stack=ltr_stack, trucks_stack=trucks_stack,
+        ltr_stack=ltr_stack,
         avail_expected_arr=avail_expected_arr,
         reward_global_p95=reward_global_p95,
         market_process=market_process,
@@ -361,7 +361,7 @@ def main():
     if con_pricing and getattr(agent_am, "post_entrenadas", False):
         tablas = run_pricing_validation(
             agent_am, NUM_NODES, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-            ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95, market_process,
+            ltr_stack, avail_expected_arr, reward_global_p95, market_process,
             ev_esperado=ev_esperado, output_dir=output_dir, sim_df=sim_df, replay_df=replay_df,
             semilla_eval=MARKET_SEED_EVAL if EVAL_SET == "dev" else MARKET_SEED_EVAL_FINAL,
         )

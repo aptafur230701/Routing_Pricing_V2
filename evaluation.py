@@ -33,13 +33,12 @@ from config import (
     MAX_DURATION, K_MAX, TRAIN_DAYS, MARKET_DIAS_EPISODIO,
     MARKET_SEED_EVAL, MARKET_M_EVAL_WORLDS, REPLAY_MAX_CASOS, REWARD_SCALE_FACTOR,
 )
-from baselines import Observacion, PoliticaB1, PoliticaB2, PoliticaB2P, calcular_ev_pronostico
-from dp_relajada import PoliticaB3
+from baselines.politicas import Observacion, PoliticaB1, PoliticaB2, PoliticaB2P, PoliticaB3, calcular_ev_pronostico
 from greedy_rollout import greedy_rollout
 from pricing import crear_selector_q
 from problem_data import build_rm_pen_stack, lane_reward
 from routing_env import VectorRoutingEnv
-from Solvers import solve_ub_pi
+from baselines.ub_pi import solve_ub_pi
 from stats_analysis import gap_pct, ic_bootstrap_media, ub_dp_floja, NOTA_UB_DP_FLOJA
 
 _DIAS_SIMULADOS_UB_PI = MARKET_DIAS_EPISODIO   # días del mundo que cubren cualquier ruta (6: 77 h = 5,5 días de mercado)
@@ -68,15 +67,15 @@ def make_replay_env(time_matrix, rate_stack, loads_stack, distance_arr, diesel_a
         max_duration=MAX_DURATION,
         day_offset=day_offset,
         indice_stack=indice,
-        indice_std=None if market is None else market.params.indice_std,
+        indice_std=None if market is None else market.indice_std,
     )
 
 
 def make_sim_env(time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes, market):
     """Entorno de mundos simulados (cargas y tarifas sorteadas al llegar a cada nodo).
 
-    rate_stack / loads_stack solo fijan el último día con datos para las features
-    históricas (LTR, camiones); como en el entrenamiento, los días de entrenamiento.
+    rate_stack / loads_stack solo fijan el último día con datos para la feature
+    histórica de LTR; como en el entrenamiento, los días de entrenamiento.
     """
     return VectorRoutingEnv(
         time_matrix=time_matrix,
@@ -99,7 +98,6 @@ def rollout_drl_env(
     time_matrix_arr: np.ndarray,
     distance_arr:   np.ndarray,
     ltr_stack:      np.ndarray,
-    trucks_stack:   np.ndarray,
     num_nodes:      int,
     reward_global_p95: float      = 1.0,
     k_max:          int        = None,
@@ -124,7 +122,7 @@ def rollout_drl_env(
     res = greedy_rollout(
         agent, env,
         np.array([start_node], dtype=np.int64), np.array([start_day_idx], dtype=np.int64),
-        time_matrix_arr, distance_arr, trucks_stack, ltr_stack,
+        time_matrix_arr, distance_arr, ltr_stack,
         reward_global_p95, num_nodes,
         k_max_arr=[k_max],
         avail_expected_arr=avail_expected_arr,
@@ -258,12 +256,12 @@ class ContextoEval:
     """Datos y políticas comunes de una evaluación (simulada o replay)."""
 
     def __init__(self, agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
-                 ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95):
+                 ltr_stack, avail_expected_arr, reward_global_p95):
         self.agent_cpu = copy.deepcopy(agent).to("cpu").eval()   # DRL en CPU, un hilo
         self.market, self.tabla = market, tabla
         self.T = np.asarray(time_matrix, dtype=float)
         self.dist, self.diesel, self.N = distance_arr, diesel_arr, num_nodes
-        self.ltr, self.trucks = ltr_stack, trucks_stack
+        self.ltr = ltr_stack
         self.avail, self.p95 = avail_expected_arr, reward_global_p95
         self.ev = calcular_ev_pronostico(market, distance_arr, diesel_arr)   # una vez por evaluación
         # DRL-Q (argmax de Q con Ṽ = promedio de las cabezas A y B): solo si las cabezas están entrenadas.
@@ -292,7 +290,7 @@ def _ejecutar_drl(ctx, env, nodo, dia, K, world_seed, dow0, loads_stack=None, ra
         t0 = time.perf_counter()
         res = greedy_rollout(
             ctx.agent_cpu, envc, np.array([nodo], dtype=np.int64), np.array([dia], dtype=np.int64),
-            ctx.T, ctx.dist, ctx.trucks, ctx.ltr, ctx.p95, ctx.N,
+            ctx.T, ctx.dist, ctx.ltr, ctx.p95, ctx.N,
             k_max_arr=[K], avail_expected_arr=ctx.avail, world_seeds=seeds, device=torch.device("cpu"),
             ev_esperado=ctx.ev, selector=ctx.selector_q if q else None,
         )
@@ -306,7 +304,7 @@ def _ejecutar_drl(ctx, env, nodo, dia, K, world_seed, dow0, loads_stack=None, ra
 
 
 def ub_pi(time_matrix, distance_arr, diesel_arr, start_node, K, mundo, start_day_idx=0) -> tuple:
-    """UB-PI: mejor ruta con el mundo completo conocido, vía DP hacia atrás (Solvers.solve_ub_pi).
+    """UB-PI: mejor ruta con el mundo completo conocido, vía DP hacia atrás (baselines.ub_pi.solve_ub_pi).
 
     Estado (nodo, franja de UBPI_DT_HORAS, k): el camión puede revisitar nodos, así que no hay
     conjunto de visitados. La recompensa de salir de un nodo en una franja usa la fila del día
@@ -420,7 +418,7 @@ def _combinar(base: pd.DataFrame, drl: pd.DataFrame, k_levels) -> pd.DataFrame:
 
 
 def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, loads_train,
-                             distance_arr, diesel_arr, num_nodes, ltr_stack, trucks_stack,
+                             distance_arr, diesel_arr, num_nodes, ltr_stack,
                              avail_expected_arr, reward_global_p95,
                              M=MARKET_M_EVAL_WORLDS, k_levels=(K_MAX, None), verbose=True,
                              cache_path=None, semilla_eval=MARKET_SEED_EVAL) -> pd.DataFrame:
@@ -436,7 +434,7 @@ def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, load
         sola vez y se reusan entre corridas (mientras no cambie el proceso, la tabla V ni el diseño).
     """
     ctx = ContextoEval(agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
-                       ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95)
+                       ltr_stack, avail_expected_arr, reward_global_p95)
     env = make_sim_env(time_matrix, rate_train, loads_train, distance_arr, diesel_arr, num_nodes, market)
     dis = disenar_mundos(num_nodes, M, market, num_dias=rate_train.shape[0], semilla=semilla_eval)
 
@@ -519,19 +517,19 @@ def casos_replay(num_nodes: int, num_dias: int, max_casos: int = REPLAY_MAX_CASO
 
 
 def evaluar_replay(agent, market, tabla, time_matrix, rate_eval, loads_eval,
-                   distance_arr, diesel_arr, num_nodes, ltr_eval, trucks_eval,
+                   distance_arr, diesel_arr, num_nodes, ltr_eval,
                    avail_expected_arr, reward_global_p95,
                    k_levels=(K_MAX, None), max_casos=REPLAY_MAX_CASOS, verbose=True,
                    cache_path=None) -> pd.DataFrame:
-    """El mismo arnés con market_process=None sobre los días reales de evaluación (días 90-119).
+    """El mismo arnés con market_process=None sobre los días reales de prueba (oct 2026, fuera de muestra).
 
     Fuera de muestra respecto del proceso (se ajusta solo con los TRAIN_DAYS de
-    entrenamiento). ltr_eval / trucks_eval deben estar recortados a los mismos días que rate_eval.
+    entrenamiento). ltr_eval debe estar recortado a los mismos días que rate_eval.
     UB-PI se resuelve sobre el histórico; UB-DP no aplica (es la referencia del proceso simulado).
     cache_path : como en evaluar_mundos_simulados, para B1, B2, B2P, B3 y UB-PI.
     """
     ctx = ContextoEval(agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
-                       ltr_eval, trucks_eval, avail_expected_arr, reward_global_p95)
+                       ltr_eval, avail_expected_arr, reward_global_p95)
     env = make_replay_env(time_matrix, rate_eval, loads_eval, distance_arr, diesel_arr, num_nodes,
                           day_offset=TRAIN_DAYS, market=market)
     nodos, dias = casos_replay(num_nodes, rate_eval.shape[0], max_casos)

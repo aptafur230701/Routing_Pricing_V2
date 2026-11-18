@@ -12,7 +12,7 @@ import torch
 
 import inference
 import validate_pricing as vp
-from am_agent import AMRoutingAgent
+from model.agent import AMRoutingAgent
 from config import AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, TRAIN_DAYS, configurar_k
 
 NUM_NODES = 10

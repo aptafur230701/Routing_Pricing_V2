@@ -24,12 +24,12 @@ import pandas as pd
 import pytest
 import torch
 
-from am_agent import AMRoutingAgent
-from baselines import Observacion, PoliticaB1, PoliticaB2
+from model.agent import AMRoutingAgent
+from baselines.politicas import Observacion, PoliticaB1, PoliticaB2
 from config import (
     MAX_DURATION, TRAIN_DAYS, K_MAX, MARKET_SEED_TRAIN, MARKET_SEED_EVAL, MARKET_SEED_EVAL_FINAL,
 )
-from dp_relajada import calcular_tabla, _sortear_filas
+from baselines.dp_relajada import calcular_tabla, _sortear_filas
 import evaluation as ev
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices, lane_reward
@@ -51,7 +51,7 @@ class Instancia:
         asegurar_parametros()
         self.n = n
         (self.tm, self.rate, self.loads, self.dist, self.diesel,
-         self.ltr, self.trucks, self.avail, self.p95) = load_matrices(n)
+         self.ltr, self.avail, self.p95) = load_matrices(n)
         self.T = np.asarray(self.tm, dtype=float)
         self.market = MarketProcess(n)
         self.tabla = calcular_tabla(self.market, self.tm, self.dist, self.diesel, K=K_MAX, S=S)
@@ -61,7 +61,7 @@ class Instancia:
         return ev.evaluar_mundos_simulados(
             self.agent, self.market, self.tabla, self.tm,
             self.rate[:TRAIN_DAYS], self.loads[:TRAIN_DAYS], self.dist, self.diesel, self.n,
-            self.ltr, self.trucks, self.avail, self.p95, M=M, k_levels=k_levels, verbose=False,
+            self.ltr, self.avail, self.p95, M=M, k_levels=k_levels, verbose=False,
         )
 
 
@@ -230,7 +230,7 @@ def test_b3_alcanza_ub_dp_con_k_2(inst35):
     """Con K = 2 (casa → j → casa) la DP es exacta: B3 es la política óptima y su promedio debe
     coincidir con UB-DP salvo error de muestreo (V es optimista: máximo sobre S sorteos)."""
     ctx = ev.ContextoEval(inst35.agent, inst35.market, inst35.tabla, inst35.tm, inst35.dist,
-                          inst35.diesel, inst35.n, inst35.ltr, inst35.trucks, inst35.avail, inst35.p95)
+                          inst35.diesel, inst35.n, inst35.ltr, inst35.avail, inst35.p95)
     env = ev.make_sim_env(inst35.tm, inst35.rate[:TRAIN_DAYS], inst35.loads[:TRAIN_DAYS],
                           inst35.dist, inst35.diesel, inst35.n, inst35.market)
     dis = ev.disenar_mundos(inst35.n, 300, inst35.market)

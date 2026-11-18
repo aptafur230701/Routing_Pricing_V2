@@ -11,7 +11,7 @@ import pytest
 import torch
 
 import validate_pricing as vp
-from am_agent import AMRoutingAgent
+from model.agent import AMRoutingAgent
 from config import (
     AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, TRAIN_DAYS, MARKET_SEED_VAL, REWARD_SCALE_FACTOR as S, configurar_k,
 )
@@ -40,7 +40,7 @@ def esc(datos):
     agent.post_entrenadas = True
     d = datos
     return vp.Escenario(agent, NUM_NODES, d["time_matrix"], d["rate_stack"][:TRAIN_DAYS], d["loads_stack"][:TRAIN_DAYS],
-                        d["distance_arr"], d["diesel_arr"], d["ltr_stack"], d["trucks_stack"], d["avail_expected_arr"],
+                        d["distance_arr"], d["diesel_arr"], d["ltr_stack"], d["avail_expected_arr"],
                         d["reward_global_p95"], d["market"], d["ev_esperado"])
 
 
@@ -107,7 +107,7 @@ def test_recolectar_q_coincide_con_greedy_rollout_con_selector(esc, mundos, dato
         margen[r["b"]] += r["r_raw"]
     d = datos
     res = greedy_rollout(esc.agent, esc.make_env(), dis["nodo"], dis["start_day"], np.asarray(d["time_matrix"], float),
-                         d["distance_arr"], d["trucks_stack"], d["ltr_stack"], d["reward_global_p95"], NUM_NODES,
+                         d["distance_arr"], d["ltr_stack"], d["reward_global_p95"], NUM_NODES,
                          k_max_arr=k, avail_expected_arr=d["avail_expected_arr"], world_seeds=dis["world_seed"],
                          ev_esperado=d["ev_esperado"], selector=esc.selector_q, device=torch.device("cpu"))
     np.testing.assert_allclose(margen, res.raw_reward, atol=1e-3)

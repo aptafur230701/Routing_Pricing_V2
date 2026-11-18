@@ -13,12 +13,12 @@ import pytest
 import torch
 
 import am_training
-from am_agent import AMRoutingAgent
-from baselines import calcular_ev_pronostico
+from model.agent import AMRoutingAgent
+from baselines.politicas import calcular_ev_pronostico
 from config import TRAIN_DAYS, K_MAX, PPO_LR, LR_FINAL_FRAC, CKPT_WINDOW, DEVICE
 import evaluation as ev
 from market_process import MarketProcess, asegurar_parametros
-from dp_relajada import calcular_tabla
+from baselines.dp_relajada import calcular_tabla
 from problem_data import load_matrices
 
 N = 10
@@ -27,8 +27,8 @@ N = 10
 @pytest.fixture(scope="module")
 def datos():
     asegurar_parametros()
-    (tm, rate, loads, dist, diesel, ltr, trucks, avail, p95) = load_matrices(N)
-    return dict(tm=tm, rate=rate, loads=loads, dist=dist, diesel=diesel, ltr=ltr, trucks=trucks,
+    (tm, rate, loads, dist, diesel, ltr, avail, p95) = load_matrices(N)
+    return dict(tm=tm, rate=rate, loads=loads, dist=dist, diesel=diesel, ltr=ltr,
                 avail=avail, p95=p95, market=MarketProcess(N))
 
 
@@ -40,7 +40,7 @@ def _entrenar(d, monkeypatch, tmp_path, n_updates=20, **cfg):
     ruta = str(tmp_path / "best.pt")
     *_, log = am_training.run_am_training(
         d["tm"], d["rate"][:TRAIN_DAYS], d["loads"][:TRAIN_DAYS], d["dist"], d["diesel"], N,
-        ltr_stack=d["ltr"], trucks_stack=d["trucks"], reward_global_p95=d["p95"],
+        ltr_stack=d["ltr"], reward_global_p95=d["p95"],
         avail_expected_arr=d["avail"], market_process=d["market"], best_checkpoint_path=ruta,
     )
     return log, ruta
@@ -93,7 +93,7 @@ def test_validacion_reporta_diferencia_pareada_contra_b3(datos):
     d = datos
     val = am_training.ValidacionSimulada(
         d["market"], d["tm"], d["rate"][:TRAIN_DAYS], d["loads"][:TRAIN_DAYS], d["dist"], d["diesel"], N,
-        np.asarray(d["tm"], dtype=float), d["ltr"], d["trucks"], d["p95"], d["avail"],
+        np.asarray(d["tm"], dtype=float), d["ltr"], d["p95"], d["avail"],
         ev_esperado=calcular_ev_pronostico(d["market"], d["dist"], d["diesel"]),
     )
     for K, arr in val.b3_mundos.items():
@@ -114,7 +114,7 @@ def test_cache_de_baselines_reproduce_el_calculo_directo(datos, tmp_path):
     a1 = AMRoutingAgent(num_nodes=N, d_h=32, n_heads=4, n_layers=1, d_ff=64, device=torch.device("cpu"))
     a2 = AMRoutingAgent(num_nodes=N, d_h=32, n_heads=4, n_layers=1, d_ff=64, device=torch.device("cpu"))
     args = (d["market"], tabla, d["tm"], d["rate"][:TRAIN_DAYS], d["loads"][:TRAIN_DAYS], d["dist"],
-            d["diesel"], N, d["ltr"], d["trucks"], d["avail"], d["p95"])
+            d["diesel"], N, d["ltr"], d["avail"], d["p95"])
     cache = str(tmp_path / "c" / "sim.pkl")
     directo = ev.evaluar_mundos_simulados(a1, *args, M=8, verbose=False)
     primero = ev.evaluar_mundos_simulados(a1, *args, M=8, verbose=False, cache_path=cache)

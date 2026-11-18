@@ -1,7 +1,7 @@
 """
 test_b2p.py
 ===========
-B2P (B2 con pronósticos del índice de mercado, baselines.py):
+B2P (B2 con pronósticos del índice de mercado, baselines/politicas.py):
 
   · b_h = f + (1 − f) · ρ^h: b_0 = 1 y decrece hacia f.
   · los valores esperados por h y día de la semana son media_lane + b_h · índice (tabla precalculada).
@@ -13,7 +13,7 @@ B2P (B2 con pronósticos del índice de mercado, baselines.py):
 import numpy as np
 import pytest
 
-from baselines import Observacion, PoliticaB2, PoliticaB2P
+from baselines.politicas import Observacion, PoliticaB2, PoliticaB2P
 from config import MAX_DURATION, MPG, MARGINAL_COST_SIN_DIESEL, TRAIN_DAYS, UBDP_DT_HORAS
 from evaluation import ejecutar_politica, make_replay_env, make_sim_env
 from market_process import MarketProcess, asegurar_parametros
@@ -33,26 +33,26 @@ def d():
 
 
 def test_b_h_es_la_mejor_prediccion_lineal(d):
-    p, b = d["mp"].params, d["b2p"].b
-    f, rho = p.frac_var_lento, p.rho
+    mp, b = d["mp"], d["b2p"].b
+    f, rho = mp.frac_var_lento, mp.rho
     assert b[0] == pytest.approx(1.0)
     assert np.allclose(b, f + (1 - f) * rho ** np.arange(len(b)))
     assert (np.diff(b) < 0).all() and b[-1] > f
 
 
 def test_tabla_por_h_es_media_lane_mas_b_h_por_indice(d):
+    """ev_dia(h, dow, dia, índice) = ev_empírico[dow] + b_h · prob_empírico[dow] · dist − el ev_empírico ya
+    resta el costo (ver baselines.politicas._promedios_empiricos_por_dow / calcular_ev_pronostico)."""
+    from baselines.politicas import _promedios_empiricos_por_dow
     mp, pol = d["mp"], d["b2p"]
-    p = mp.params
-    phi = p.phi[p.grupo]
+    ev_bruto, prob = _promedios_empiricos_por_dow(mp, d["dist"])
     costo = d["dist"] * (d["diesel"] / MPG) + d["dist"] * MARGINAL_COST_SIN_DIESEL
     rng = np.random.default_rng(0)
     idx = rng.normal(0, 0.1, N)
     for dia_hoy, dia in ((0, 0), (2, 5), (3, 3)):
         h = dia - dia_hoy
         dow = (4 + dia) % 7
-        m = p.mu * p.s[dow]
-        prob = 1 - (phi / (phi + m)) ** phi
-        esperado = prob * (p.media_lane + pol.b[h] * idx[:, None]) * d["dist"] - costo
+        esperado = ev_bruto[dow] - costo + pol.b[h] * prob[dow] * d["dist"] * idx[:, None]
         np.testing.assert_allclose(pol._ev_dia({}, 4, dia_hoy, dia, idx), esperado, rtol=1e-12, atol=1e-9)
 
 

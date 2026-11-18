@@ -26,7 +26,7 @@ import pandas as pd
 from config import (
     SEED, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, K_MAX, TRAIN_DAYS, MARKET_M_EVAL_WORLDS,
 )
-from dp_relajada import cargar_o_calcular_tabla
+from baselines.dp_relajada import cargar_o_calcular_tabla
 from evaluation import evaluar_mundos_simulados, resumen_metodos
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
@@ -62,7 +62,7 @@ def run(num_nodes: int, k_levels, n_worlds: int, checkpoint_dir: str = None,
     agent.eval()
 
     time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
-        ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95 = load_matrices(num_nodes)
+        ltr_stack, avail_expected_arr, reward_global_p95 = load_matrices(num_nodes)
 
     asegurar_parametros()
     market = MarketProcess(num_nodes)
@@ -72,7 +72,7 @@ def run(num_nodes: int, k_levels, n_worlds: int, checkpoint_dir: str = None,
     df = evaluar_mundos_simulados(
         agent, market, tabla, time_matrix,
         rate_stack[:TRAIN_DAYS], loads_stack[:TRAIN_DAYS], distance_arr, diesel_arr, num_nodes,
-        ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95,
+        ltr_stack, avail_expected_arr, reward_global_p95,
         M=n_worlds, k_levels=tuple(k_levels),
     )
     resumen = resumen_metodos(df)

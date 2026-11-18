@@ -1,7 +1,7 @@
 """
 test_solvers_k_cardinality.py
 ===============================
-Criterio de aceptación: la DP hacia atrás de UB-PI (único solver que conserva Solvers.py)
+Criterio de aceptación: la DP hacia atrás de UB-PI (único solver que conserva baselines/ub_pi.py)
 honra el presupuesto de cardinalidad K (≤ K arcos, incluido el retorno) por construcción
 — la dimensión k del estado —.
 
@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from config import K_LEVELS
-from Solvers import solve_ub_pi
+from baselines.ub_pi import solve_ub_pi
 
 N = 9   # el camión puede revisitar nodos, así que K puede ser binding con cualquier N.
 

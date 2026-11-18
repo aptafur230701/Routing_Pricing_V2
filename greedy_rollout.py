@@ -20,7 +20,7 @@ import torch
 
 from config import MAX_DURATION, DEVICE
 from routing_env import max_pasos
-from attention_encoder import (
+from model.encoder import (
     build_node_features_batch,
     build_temporal_features_batch,
     build_market_features_batch,
@@ -56,7 +56,6 @@ def greedy_rollout(
     start_day_idxs:     np.ndarray,          # (B,) int64
     time_matrix_arr:    np.ndarray,
     distance_arr:       np.ndarray,
-    trucks_stack:       np.ndarray,
     ltr_stack:          np.ndarray,
     reward_global_p95:  float,
     num_nodes:          int,
@@ -66,7 +65,7 @@ def greedy_rollout(
                                              # rollout muestreado hacen que ambos vean el mismo mundo
     max_duration:       float      = MAX_DURATION,
     device:             torch.device = None,   # dispositivo del agente (default: DEVICE de config)
-    ev_esperado:        np.ndarray = None,   # EvEsperado, calcular_ev_pronostico (baselines.py); obligatorio con
+    ev_esperado:        np.ndarray = None,   # EvEsperado, calcular_ev_pronostico (baselines/politicas.py); obligatorio con
                                              # USE_CONTINUATION_FEATURES (features de continuación f7–f10)
     selector:           callable   = None,   # fn(h_t, embeddings, masks, env) → (B,) int64: reemplaza el argmax del actor
                                              # (p. ej. el argmax de Q de DRL-Q, pricing.crear_selector_q). None ⇒ actor greedy.
@@ -113,7 +112,6 @@ def greedy_rollout(
                     cur_nodes, start_nodes,
                     None, time_matrix_arr, distance_arr,
                     day_idx, num_nodes, max_duration,
-                    trucks_stack_raw=trucks_stack,
                     reward_global_p95=reward_global_p95,
                     avail_expected_arr=avail_expected_arr,
                     reward_rows=env.reward_rows,

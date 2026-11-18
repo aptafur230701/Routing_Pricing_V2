@@ -16,12 +16,12 @@ El camión puede volver a pasar por un nodo intermedio dentro del tour. Pruebas 
 import numpy as np
 import pytest
 
-from baselines import Observacion, PoliticaB2
+from baselines.politicas import Observacion, PoliticaB2
 from config import MAX_DURATION
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import build_rm_pen_stack, lane_reward, load_matrices
 from routing_env import RoutingEnv, VectorRoutingEnv, max_pasos
-from Solvers import solve_ub_pi
+from baselines.ub_pi import solve_ub_pi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Máscara con revisitas: RoutingEnv == VectorRoutingEnv

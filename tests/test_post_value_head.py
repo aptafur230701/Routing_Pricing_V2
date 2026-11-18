@@ -9,9 +9,9 @@ import pytest
 import torch
 
 import config
-from am_agent import AMRoutingAgent
-from attention_encoder import N_NODE_FEATURES
-from critic_head import PostDecisionValueHead
+from model.agent import AMRoutingAgent
+from model.encoder import N_NODE_FEATURES
+from model.critic_head import PostDecisionValueHead
 
 D_H = 32
 

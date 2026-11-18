@@ -19,10 +19,10 @@ import pytest
 import torch
 
 from config import DEVICE, K_LEVELS, REWARD_SCALE_FACTOR, TIME_VIOLATION_PENALTY
-from am_agent import AMRoutingAgent
+from model.agent import AMRoutingAgent
 from greedy_rollout import greedy_rollout
 from problem_data import build_rm_pen_stack
-from baselines import EvEsperado
+from baselines.politicas import EvEsperado
 from routing_env import RoutingEnv, VectorRoutingEnv
 
 N = 9   # el camión puede revisitar nodos, así que con MAX_DURATION_SYN holgado cualquier K de K_LEVELS
@@ -39,13 +39,12 @@ def synthetic():
     diesel_arr   = np.ones((N, N)) * 3.0
     rate_stack   = np.ones((3, N, N)) * 5.0
     loads_stack  = np.ones((3, N, N)) * 5.0
-    trucks_stack = np.ones((N, 3, 3), dtype=np.float32) * 2.0
     ltr_stack    = np.ones((N, 3), dtype=np.float32) * 10.0
     rm_pen_stack = build_rm_pen_stack(rate_stack, loads_stack, distance_arr, diesel_arr)
     return dict(
         time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack,
         distance_arr=distance_arr, diesel_arr=diesel_arr,
-        trucks_stack=trucks_stack, ltr_stack=ltr_stack, rm_pen_stack=rm_pen_stack,
+        ltr_stack=ltr_stack, rm_pen_stack=rm_pen_stack,
         ev_esperado=EvEsperado(                                                    # features de continuación
             ev=np.random.RandomState(0).uniform(-50, 200, size=(7, N, N)),
             q=np.random.RandomState(2).uniform(0, 50, size=(6, 7, N, N)), b=np.linspace(1.0, 0.5, 6)),
@@ -75,7 +74,7 @@ def _run(agent, env, synthetic, k_max):
     return greedy_rollout(
         agent, env, starts, np.zeros(N, dtype=np.int64),
         synthetic["time_matrix"], synthetic["distance_arr"],
-        synthetic["trucks_stack"], synthetic["ltr_stack"],
+        synthetic["ltr_stack"],
         reward_global_p95=1.0, num_nodes=N,
         k_max_arr=[k_max] * N, max_duration=MAX_DURATION_SYN,
         ev_esperado=synthetic["ev_esperado"],

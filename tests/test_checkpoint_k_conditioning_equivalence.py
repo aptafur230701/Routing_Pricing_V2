@@ -34,7 +34,7 @@ import pytest
 import numpy as np
 
 from config import TRAIN_DAYS
-from baselines import calcular_ev_pronostico
+from baselines.politicas import calcular_ev_pronostico
 from evaluation import make_replay_env, rollout_drl_env, ub_pi
 from market_process import MarketProcess, asegurar_parametros
 from transfer_learning import load_checkpoint_compatible
@@ -73,7 +73,7 @@ def loaded():
 def test_free_case_rollout_quality_vs_exact_optimum(loaded):
     agent, data = loaded
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-     ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95) = data
+     ltr_stack, avail_expected_arr, reward_global_p95) = data
     num_days = loads_stack.shape[0]
     time_matrix_np = np.asarray(time_matrix, dtype=float)
     asegurar_parametros()
@@ -86,7 +86,7 @@ def test_free_case_rollout_quality_vs_exact_optimum(loaded):
         for start_node in range(NUM_NODES):
             route, reward, _ = rollout_drl_env(
                 agent, env, start_node, day,
-                time_matrix_np, distance_arr, ltr_stack, trucks_stack, NUM_NODES,
+                time_matrix_np, distance_arr, ltr_stack, NUM_NODES,
                 reward_global_p95=reward_global_p95,
                 avail_expected_arr=avail_expected_arr,
                 k_max=None,   # caso libre — k_restricted=0

@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from config import MARKET_SEED_EVAL, MARKET_M_EVAL_WORLDS, TRAIN_DAYS, REPLAY_MAX_CASOS
-from baselines import PoliticaB2, PoliticaB2P
+from baselines.politicas import PoliticaB2, PoliticaB2P
 from evaluation import (
     disenar_mundos, ejecutar_politica, make_replay_env, make_sim_env, casos_replay, _UnHilo,
 )

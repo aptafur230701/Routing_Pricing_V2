@@ -50,7 +50,7 @@ from config import (
 from routing_env import VectorRoutingEnv, max_pasos
 from greedy_rollout import greedy_rollout
 from problem_data import build_rm_pen_stack
-from attention_encoder import (
+from model.encoder import (
     build_node_features_batch,
     build_temporal_features_batch,
     build_market_features_batch,
@@ -58,11 +58,11 @@ from attention_encoder import (
     build_dow_features_batch,
     N_DOW_FEATURES,
 )
-from am_agent import AMRoutingAgent
-from critic_head import CriticHead
-from baselines import calcular_ev_pronostico
-from debug_utils import check_tensor
-from dp_relajada import cargar_o_calcular_tabla, PoliticaB3
+from model.agent import AMRoutingAgent
+from model.critic_head import CriticHead
+from baselines.politicas import calcular_ev_pronostico, PoliticaB3
+from model.debug_utils import check_tensor
+from baselines.dp_relajada import cargar_o_calcular_tabla
 from evaluation import disenar_mundos, ejecutar_politica
 from market_process import MarketProcess, asegurar_parametros
 
@@ -324,7 +324,6 @@ def _evaluate_greedy(
     time_matrix_arr:  np.ndarray,
     distance_arr:     np.ndarray,
     ltr_stack:        np.ndarray,
-    trucks_stack:     np.ndarray,
     reward_global_p95: float,
     num_nodes:        int,
     eval_k_levels:    list = None,   # niveles de K por episodio (None ⇒ todos libres)
@@ -356,7 +355,7 @@ def _evaluate_greedy(
         agent, eval_env,
         np.asarray(eval_start_nodes, dtype=np.int64),
         np.asarray(eval_start_days,  dtype=np.int64),
-        time_matrix_arr, distance_arr, trucks_stack, ltr_stack,
+        time_matrix_arr, distance_arr, ltr_stack,
         reward_global_p95, num_nodes,
         k_max_arr=eval_k_levels,
         avail_expected_arr=avail_expected_arr,
@@ -378,7 +377,7 @@ class ValidacionSimulada:
     """
 
     def __init__(self, market_process, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-                 num_nodes, time_matrix_arr, ltr_stack, trucks_stack, reward_global_p95, avail_expected_arr,
+                 num_nodes, time_matrix_arr, ltr_stack, reward_global_p95, avail_expected_arr,
                  ev_esperado=None):
         M = get_val_worlds(num_nodes)
         dis = disenar_mundos(num_nodes, M, market_process, num_dias=rate_stack.shape[0],
@@ -389,7 +388,7 @@ class ValidacionSimulada:
         self.dias = np.tile(dis["start_day"], len(self.niveles))
         self.semillas = np.tile(dis["world_seed"], len(self.niveles))
         self.k_arr = [K for K in self.niveles for _ in range(M)]
-        self.args = (time_matrix_arr, distance_arr, trucks_stack, ltr_stack, reward_global_p95, num_nodes)
+        self.args = (time_matrix_arr, distance_arr, ltr_stack, reward_global_p95, num_nodes)
         self.avail = avail_expected_arr
         self.ev = ev_esperado
         self.env = VectorRoutingEnv(
@@ -452,8 +451,7 @@ def run_am_training(
     num_nodes:      int,
     pretrained_agent:  AMRoutingAgent = None,
     pretrained_critic: CriticHead     = None,
-    ltr_stack:         np.ndarray = None,   # [num_nodes, 120]
-    trucks_stack:      np.ndarray = None,   # [num_nodes, 120, 3]
+    ltr_stack:         np.ndarray = None,   # [num_nodes, num_days]
     reward_global_p95: float      = 1.0,
     avail_expected_arr: np.ndarray = None,  # [num_nodes, num_nodes]
     market_process = None,   # MarketProcess opcional (proceso exógeno de cargas y tarifas). None = días
@@ -479,8 +477,7 @@ def run_am_training(
     distance_arr   : np.ndarray [N, N]
     diesel_arr     : np.ndarray [N, N]
     num_nodes      : int
-    ltr_stack      : np.ndarray [num_nodes, 120] — LTR por hub y día
-    trucks_stack   : np.ndarray [num_nodes, 120, 3] — camiones por hub, día y delta
+    ltr_stack      : np.ndarray [num_nodes, num_days] — LTR por hub y día
     avail_expected_arr : np.ndarray [num_nodes, num_nodes] — E[loads] histórico
                      (train), usado solo como feature de entrada (avail_prior)
     market_process : MarketProcess | None — si se pasa, en cada llegada a un nodo las cargas y
@@ -603,7 +600,7 @@ def run_am_training(
         distance_arr=distance_arr,
         diesel_arr=diesel_arr,
         indice_stack=indice_train,
-        indice_std=mercado.params.indice_std,
+        indice_std=mercado.indice_std,
     )
     # Entorno del monitor greedy: replay de los días de entrenamiento (market_process=None),
     # aunque el entrenamiento use mundos simulados. Si ya hay rm_pen_stack se reutiliza.
@@ -618,7 +615,7 @@ def run_am_training(
         num_nodes=num_nodes,
         max_duration=MAX_DURATION,
         indice_stack=indice_train,
-        indice_std=mercado.params.indice_std,
+        indice_std=mercado.indice_std,
     )
     # Generador PROPIO de semillas de mundo (nunca el estado global de numpy): una
     # semilla por episodio y update, independiente de las decisiones del agente.
@@ -647,7 +644,7 @@ def run_am_training(
     if market_process is not None:
         val = ValidacionSimulada(
             market_process, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
-            time_matrix_arr, ltr_stack, trucks_stack, reward_global_p95, avail_expected_arr,
+            time_matrix_arr, ltr_stack, reward_global_p95, avail_expected_arr,
             ev_esperado=ev_esperado,
         )
         refs = " | ".join(
@@ -734,7 +731,6 @@ def run_am_training(
                         cur_nodes, start_nodes_arr,
                         rm_pen_stack, time_matrix_arr, distance_arr,
                         day_idx, num_nodes, MAX_DURATION,
-                        trucks_stack_raw=trucks_stack,
                         reward_global_p95=reward_global_p95,
                         avail_expected_arr=avail_expected_arr,
                         reward_rows=vec_env.reward_rows,
@@ -808,7 +804,7 @@ def run_am_training(
             with fases("greedy"):
                 greedy_ep_rewards = greedy_rollout(
                     agent, vec_env, start_nodes_arr, start_day_idxs,
-                    time_matrix_arr, distance_arr, trucks_stack, ltr_stack,
+                    time_matrix_arr, distance_arr, ltr_stack,
                     reward_global_p95, num_nodes,
                     k_max_arr=k_max_arr,
                     avail_expected_arr=avail_expected_arr,
@@ -1173,7 +1169,7 @@ def run_am_training(
                 with fases("validacion"):
                     greedy_reward, greedy_valid_rate = _evaluate_greedy(
                         agent, eval_env, eval_start_nodes, eval_start_days,
-                        time_matrix_arr, distance_arr, ltr_stack, trucks_stack,
+                        time_matrix_arr, distance_arr, ltr_stack,
                         reward_global_p95, num_nodes,
                         eval_k_levels=eval_k_levels,
                         avail_expected_arr=avail_expected_arr,

@@ -2,6 +2,17 @@
 
 Carlos Vergara · octubre de 2026
 
+> **Nota (nov 2026).** El generador de cargas y tarifas que describe este documento (binomial
+> negativa con tasa global `mu_ij·s_d` + tarifa = `media_lane + índice + residuo`, ajustado sobre
+> 120 días ene–abr 2026) fue **reemplazado** por el de
+> [metodologia_realizaciones_mercado_reefer.md](metodologia_realizaciones_mercado_reefer.md), que
+> usa días reales de jun–oct 2026 y cuantiles reales en vez de un modelo paramétrico de tarifas.
+> Lo que SÍ sigue vigente de este documento es el **índice de mercado por nodo** (lento/rápido
+> AR(1), ρ, σ_i, frac_var_lento) — se conserva tal cual, solo repuntado a los datos nuevos y ya no
+> simulado por "mundo" (el índice de cualquier día es ahora un dato observado directo, porque los
+> episodios siempre recorren días reales). Lo demás de este documento (fases 1-2 y la fase 3 vieja
+> del modelo de tarifas) queda como referencia histórica del diseño anterior.
+
 Cada vez que el agente llega a un nodo, el proceso sortea cuántas cargas hay en cada lane que sale de él y a qué tarifa por milla. Se estima del histórico con dos modelos, uno de conteos y otro de tarifas, y no depende de las decisiones del agente.
 
 ## Contexto y motivación

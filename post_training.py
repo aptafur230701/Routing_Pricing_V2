@@ -37,7 +37,7 @@ from config import (
     AM_D_FF, POST_N_EJEMPLOS, POST_N_VAL, POST_LR, POST_BATCH, POST_EPOCHS, POST_PACIENCIA,
     MARKET_SEED_POST_TRAIN, MARKET_SEED_POST_VAL, POST_HIDDEN, POST_SEED_A, POST_SEED_B,
 )
-from critic_head import PostDecisionValueHead
+from model.critic_head import PostDecisionValueHead
 from evaluation import disenar_mundos
 from validate_pricing import Escenario, cargar_datos
 
@@ -209,7 +209,7 @@ def entrenar_cabezas_post(agent, critic, datos: dict, num_nodes: int, destino: s
     agent.eval()
     esc = Escenario(agent, num_nodes, datos["time_matrix"], datos["rate_stack"][:TRAIN_DAYS],
                     datos["loads_stack"][:TRAIN_DAYS], datos["distance_arr"], datos["diesel_arr"], datos["ltr_stack"],
-                    datos["trucks_stack"], datos["avail_expected_arr"], datos["reward_global_p95"], datos["market"],
+                    datos["avail_expected_arr"], datos["reward_global_p95"], datos["market"],
                     datos["ev_esperado"])
     t0 = time.time()
     if verbose:

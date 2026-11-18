@@ -50,11 +50,11 @@ from config import (
     N_EST_CONTRAFACTUAL, N_MUNDOS_CONTRAFACTUAL, BE_MARGEN, INDICE_DISPERSION_SEMANAL, MARKET_M_EVAL_WORLDS,
     BOOTSTRAP_B, BOOTSTRAP_SEED,
 )
-from attention_encoder import (
+from model.encoder import (
     build_node_features_batch, build_temporal_features_batch, build_market_features_batch,
     build_budget_features_batch, build_dow_features_batch,
 )
-from baselines import calcular_ev_pronostico
+from baselines.politicas import calcular_ev_pronostico
 from evaluation import disenar_mundos, make_sim_env, make_replay_env, casos_replay, _etiqueta_k
 from market_process import MarketProcess, asegurar_parametros
 from pricing import (
@@ -81,13 +81,13 @@ class Escenario:
     """Datos del problema y rollouts por lotes sobre mundos simulados o sobre el replay de los días de evaluación.
 
     modo="simulado": rate_stack/loads_stack = días de entrenamiento (fijan el último día con datos del entorno).
-    modo="replay"  : rate_stack/loads_stack = días de evaluación (TRAIN_DAYS en adelante) y ltr/trucks recortados
+    modo="replay"  : rate_stack/loads_stack = días de evaluación (TRAIN_DAYS en adelante) y ltr recortado
                      a los mismos días; world_seed no existe.
     rate_hist/loads_hist son siempre la serie de entrenamiento (para el percentil histórico de p*).
     """
 
     def __init__(self, agent, num_nodes, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-                 ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95, market, ev_esperado=None,
+                 ltr_stack, avail_expected_arr, reward_global_p95, market, ev_esperado=None,
                  modo="simulado", rate_hist=None, loads_hist=None):
         self.agent, self.N, self.market, self.modo = agent.eval(), num_nodes, market, modo
         self.T = np.asarray(time_matrix, dtype=float)
@@ -97,7 +97,7 @@ class Escenario:
         self.rate_hist = rate_stack[:TRAIN_DAYS] if rate_hist is None else rate_hist
         self.loads_hist = loads_stack[:TRAIN_DAYS] if loads_hist is None else loads_hist
         self.time_matrix = time_matrix
-        self.ltr, self.trucks, self.avail, self.p95 = ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95
+        self.ltr, self.avail, self.p95 = ltr_stack, avail_expected_arr, reward_global_p95
         self.ev = ev_esperado if ev_esperado is not None else calcular_ev_pronostico(market, distance_arr, diesel_arr)
         self.device = next(agent.parameters()).device
         self.con_cabezas = bool(getattr(agent, "post_entrenadas", False))
@@ -115,7 +115,7 @@ class Escenario:
         B, cur, dev = len(env.current_node), env.current_node, self.device
         nf = build_node_features_batch(
             cur, env.start_node, None, self.T, self.dist, env.current_day_idx,
-            self.N, MAX_DURATION, trucks_stack_raw=self.trucks, reward_global_p95=self.p95,
+            self.N, MAX_DURATION, reward_global_p95=self.p95,
             avail_expected_arr=self.avail, reward_rows=env.reward_rows, ev=self.ev,
             time_elapsed=env.time_elapsed, dow0=env.start_dow,
             market_index=env.market_index, index_std=env.index_std,
@@ -553,7 +553,7 @@ def run_pricing_validation(*args, **kwargs) -> dict:
 
 def _run_pricing_validation(
     agent, num_nodes, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-    ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95, market, ev_esperado=None,
+    ltr_stack, avail_expected_arr, reward_global_p95, market, ev_esperado=None,
     output_dir=None, sim_df=None, replay_df=None, n_mundos_cf=N_MUNDOS_CONTRAFACTUAL,
     n_estados_cf=N_EST_CONTRAFACTUAL, m_eval=MARKET_M_EVAL_WORLDS, semilla_eval=MARKET_SEED_EVAL, verbose=True,
 ) -> dict:
@@ -566,9 +566,9 @@ def _run_pricing_validation(
         raise ValueError("el agente no trae las cabezas Ṽ A/B entrenadas (correr post_training.py)")
     t0 = time.time()
     esc_sim = Escenario(agent, num_nodes, time_matrix, rate_stack[:TRAIN_DAYS], loads_stack[:TRAIN_DAYS], distance_arr,
-                        diesel_arr, ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95, market, ev_esperado)
+                        diesel_arr, ltr_stack, avail_expected_arr, reward_global_p95, market, ev_esperado)
     esc_rep = Escenario(agent, num_nodes, time_matrix, rate_stack[TRAIN_DAYS:], loads_stack[TRAIN_DAYS:], distance_arr,
-                        diesel_arr, ltr_stack[:, TRAIN_DAYS:], trucks_stack[:, TRAIN_DAYS:], avail_expected_arr,
+                        diesel_arr, ltr_stack[:, TRAIN_DAYS:], avail_expected_arr,
                         reward_global_p95, market, ev_esperado, modo="replay",
                         rate_hist=rate_stack[:TRAIN_DAYS], loads_hist=loads_stack[:TRAIN_DAYS])
     out = output_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "results",
@@ -750,12 +750,12 @@ def append_pricing_sheet(excel_path: str, tablas: dict) -> None:
 def cargar_datos(num_nodes):
     """Datos y proceso de mercado para una corrida independiente (CLI)."""
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-     ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95) = load_matrices(num_nodes)
+     ltr_stack, avail_expected_arr, reward_global_p95) = load_matrices(num_nodes)
     asegurar_parametros()
     market = MarketProcess(num_nodes)
     return dict(
         time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack, distance_arr=distance_arr,
-        diesel_arr=diesel_arr, ltr_stack=ltr_stack, trucks_stack=trucks_stack,
+        diesel_arr=diesel_arr, ltr_stack=ltr_stack,
         avail_expected_arr=avail_expected_arr, reward_global_p95=reward_global_p95, market=market,
         ev_esperado=calcular_ev_pronostico(market, distance_arr, diesel_arr),
     )
@@ -763,7 +763,7 @@ def cargar_datos(num_nodes):
 
 def main():
     from transfer_learning import checkpoint_tiene_post_head, load_checkpoint_compatible
-    from dp_relajada import cargar_o_calcular_tabla
+    from baselines.dp_relajada import cargar_o_calcular_tabla
     from evaluation import evaluar_mundos_simulados, evaluar_replay
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--num-nodes", type=int, default=10)
@@ -789,13 +789,13 @@ def main():
         cache = os.path.join(cwd, "datos", "cache_eval")
         sim_df = evaluar_mundos_simulados(
             agent, d["market"], tabla, d["time_matrix"], d["rate_stack"][:TRAIN_DAYS], d["loads_stack"][:TRAIN_DAYS],
-            d["distance_arr"], d["diesel_arr"], a.num_nodes, d["ltr_stack"], d["trucks_stack"],
+            d["distance_arr"], d["diesel_arr"], a.num_nodes, d["ltr_stack"],
             d["avail_expected_arr"], d["reward_global_p95"], k_levels=tuple(K_TRAINING_LEVELS),
             M=tam.get("m_eval", MARKET_M_EVAL_WORLDS),
             cache_path=None if a.quick else os.path.join(cache, f"baselines_simulado_{a.num_nodes}nodos.pkl"))
         replay_df = evaluar_replay(
             agent, d["market"], tabla, d["time_matrix"], d["rate_stack"][TRAIN_DAYS:], d["loads_stack"][TRAIN_DAYS:],
-            d["distance_arr"], d["diesel_arr"], a.num_nodes, d["ltr_stack"][:, TRAIN_DAYS:], d["trucks_stack"][:, TRAIN_DAYS:],
+            d["distance_arr"], d["diesel_arr"], a.num_nodes, d["ltr_stack"][:, TRAIN_DAYS:],
             d["avail_expected_arr"], d["reward_global_p95"], k_levels=tuple(K_TRAINING_LEVELS),
             cache_path=None if a.quick else os.path.join(cache, f"baselines_replay_{a.num_nodes}nodos.pkl"))
     run_pricing_validation(agent, a.num_nodes, **d, output_dir=a.output_dir, sim_df=sim_df, replay_df=replay_df, **tam)

@@ -13,12 +13,12 @@ import pytest
 import torch
 
 import am_training
-from am_agent import AMRoutingAgent
+from model.agent import AMRoutingAgent
 from config import (
     DEVICE,
     K_TRAINING_LEVELS, MARKET_SEED_EVAL, MARKET_SEED_VAL, TRAIN_DAYS, get_val_worlds,
 )
-from baselines import calcular_ev_pronostico
+from baselines.politicas import calcular_ev_pronostico
 from evaluation import disenar_mundos
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
@@ -29,15 +29,15 @@ N = 10
 @pytest.fixture(scope="module")
 def datos():
     asegurar_parametros()
-    (tm, rate, loads, dist, diesel, ltr, trucks, avail, p95) = load_matrices(N)
+    (tm, rate, loads, dist, diesel, ltr, avail, p95) = load_matrices(N)
     return dict(tm=tm, rate=rate[:TRAIN_DAYS], loads=loads[:TRAIN_DAYS], dist=dist, diesel=diesel,
-                ltr=ltr, trucks=trucks, avail=avail, p95=p95, market=MarketProcess(N))
+                ltr=ltr, avail=avail, p95=p95, market=MarketProcess(N))
 
 
 def _val(d):
     return am_training.ValidacionSimulada(
         d["market"], d["tm"], d["rate"], d["loads"], d["dist"], d["diesel"], N,
-        np.asarray(d["tm"], dtype=float), d["ltr"], d["trucks"], d["p95"], d["avail"],
+        np.asarray(d["tm"], dtype=float), d["ltr"], d["p95"], d["avail"],
         ev_esperado=calcular_ev_pronostico(d["market"], d["dist"], d["diesel"]),
     )
 
@@ -75,7 +75,7 @@ def test_entrenamiento_guarda_mejor_update_y_loguea_validacion(datos, monkeypatc
     ruta = str(tmp_path / "best.pt")
     _, _, _, _, log = am_training.run_am_training(
         datos["tm"], datos["rate"], datos["loads"], datos["dist"], datos["diesel"], N,
-        ltr_stack=datos["ltr"], trucks_stack=datos["trucks"], reward_global_p95=datos["p95"],
+        ltr_stack=datos["ltr"], reward_global_p95=datos["p95"],
         avail_expected_arr=datos["avail"], market_process=datos["market"], best_checkpoint_path=ruta,
     )
     con_val = [e for e in log if "val" in e]
@@ -91,7 +91,7 @@ def test_entrenamiento_guarda_mejor_update_y_loguea_validacion(datos, monkeypatc
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_dow_del_entorno_y_one_hot(datos):
-    from attention_encoder import build_dow_features_batch, N_DOW_FEATURES
+    from model.encoder import build_dow_features_batch, N_DOW_FEATURES
     from fit_market_process import dia_de_semana
     from routing_env import VectorRoutingEnv
     for offset in (0, TRAIN_DAYS):
@@ -112,7 +112,7 @@ def test_dow_del_entorno_y_one_hot(datos):
 
 def test_dow_cambia_la_decision_y_checkpoint_viejo_equivale(datos):
     """Con columnas de dow en cero el contexto es el de antes; con ellas, el día importa."""
-    from attention_encoder import ContextNetwork
+    from model.encoder import ContextNetwork
     torch.manual_seed(0)
     ctx = ContextNetwork(32)
     g, c = torch.randn(4, 32), torch.randn(4, 32)

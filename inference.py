@@ -33,8 +33,8 @@ from config import (
     DEVICE, MAX_DURATION, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, TRAIN_DAYS, RUN_TAG,
     REWARD_SCALE_FACTOR,
 )
-from am_agent import AMRoutingAgent
-from baselines import calcular_ev_pronostico
+from model.agent import AMRoutingAgent
+from baselines.politicas import calcular_ev_pronostico
 from evaluation import make_replay_env
 from greedy_rollout import greedy_rollout
 from market_process import MarketProcess, asegurar_parametros
@@ -81,7 +81,7 @@ def load_latest_day():
     mercado recortadas a ese mismo día, para que el índice 0 apunte a él.
     """
     time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
-        ltr_stack, trucks_stack, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
+        ltr_stack, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
 
     # Último día del stack histórico = día más reciente disponible
     last = rate_stack.shape[0] - 1
@@ -102,7 +102,6 @@ def load_latest_day():
         loads_train=loads_stack[:TRAIN_DAYS],          # (solo cuentan los días con carga)
         rate_last=rate_stack[last:], loads_last=loads_stack[last:],   # tablero del día (replay)
         ltr_stack=ltr_stack[:, last:],
-        trucks_stack=trucks_stack[:, last:],
         avail_expected_arr=avail_expected_arr,
         reward_global_p95=reward_global_p95,
     )
@@ -148,7 +147,7 @@ def _rollout_con_pricing(agent, start_node, day, with_board) -> tuple:
 
     res = greedy_rollout(
         agent, env, np.array([start_node], dtype=np.int64), np.array([0], dtype=np.int64),
-        day["time_matrix_arr"], day["distance_arr"], day["trucks_stack"], day["ltr_stack"],
+        day["time_matrix_arr"], day["distance_arr"], day["ltr_stack"],
         day["reward_global_p95"], NUM_NODES,
         k_max_arr=[None], avail_expected_arr=day["avail_expected_arr"],
         ev_esperado=day["ev_esperado"], selector=selector, step_hook=hook,

@@ -35,8 +35,8 @@ Uso standalone
 
 import os
 import torch
-from am_agent import AMRoutingAgent
-from critic_head import CriticHead
+from model.agent import AMRoutingAgent
+from model.critic_head import CriticHead
 from config import DEVICE
 
 

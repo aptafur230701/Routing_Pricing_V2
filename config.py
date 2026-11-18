@@ -139,36 +139,36 @@ def configurar_k(restringido: bool) -> None:
 USE_CONTINUATION_FEATURES = True   # True: 4 features extra por nodo j (N_NODE_FEATURES = 12 con el índice de mercado) con la
                                    # información de qué pasa después de j (tiempo y holgura de regreso a
                                    # casa, valor esperado de volver a casa y de seguir un salto más; ver
-                                   # attention_encoder.py). False: las 7 features base. Ablacionable.
+                                   # model/encoder.py). False: las 7 features base. Ablacionable.
 
 # ── Train / eval split ───────────────────────────────────────
-TRAIN_DAYS = 90   # días usados para entrenamiento; el resto (días 90-119) queda para evaluación
+# jun 1 - sep 30 2026 (122 días) entrenamiento; oct 1-31 2026 (31 días) prueba, fuera de muestra.
+TRAIN_DAYS = 122
 
 # ── Market signal normalisation clamps ───────────────────────
-LTR_CLIP           = 200.0   # p95 del LTR es 124; 200 es techo seguro
-TRUCKS_CLIP        =  50.0   # p95 de trucks delta=1 es 45
+LTR_CLIP           = 200.0   # techo seguro para el load_to_truck_ratio diario del hub
 LOADS_EXPECTED_CLIP = 100.0  # p95 de E[loads] por lane (train, excl. diagonal) es ~66; 100 es techo seguro
 
 # ── Reproducibility ───────────────────────────────────────────
 SEED = int(os.environ.get("SEED", 42))   # torch/numpy del entrenamiento; variable de entorno SEED para variar por corrida
 
-# ── Proceso exógeno de cargas y tarifas (market_process) ─────
-# Ver proceso_exogeno_cargas_tarifas.md. Ningún índice de día va escrito a
-# mano: el número de días sale de la forma de loads_stack / rate_stack y las
-# fechas salen de FECHA_INICIO + índice del día.
-FECHA_INICIO         = "2026-01-01"   # fecha del día 0 del histórico (jueves)
+# ── Generador de realizaciones diarias (market_process) ──────
+# Ver metodologia_realizaciones_mercado_reefer.md (generador) y proceso_exogeno_cargas_tarifas.md
+# (índice de mercado por nodo, conservado). Ningún índice de día va escrito a mano: el número de
+# días sale de los CSV diarios de datos/datos_finales_jun_oct_2026 y las fechas salen de sus nombres
+# de archivo (FECHA_INICIO = la primera fecha de esa carpeta, jun 1 2026).
+FECHA_INICIO         = "2026-06-01"   # primer día de datos/datos_finales_jun_oct_2026 (lunes)
 DIAS_EXCLUIDOS       = []             # fechas ("AAAA-MM-DD") a dejar fuera del ajuste, solo si
                                       # la fuente confirma que son erróneas. Vacía = usa todos los días de ajuste.
-MARKET_PHI_MAX       = 1000.0         # tope de la dispersión phi (phi → ∞ equivale a Poisson)
-MARKET_N_GRUPOS      = 4              # grupos de volumen h (cuartiles de mu_ij) para estimar phi_h
+MARKET_R_MAX         = 1000.0         # tope de la dispersión r de la binomial negativa (r → ∞ equivale a Poisson)
+MARKET_N_GRUPOS      = 10             # grupos de volumen h (deciles de la m promedio de cada lane) para estimar r_h
+MARKET_VENTANA_VECINOS = 3            # días antes/después (sin el propio día) para la media móvil de m (Paso 4b)
 MARKET_PARAMS_PATH   = "datos/market_params.npz"   # relativo a la raíz del proyecto
 VENTANA_LENTO_DIAS   = 21             # ventana (impar, centrada) del promedio que separa el estado lento del rápido del
                                       # índice de mercado; los días con la ventana completa son los "días de escenario"
 HORAS_DIA_MERCADO    = 14.0           # un día de mercado = 14 h (igual que RoutingEnv)
 MARKET_DIAS_EPISODIO = int(MAX_DURATION // HORAS_DIA_MERCADO) + 1   # días de mercado que puede tocar un episodio
                                       # (el de salida y los que caben en MAX_DURATION: 6 con 77 h)
-MARKET_DIA_MAX       = TRAIN_DAYS - 1 + MARKET_DIAS_EPISODIO - 1    # último día posible de un episodio: el último
-                                      # día de salida (TRAIN_DAYS − 1) más los días que caben en MAX_DURATION
 MARKET_SEED_TRAIN    = int(os.environ.get("MARKET_SEED_TRAIN", 20260))   # semilla de los mundos de entrenamiento
                                                                           # (variable de entorno para variarla por corrida)
 MARKET_SEED_EVAL     = 777001  # semilla base de los mundos de evaluación (distinta de la de entrenamiento)

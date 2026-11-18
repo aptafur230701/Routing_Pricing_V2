@@ -70,8 +70,8 @@ Con encoder, contexto y actor congelados:
 
 | Archivo | Papel |
 |---|---|
-| `critic_head.py` | `PostDecisionValueHead(seed)` (+ `forward_pairs`); detach interno de `h_t` y embeddings |
-| `am_agent.py` | `post_value_a/b`, `post_values(h_t, emb)`, `post_entrenadas` |
+| `model/critic_head.py` | `PostDecisionValueHead(seed)` (+ `forward_pairs`); detach interno de `h_t` y embeddings |
+| `model/agent.py` | `post_value_a/b`, `post_values(h_t, emb)`, `post_entrenadas` |
 | `am_training.py` | PPO sin pérdida de Ṽ (las cabezas, si existen, quedan fuera de los optimizers) |
 | `post_training.py` | generación de ejemplos, ajuste de A/B, curva de error, checkpoint `_pricing` |
 | `pricing.py` | `q_values`, `reservation_price` (A/B, devuelve `PrecioReserva`), `crear_selector_q`, `percentil_historico` |
@@ -96,7 +96,7 @@ Con encoder, contexto y actor congelados:
   un mismo mundo no son independientes), la correlación y el sesgo por tramo (< 300, 300-800, > 800 mi, con n; a
   N = 10 no hay lanes < 300 mi). Se expresa también como fracción de la dispersión semanal del índice de mercado
   (0,10-0,12 USD/mi).
-* **(c) Utilidad**, en los mundos simulados de evaluación y en replay (días 90-119): margen de DRL-Q contra DRL,
+* **(c) Utilidad**, en los mundos simulados de evaluación y en replay (días de prueba, oct 2026, fuera de muestra): margen de DRL-Q contra DRL,
   B1, B2, B2P y B3 (diferencias pareadas, IC95 por mundo); diferencia relativa al margen del actor con su IC95;
   % de arcos de DRL-Q con p\* bajo el break-even y sobre break-even + 0,30 USD/mi; y la **regla de aceptación por
   umbral** con tres pisos (break-even, break-even + 0,30, p\*): entre las lanes con carga válidas con tarifa
