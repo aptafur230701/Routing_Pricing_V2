@@ -81,16 +81,16 @@ nodos, ver `NODE_SEQUENCE`).
 | [model/encoder.py](model/encoder.py) | `AttentionEncoder` (Transformer) + `ContextNetwork`. |
 | [model/decoder.py](model/decoder.py) | `AttentionDecoder` (pointer network) con glimpse + pointer attention. |
 | [model/critic_head.py](model/critic_head.py) | `CriticHead`: estima V(s_t) para la ventaja PPO. `PostDecisionValueHead`: Ṽ(s, j), valor de llegar a j antes de ver su tablero (precio de reserva); el agente trae dos (A y B). |
-| [pricing.py](pricing.py) | `reservation_price`: precio de reserva p* por lane (parejas AB/BA, rango); `crear_selector_q`: ruta DRL-Q (argmax de Q). |
+| [pricing.py](pricing.py) | `reservation_price`: precio de reserva p* por lane (parejas AB/BA, rango) sobre el arco que el actor ya elige. |
 | [post_training.py](post_training.py) | Fase posterior al PPO: entrena las cabezas Ṽ A/B con el actor congelado y guarda `am_checkpoint_<N>nodes_pricing.pt`. |
-| [validate_pricing.py](validate_pricing.py) | Validación de p* y de DRL-Q: contrafactual, utilidad (márgenes pareados, regla por umbral), plausibilidad. |
+| [validate_pricing.py](validate_pricing.py) | Validación de p* sobre la ruta del DRL: contrafactual, utilidad (regla por umbral), plausibilidad. |
 | [model/agent.py](model/agent.py) | `AMRoutingAgent`: combina encoder + contexto + decoder; el rollout se ejecuta paso a paso sobre el entorno. |
 | [am_training.py](am_training.py) | Loop de entrenamiento PPO-Clip + GAE. |
 | [greedy_rollout.py](greedy_rollout.py) | Rollout greedy (argmax por nodo) sobre `VectorRoutingEnv`: evaluación del DRL en replay de días reales o en mundos simulados, baseline self-critical y monitor de entrenamiento. |
 | [model/debug_utils.py](model/debug_utils.py) | `check_tensor`: verificación de NaN/Inf en el forward pass (falla rápido en vez de silenciar con `nan_to_num`). Usado en producción por el encoder/decoder/training, no es un script de debug puntual. |
 | [transfer_learning.py](transfer_learning.py) | Warm-start de pesos entre tamaños de grafo (`NODE_SEQUENCE`). |
 | [baselines/ub_pi.py](baselines/ub_pi.py) | DP hacia atrás de UB-PI (`solve_ub_pi`), único solver que se conserva: mejor ruta con el mundo completo conocido, estado (nodo, franja de 1 min, k). |
-| [inference.py](inference.py) | Inferencia standalone: carga el checkpoint con las cabezas Ṽ y genera la ruta de DRL-Q desde un nodo dado, con el precio de reserva p* por arco. |
+| [inference.py](inference.py) | Inferencia standalone: carga el checkpoint con las cabezas Ṽ y genera la ruta del DRL desde un nodo dado, con el precio de reserva p* por arco. |
 
 ### Generador de realizaciones diarias (opcional)
 
@@ -165,12 +165,13 @@ el DRL.
 | `results/<N>nodes/` | Salida de cada run: `DRL_Routing_Summary_AM.xlsx`, diagnósticos PPO/training (`.png`), `training_log_<N>nodes.pkl`/`.xlsx`. |
 | `docs/architecture.html` / `.png` | Diagrama explicativo del pipeline AM-PPO. |
 
-## Pricing: precio de reserva y ruta DRL-Q
+## Pricing: precio de reserva por arco
 
-Descripción completa en [PRICING_PLAN.md](PRICING_PLAN.md). El modelo entrega dos salidas: la **ruta** y, para cada
-arco con carga, el **precio mínimo por milla** (p\*) al que al camión le conviene aceptar la lane frente a su mejor
-alternativa. Es una recomendación del lado del transportista; **no modela aceptación** (no hay datos de aceptación
-y rechazo) y p\* es un costo de oportunidad, no una probabilidad.
+Descripción completa en [PRICING_PLAN.md](PRICING_PLAN.md). El DRL (el actor del PPO) es el único método de ruteo;
+el pricing es estrictamente downstream de esa ruta ya decidida: para cada arco con carga calcula el **precio mínimo
+por milla** (p\*) al que al camión le conviene aceptar esa lane frente a su mejor alternativa. p\* nunca re-decide
+qué lane tomar — es una recomendación del lado del transportista sobre la decisión que el actor ya hizo. **No
+modela aceptación** (no hay datos de aceptación y rechazo) y p\* es un costo de oportunidad, no una probabilidad.
 
 **Modelo.** Con `S = REWARD_SCALE_FACTOR` y `r_obs = tarifa·dist·1[carga] − costo`:
 
@@ -179,13 +180,12 @@ Q(s, a)  = r_obs(i→a)/S + Ṽ(s, a)                     Ṽ(s, casa) = 0
 p*(i→j)  = ( S · (Q_alt − Ṽ(s, j)) + costo(i→j) ) / dist(i→j)      [USD/milla],   Q_alt = mejor Q entre a ≠ j válidas
 ```
 
-`Ṽ(s, a)` es el margen esperado desde la llegada a `a` hasta volver a casa siguiendo el actor en modo greedy.
-Hay dos cabezas, A y B, entrenadas con mitades distintas de los mundos: p\*_AB elige la alternativa con A y evalúa
-con B (p\*_BA, al revés); p\* es el promedio y el **rango** [mín, máx] es la variabilidad del estimador (partición
-de datos y ruido de etiquetas), **no un intervalo de confianza** (comparten encoder, contexto y actor).
-
-**Ruta.** *DRL-Q* elige en cada nodo el argmax de Q con `Ṽ = (Ṽ_A + Ṽ_B)/2`; es la ruta que se entrega y está en el
-arnés de evaluación junto al DRL de siempre (el actor) y los baselines.
+`j` es la acción que el actor ya tomó; Q solo se evalúa para valorar `Q_alt`, la mejor alternativa a `j` (el costo
+de oportunidad), nunca para elegir la acción real. `Ṽ(s, a)` es el margen esperado desde la llegada a `a` hasta
+volver a casa siguiendo el actor en modo greedy. Hay dos cabezas, A y B, entrenadas con mitades distintas de los
+mundos: p\*_AB elige la alternativa con A y evalúa con B (p\*_BA, al revés); p\* es el promedio y el **rango**
+[mín, máx] es la variabilidad del estimador (partición de datos y ruido de etiquetas), **no un intervalo de
+confianza** (comparten encoder, contexto y actor).
 
 **Entrenamiento.** El PPO no entrena Ṽ. Después del PPO (`post_training.py`), con encoder, contexto y actor
 congelados: se generan ~200 000 ejemplos (estado de una ruta del actor, acción al azar entre las válidas salvo volver
@@ -196,20 +196,23 @@ arcos de reposicionamiento).
 **Cómo ejecutarlo.**
 
 ```bash
-python main.py                                   # PPO (o checkpoint) → Ṽ A/B → evaluación con DRL-Q → validación
+python main.py                                   # PPO (o checkpoint) → Ṽ A/B → evaluación → validación del pricing
 python post_training.py --num-nodes 10           # solo la fase de Ṽ (checkpoint del PPO → *_pricing.pt)
-python validate_pricing.py --num-nodes 10        # solo la validación sobre el checkpoint *_pricing.pt
-python inference.py [--show-board]               # ruta DRL-Q + p* por arco; escribe results/<N>nodes/pricing_<run_tag>.csv
+python validate_pricing.py --num-nodes 10        # solo el pricing sobre el checkpoint *_pricing.pt (no toca el ruteo)
+python inference.py [--show-board]               # ruta del DRL + p* por arco; escribe results/<N>nodes/pricing_<run_tag>.csv
 ```
 
+`validate_pricing.py` (solo o dentro de `main.py`) nunca entrena ni evalúa el ruteo contra B1-B3/UB-PI/UB-DP — eso
+es trabajo de `evaluation.py`, que ya corre esa comparación para el DRL.
+
 La validación escribe `results/<N>nodes/pricing_val/{figures,tables}` y la pestaña "Pricing" del Excel:
-(b) prueba contrafactual del sesgo de p\* (IC95 por bootstrap de mundos), (c) margen de DRL-Q contra DRL, B1, B2, B2P y B3
-(pareado) y regla de aceptación por umbral con tres pisos (break-even, break-even + 0,30 USD/mi y p\*), y
+(b) prueba contrafactual del sesgo de p\* (IC95 por bootstrap de mundos), (c) % de arcos con p\* bajo el break-even
+y regla de aceptación por umbral con tres pisos (break-even, break-even + 0,30 USD/mi y p\*), y
 (d) percentil de p\* en las tarifas históricas de la lane y correlación con el índice de mercado del destino.
 
 **Limitaciones.** (1) p\* es un costo de oportunidad, no una probabilidad de aceptación. (2) Ṽ se entrena con una
 sola realización por ejemplo, así que el error es alto por construcción. (3) Con K libre la ruta típica es una lane
-con carga más el retorno. (4) Ṽ sigue al actor, no a DRL-Q.
+con carga más el retorno.
 
 ## Flujo de trabajo típico
 

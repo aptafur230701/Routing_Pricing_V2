@@ -6,7 +6,7 @@ Entry point for the AM-PPO pipeline.
   1. Load data          (problem_data.py)
   2. Training           (am_training.py)
   3. Ṽ posterior al PPO (post_training.py: cabezas A/B del precio de reserva, actor congelado)
-  4. Evaluation         (evaluation.py: mundos simulados + replay; DRL, DRL-Q, baselines B1-B3, UB-PI, UB-DP)
+  4. Evaluation         (evaluation.py: mundos simulados + replay; DRL, baselines B1-B3, UB-PI, UB-DP)
   5. Save results       (evaluation.py, excel_report.py, stats_analysis.py)
   6. Validación del pricing (validate_pricing.py: contrafactual de p*, utilidad, plausibilidad)
 
@@ -25,19 +25,17 @@ Checkpoints (transfer learning)
 """
 
 import os
-import random
 import time
 import warnings
-import numpy as np
-import pandas as pd
 import torch
+import pandas as pd
 
 warnings.filterwarnings("ignore")
 
 from config import (
     SEED, DEVICE, RUN_TAG, K_TRAINING_LEVELS, configurar_k, MARKET_SEED_EVAL, MARKET_SEED_EVAL_FINAL,
     HP_OVERRIDES, configurar_hp,
-    get_episodes_per_node, TRAIN_DAYS,
+    get_episodes_per_node, TRAIN_DAYS, set_seeds,
     AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, USE_POST_HEAD,
 )
 from baselines.politicas import calcular_ev_pronostico
@@ -52,14 +50,6 @@ from stats_analysis import append_stats_sheets_to_excel, NOTA_REPLAY
 from transfer_learning import build_agent_for_training, checkpoint_tiene_post_head, load_checkpoint_compatible
 from post_training import entrenar_cabezas_post, ruta_checkpoint_pricing, pricing_vigente
 from validate_pricing import run_pricing_validation, append_pricing_sheet
-
-
-def set_seeds(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
 
 
 def _run_am(
@@ -243,9 +233,11 @@ def main():
                                 # False: solo K libre (sin presupuesto de cardinalidad). Sirve para
                                 # pulir el método contra los baselines antes de añadir la restricción.
     RUN_PRICING = True       # True (y USE_POST_HEAD activo): entrena las cabezas Ṽ A/B con el actor congelado (si el
-                              # checkpoint *_pricing.pt no existe), evalúa también DRL-Q (argmax de Q) y valida el precio
-                              # de reserva p* (validate_pricing.py), con la pestaña "Pricing" del Excel.
-    RETRAIN_POST = False     # True: reentrena las cabezas Ṽ aunque ya exista el checkpoint *_pricing.pt
+                              # checkpoint *_pricing.pt no existe) y valida el precio de reserva p* sobre la ruta
+                              # del actor (validate_pricing.py), con la pestaña "Pricing" del Excel.
+    RETRAIN_POST = False     # True: reentrena las cabezas Ṽ aunque ya exista un checkpoint *_pricing.pt válido
+                              # para este actor (pricing_vigente); con False, pricing_vigente decide y solo
+                              # reentrena cuando el actor cambió o el checkpoint no existe.
     # ──────────────────────────────────────────────────────────────────────────
 
     configurar_k(K_RESTRINGIDO)    # antes de entrenar/evaluar: fija K_TRAINING_LEVELS en el sitio
@@ -346,10 +338,12 @@ def main():
             agent_am.eval()
             print(f"Cabezas Ṽ cargadas de {pricing_path}")
 
-    sim_df, replay_df = _evaluate_and_report(
+    label = "AM" if EVAL_SET == "dev" else "AM_final"
+    excel_path = os.path.join(output_dir, f"DRL_Routing_Summary_{label}.xlsx")
+    _evaluate_and_report(
         agent_am, NUM_NODES, time_matrix, rate_stack, loads_stack,
         distance_arr, diesel_arr, ep_r, ep_l, t,
-        summary_rows, output_dir, label="AM" if EVAL_SET == "dev" else "AM_final",
+        summary_rows, output_dir, label=label,
         ltr_stack=ltr_stack,
         avail_expected_arr=avail_expected_arr,
         reward_global_p95=reward_global_p95,
@@ -359,14 +353,14 @@ def main():
     )
 
     if con_pricing and getattr(agent_am, "post_entrenadas", False):
+        # Pricing solo necesita el actor congelado: no reutiliza nada de la evaluación de ruteo de arriba.
         tablas = run_pricing_validation(
             agent_am, NUM_NODES, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
             ltr_stack, avail_expected_arr, reward_global_p95, market_process,
-            ev_esperado=ev_esperado, output_dir=output_dir, sim_df=sim_df, replay_df=replay_df,
+            ev_esperado=ev_esperado, output_dir=output_dir,
             semilla_eval=MARKET_SEED_EVAL if EVAL_SET == "dev" else MARKET_SEED_EVAL_FINAL,
         )
-        label = "AM" if EVAL_SET == "dev" else "AM_final"
-        append_pricing_sheet(os.path.join(output_dir, f"DRL_Routing_Summary_{label}.xlsx"), tablas)
+        append_pricing_sheet(excel_path, tablas)
 
     print(f"\nDone! Checkpoint guardado en: checkpoints/am_checkpoint_{NUM_NODES}nodes.pt")
 

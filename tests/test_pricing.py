@@ -1,8 +1,7 @@
 """
 test_pricing.py
 ===============
-Pruebas internas del precio de reserva (PRICING_PLAN.md): reservation_price con las cabezas A/B, q_values y el
-selector de DRL-Q.
+Pruebas internas del precio de reserva (PRICING_PLAN.md): reservation_price con las cabezas A/B y q_values.
 """
 
 import numpy as np

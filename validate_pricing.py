@@ -1,20 +1,23 @@
 """
 validate_pricing.py
 ===================
-Validación del precio de reserva p* y de la ruta DRL-Q (PRICING_PLAN.md §4). Necesita un checkpoint con las
-cabezas Ṽ A/B entrenadas (post_training.py). Todo en K libre salvo que K_TRAINING_LEVELS diga otra cosa.
+Validación del precio de reserva p* sobre la ruta del DRL ya entrenado (PRICING_PLAN.md §4). Necesita un
+checkpoint con las cabezas Ṽ A/B entrenadas (post_training.py). Todo en K libre salvo que K_TRAINING_LEVELS
+diga otra cosa. El DRL es el único método de ruteo: aquí no se re-decide ninguna acción con Q, solo se calcula
+el precio de reserva del arco que el actor ya elige.
 
-  (b) Prueba contrafactual. Se muestrean N_EST_CONTRAFACTUAL estados de rutas de DRL-Q en mundos de validación
-      (MARKET_SEED_VAL, distinta de entrenamiento, de Ṽ y de evaluación). Desde el estado, en el MISMO mundo, se
-      sigue la lane j que eligió DRL-Q y, por separado, la mejor alternativa según el modelo (la de A para p*_AB y
-      la de B para p*_BA); después de cada una, el actor greedy hasta casa:
+  (b) Prueba contrafactual. Se muestrean N_EST_CONTRAFACTUAL estados de rutas del DRL (actor) en mundos de
+      validación (MARKET_SEED_VAL, distinta de entrenamiento, de Ṽ y de evaluación). Desde el estado, en el
+      MISMO mundo, se sigue la lane j que eligió el actor y, por separado, la mejor alternativa según el modelo
+      (la de A para p*_AB y la de B para p*_BA); después de cada una, el actor greedy hasta casa:
           p*_realizado = ( G_alt − C_j + costo_j ) / dist_j
       con G_alt el margen total desde el estado tomando la alternativa (incluida su carga) y C_j el margen
       posterior a llegar a j. Sesgo = p* predicho − p*_realizado, con IC95 por bootstrap que remuestrea MUNDOS
       (los estados de un mismo mundo no son independientes).
-  (c) Utilidad, en los mundos simulados de evaluación y en replay: margen de DRL-Q frente a DRL (actor), B1, B2,
-      B2P y B3 (diferencias pareadas, IC95); % de arcos de DRL-Q con p* bajo el break-even y sobre break-even +
-      BE_MARGEN; y la regla de aceptación por umbral con tres pisos: break-even, break-even + BE_MARGEN y p*.
+  (c) Utilidad, en los mundos simulados de evaluación y en replay: % de arcos del DRL con p* bajo el break-even
+      y sobre break-even + BE_MARGEN; y la regla de aceptación por umbral con tres pisos: break-even,
+      break-even + BE_MARGEN y p*. (El margen del DRL frente a los baselines es ruteo, no pricing: se reporta
+      en evaluation.py/main.py, que ya corren esa comparación.)
   (d) Plausibilidad: percentil de p* en las tarifas históricas de la lane (días de entrenamiento con carga) y
       correlación de (p* − break-even) con el índice de mercado del destino (esperada negativa: un destino con
       índice alto vale más ⇒ Ṽ(j) mayor ⇒ p* menor).
@@ -58,12 +61,10 @@ from baselines.politicas import calcular_ev_pronostico
 from evaluation import disenar_mundos, make_sim_env, make_replay_env, casos_replay, _etiqueta_k
 from market_process import MarketProcess, asegurar_parametros
 from pricing import (
-    lane_cost_row, percentil_historico, reservation_price, crear_selector_q, PrecioReserva,
+    lane_cost_row, percentil_historico, reservation_price, PrecioReserva,
 )
 from problem_data import load_matrices
-from stats_analysis import (
-    ic_bootstrap_media, ic_bootstrap_cluster, ic_bootstrap_cociente, comparar_con_baselines, BASELINES_Q,
-)
+from stats_analysis import ic_bootstrap_media, ic_bootstrap_cluster
 
 TRAMOS = [("< 300 mi", 0.0, 300.0), ("300-800 mi", 300.0, 800.0), ("> 800 mi", 800.0, np.inf)]
 
@@ -101,7 +102,6 @@ class Escenario:
         self.ev = ev_esperado if ev_esperado is not None else calcular_ev_pronostico(market, distance_arr, diesel_arr)
         self.device = next(agent.parameters()).device
         self.con_cabezas = bool(getattr(agent, "post_entrenadas", False))
-        self.selector_q = crear_selector_q(agent, distance_arr, diesel_arr, S) if self.con_cabezas else None
 
     def make_env(self):
         if self.modo == "replay":
@@ -136,12 +136,10 @@ class Escenario:
         va, vb = self.agent.post_values(h_t, emb)
         return va.detach().cpu().numpy().astype(np.float64), vb.detach().cpu().numpy().astype(np.float64)
 
-    def acciones(self, h_t, emb, mask_t, masks, env, modo: str) -> np.ndarray:
-        """modo: "greedy" (argmax del actor), "sample" (muestreada del actor) o "q" (argmax de Q, DRL-Q)."""
+    def acciones(self, h_t, emb, mask_t, modo: str) -> np.ndarray:
+        """modo: "greedy" (argmax del actor) o "sample" (muestreada del actor)."""
         if modo == "sample":
             return self.agent.decoder.act(h_t, emb, mask_t)[0].cpu().numpy()
-        if modo == "q":
-            return self.selector_q(h_t, emb, masks, env)
         return self.agent.decoder.greedy_action(h_t, emb, mask_t).cpu().numpy()
 
     def precio(self, rec, j) -> PrecioReserva:
@@ -152,7 +150,7 @@ class Escenario:
 
     # ── (1) trayectorias de una política con todo lo que p* necesita ─────────
     @torch.no_grad()
-    def recolectar(self, dis, k_arr, modo="q", con_indice=False, con_valores=None) -> list:
+    def recolectar(self, dis, k_arr, modo="greedy", con_indice=False, con_valores=None) -> list:
         """Rollout de la política `modo` sobre los mundos `dis`; un registro por (episodio, paso).
 
         Cada registro guarda lo observado en el estado s (máscara, tablero, Ṽ de las cabezas, índice de mercado
@@ -169,7 +167,7 @@ class Escenario:
                 break
             h_t, emb, mask_t = self.encode(env, masks)
             va, vb = self.valores(h_t, emb) if con_valores else (None, None)
-            actions = self.acciones(h_t, emb, mask_t, masks, env, modo)
+            actions = self.acciones(h_t, emb, mask_t, modo)
             rate, loads = env.rate_row_obs, env.loads_row_obs
             idx = env.market_index if con_indice else None
             paso = []
@@ -240,7 +238,7 @@ class Escenario:
             if not active.any():
                 break
             h_t, emb, mask_t = self.encode(env, masks)
-            greedy = self.acciones(h_t, emb, mask_t, masks, env, "greedy")
+            greedy = self.acciones(h_t, emb, mask_t, "greedy")
             en_estado = active & (L == t)
             if capturar and en_estado.any():
                 ix = np.where(en_estado)[0]
@@ -264,8 +262,8 @@ class Escenario:
 
         Paso a paso sobre las tarifas observadas: entre las lanes con carga válidas cuya tarifa observada ≥ umbral
         de la lane, toma la de mayor (tarifa − umbral)·dist; si ninguna califica, vuelve a casa; donde volver a casa
-        no es válido (paso 0), usa la acción de DRL-Q. tipo: "be" (umbral = costo/dist), "be+margen"
-        (costo/dist + BE_MARGEN) o "pstar" (el p* de DRL-Q en ese estado).
+        no es válido (paso 0), usa la acción del actor (greedy). tipo: "be" (umbral = costo/dist), "be+margen"
+        (costo/dist + BE_MARGEN) o "pstar" (el p* en ese estado).
         """
         env = self.make_env()
         B = len(dis["nodo"])
@@ -278,10 +276,10 @@ class Escenario:
             if not active.any():
                 break
             h_t, emb, mask_t = self.encode(env, masks)
-            a_q = self.acciones(h_t, emb, mask_t, masks, env, "q")
+            a_def = self.acciones(h_t, emb, mask_t, "greedy")
             va, vb = self.valores(h_t, emb) if tipo == "pstar" else (None, None)
             rate_all, loads_all = env.rate_row_obs, env.loads_row_obs
-            acc = a_q.copy()
+            acc = a_def.copy()
             for b in np.where(active)[0]:
                 i, s0 = int(env.current_node[b]), int(env.start_node[b])
                 rate, loads = rate_all[b].astype(np.float64), loads_all[b]
@@ -332,14 +330,14 @@ def validar_contrafactual(esc: Escenario, n_mundos: int, n_estados: int, rng, k_
     """(b) Retorna (estados DataFrame, resumen DataFrame).
 
     Los mundos se generan por bloques de `n_mundos` (el primero con exactamente MARKET_SEED_VAL, los siguientes con
-    MARKET_SEED_VAL + k) hasta reunir n_estados arcos de DRL-Q con carga y alternativa: con K libre la ruta típica
+    MARKET_SEED_VAL + k) hasta reunir n_estados arcos del actor con carga y alternativa: con K libre la ruta típica
     es 1 lane cargada + el retorno, así que hacen falta más mundos que estados.
     """
     N = esc.N
     elegibles, acciones_mundo, bloque = [], {}, 0
     while len(elegibles) < n_estados and bloque < max_bloques:
         dis = disenar_mundos(N, n_mundos, esc.market, num_dias=TRAIN_DAYS, semilla=MARKET_SEED_VAL + bloque)
-        recs = esc.recolectar(dis, [k_nivel] * n_mundos, modo="q")
+        recs = esc.recolectar(dis, [k_nivel] * n_mundos, modo="greedy")
         for r in recs:
             r["b"] += bloque * n_mundos                                     # id de mundo único entre bloques
             acciones_mundo.setdefault(r["b"], []).append(r["j"])
@@ -414,14 +412,14 @@ def validar_contrafactual(esc: Escenario, n_mundos: int, n_estados: int, rng, k_
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (c) y (d): arcos de las rutas de DRL-Q
+# (c) y (d): arcos de la ruta del actor
 # ─────────────────────────────────────────────────────────────────────────────
 
-def arcos_drl_q(esc: Escenario, dis, k_arr) -> pd.DataFrame:
-    """Una fila por arco de las rutas de DRL-Q (también el retorno y los arcos sin carga, con p* = NaN): ruta, tarifa
+def arcos_ruta(esc: Escenario, dis, k_arr) -> pd.DataFrame:
+    """Una fila por arco de la ruta del actor (también el retorno y los arcos sin carga, con p* = NaN): ruta, tarifa
     de hoy, p*, rango, break-even, percentil histórico e índice de mercado del destino. Los arcos con p* definido
     (con carga, no retorno, con alternativa) son los que entran en los resúmenes."""
-    recs = esc.recolectar(dis, k_arr, modo="q", con_indice=True)
+    recs = esc.recolectar(dis, k_arr, modo="greedy", con_indice=True)
     rutas = {}
     for r in recs:
         rutas.setdefault(r["b"], [r["i"]]).append(r["j"])
@@ -468,28 +466,10 @@ def resumen_arcos(df: pd.DataFrame, nombre: str) -> dict:
     )
 
 
-def utilidad_pareada(df_eval: pd.DataFrame) -> tuple:
-    """Diferencias pareadas de DRL-Q contra DRL, B1, B2, B2P y B3 (IC95 por mundo, Wilcoxon+Holm) y la diferencia
-    relativa al margen del actor con su IC95 (criterio de parada: límite superior < −2 %)."""
-    if df_eval is None or df_eval.empty or not (df_eval["metodo"] == "DRL-Q").any():
-        return pd.DataFrame(), pd.DataFrame()
-    pareada = comparar_con_baselines(df_eval, referencia="DRL-Q", baselines=BASELINES_Q)
-    filas = []
-    for (modo, K), g in df_eval.groupby(["modo", "K"], sort=False):
-        ancho = g.pivot(index="mundo", columns="metodo", values="margen")
-        par = ancho[["DRL-Q", "DRL"]].dropna()
-        punto, lo, hi = ic_bootstrap_cociente((par["DRL-Q"] - par["DRL"]).to_numpy(), par["DRL"].to_numpy())
-        filas.append(dict(modo=modo, K=K, n_mundos=len(par), margen_drl_q=par["DRL-Q"].mean(), margen_drl=par["DRL"].mean(),
-                          dif_usd=(par["DRL-Q"] - par["DRL"]).mean(), dif_rel_pct=100 * punto,
-                          dif_rel_ic95_inf_pct=100 * lo, dif_rel_ic95_sup_pct=100 * hi,
-                          alerta_parada=bool(hi < -0.02)))
-    return pareada, pd.DataFrame(filas)
-
-
 def comparar_umbral(esc: Escenario, dis, k_arr, nombre_modo: str) -> tuple:
     """Regla de aceptación por umbral con los tres pisos; resumen y diferencias pareadas (p* − piso) por mundo."""
     res = {t: esc.umbral(dis, k_arr, t) for t in ("be", "be+margen", "pstar")}
-    etiquetas = {"be": "break-even", "be+margen": f"break-even + {BE_MARGEN:.2f}", "pstar": "p* de DRL-Q"}
+    etiquetas = {"be": "break-even", "be+margen": f"break-even + {BE_MARGEN:.2f}", "pstar": "p*"}
     filas = [dict(conjunto=nombre_modo, umbral=etiquetas[t], margen_medio=d["margen"].mean(), validez=d["valido"].mean(),
                   largo_tour_medio=d["n_arcos"].mean(), n_mundos=len(d)) for t, d in res.items()]
     difs = []
@@ -554,14 +534,11 @@ def run_pricing_validation(*args, **kwargs) -> dict:
 def _run_pricing_validation(
     agent, num_nodes, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
     ltr_stack, avail_expected_arr, reward_global_p95, market, ev_esperado=None,
-    output_dir=None, sim_df=None, replay_df=None, n_mundos_cf=N_MUNDOS_CONTRAFACTUAL,
+    output_dir=None, n_mundos_cf=N_MUNDOS_CONTRAFACTUAL,
     n_estados_cf=N_EST_CONTRAFACTUAL, m_eval=MARKET_M_EVAL_WORLDS, semilla_eval=MARKET_SEED_EVAL, verbose=True,
 ) -> dict:
-    """Corre (b), (c) y (d); guarda tablas y figuras en <output_dir>/pricing_val y devuelve los DataFrames.
-
-    sim_df / replay_df: salida de evaluation.evaluar_mundos_simulados / evaluar_replay (con DRL y DRL-Q) para las
-    diferencias pareadas de margen; sin ellos esa parte se omite.
-    """
+    """Corre (b), (c) y (d) sobre las rutas que la política (ya entrenada y evaluada contra sus baselines en otra
+    fase) calcula en mundos frescos; guarda tablas y figuras en <output_dir>/pricing_val y devuelve los DataFrames."""
     if not getattr(agent, "post_entrenadas", False):
         raise ValueError("el agente no trae las cabezas Ṽ A/B entrenadas (correr post_training.py)")
     t0 = time.time()
@@ -593,15 +570,15 @@ def _run_pricing_validation(
                        tablas[next(k for k in tablas if k.startswith("contrafactual_resumen"))],
                        os.path.join(d_fig, "contrafactual.png"))
 
-    # ── (c) y (d): arcos de DRL-Q y regla por umbral, en simulado y en replay ──
+    # ── (c) y (d): arcos de la ruta del actor y regla por umbral, en simulado y en replay ──
     dis_sim = disenar_mundos(num_nodes, m_eval, market, num_dias=TRAIN_DAYS, semilla=semilla_eval)
     nodos_r, dias_r = casos_replay(num_nodes, rate_stack[TRAIN_DAYS:].shape[0])
     dis_rep = dict(nodo=nodos_r.astype(np.int64), start_day=dias_r.astype(np.int64), world_seed=None)
     resumenes, arcos_sim, arcos_rep = [], None, None
     for K in K_TRAINING_LEVELS:
         k_sim, k_rep = [K] * m_eval, [K] * len(nodos_r)
-        arcos_sim = arcos_drl_q(esc_sim, dis_sim, k_sim)
-        arcos_rep = arcos_drl_q(esc_rep, dis_rep, k_rep)
+        arcos_sim = arcos_ruta(esc_sim, dis_sim, k_sim)
+        arcos_rep = arcos_ruta(esc_rep, dis_rep, k_rep)
         etq = f"simulado K={_etiqueta_k(K)}", f"replay K={_etiqueta_k(K)}"
         resumenes += [resumen_arcos(arcos_sim, etq[0]), resumen_arcos(arcos_rep, etq[1])]
         u_res_s, u_dif_s, u_pm_s = comparar_umbral(esc_sim, dis_sim, k_sim, etq[0])
@@ -610,9 +587,9 @@ def _run_pricing_validation(
         tablas[f"umbral_resumen{sfx}"] = pd.concat([u_res_s, u_res_r], ignore_index=True)
         tablas[f"umbral_diferencias{sfx}"] = pd.concat([u_dif_s, u_dif_r], ignore_index=True)
         tablas[f"umbral_por_mundo{sfx}"] = pd.concat([u_pm_s, u_pm_r], ignore_index=True)
-        tablas[f"arcos_drl_q_simulado{sfx}"], tablas[f"arcos_drl_q_replay{sfx}"] = arcos_sim, arcos_rep
+        tablas[f"arcos_simulado{sfx}"], tablas[f"arcos_replay{sfx}"] = arcos_sim, arcos_rep
         if verbose:
-            print(f"\n  (c)/(d) arcos de DRL-Q y regla por umbral, K={_etiqueta_k(K)} ({time.time() - t0:.0f} s)")
+            print(f"\n  (c)/(d) arcos de la ruta y regla por umbral, K={_etiqueta_k(K)} ({time.time() - t0:.0f} s)")
             print(tablas[f"umbral_resumen{sfx}"].to_string(index=False, float_format=lambda x: f"{x:.2f}"))
             print(tablas[f"umbral_diferencias{sfx}"].to_string(index=False, float_format=lambda x: f"{x:.2f}"))
     tablas["arcos_resumen"] = pd.DataFrame(resumenes)
@@ -621,15 +598,6 @@ def _run_pricing_validation(
             print(tablas["arcos_resumen"].T.to_string(float_format=lambda x: f"{x:.3f}"))
     _fig_plausibilidad(arcos_sim, os.path.join(d_fig, "plausibilidad.png"))
 
-    # ── (c) márgenes pareados desde el arnés ───────────────────────────────
-    eval_df = pd.concat([d for d in (sim_df, replay_df) if d is not None and not d.empty], ignore_index=True) \
-        if (sim_df is not None or replay_df is not None) else None
-    if eval_df is not None:
-        pareada, relativa = utilidad_pareada(eval_df)
-        tablas["utilidad_pareada"], tablas["utilidad_relativa_actor"] = pareada, relativa
-        if verbose and len(relativa):
-            print("\n  (c) DRL-Q frente al actor (relativa al margen del actor):")
-            print(relativa.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
     curva_csv = os.path.join(out, "post_training_curva.csv")
     if os.path.exists(curva_csv):
         tablas["post_curva"] = pd.read_csv(curva_csv)                      # error de Ṽ en validación (post_training.py)
@@ -641,9 +609,9 @@ def _run_pricing_validation(
 
 
 def _hoja_arcos(tablas: dict) -> pd.DataFrame:
-    """Una fila por arco de las rutas de DRL-Q (simulado y replay), lista para la hoja "Pricing arcos"."""
+    """Una fila por arco de la ruta del actor (simulado y replay), lista para la hoja "Pricing arcos"."""
     partes = []
-    for k, nombre in (("arcos_drl_q_simulado", "simulado"), ("arcos_drl_q_replay", "replay (días 90-119)")):
+    for k, nombre in (("arcos_simulado", "simulado"), ("arcos_replay", "replay (días 90-119)")):
         for clave in [c for c in tablas if c.startswith(k)]:
             d = tablas[clave].copy()
             sufijo = clave[len(k):].replace("_K", " K=")
@@ -667,7 +635,7 @@ def _hoja_arcos(tablas: dict) -> pd.DataFrame:
 
 def append_pricing_sheet(excel_path: str, tablas: dict) -> None:
     """Agrega al Excel de resultados la hoja "Pricing" (resúmenes de la validación) y la hoja "Pricing arcos" (el
-    precio de reserva de cada arco de las rutas de DRL-Q: p*, rango, tarifa de hoy, break-even y percentil), sin
+    precio de reserva de cada arco de la ruta del actor: p*, rango, tarifa de hoy, break-even y percentil), sin
     tocar las demás hojas."""
     secciones = []
     if "post_curva" in tablas and len(tablas["post_curva"]):
@@ -678,16 +646,12 @@ def append_pricing_sheet(excel_path: str, tablas: dict) -> None:
     for k in tablas:
         if k.startswith("contrafactual_resumen"):
             secciones.append(("Contrafactual — sesgo = p* predicho − p* realizado (USD/mi y USD/lane); IC95 por bootstrap de mundos", tablas[k]))
-    secciones.append(("Arcos de DRL-Q: p* vs break-even, percentil histórico y correlación con el índice del destino", tablas["arcos_resumen"]))
+    secciones.append(("Arcos de la ruta: p* vs break-even, percentil histórico y correlación con el índice del destino", tablas["arcos_resumen"]))
     for k in tablas:
         if k.startswith("umbral_resumen"):
             secciones.append(("Regla de aceptación por umbral (pisos: break-even, break-even + margen, p*)", tablas[k]))
         elif k.startswith("umbral_diferencias"):
             secciones.append(("Regla por umbral — diferencias pareadas de margen (p* − piso), IC95 por mundo", tablas[k]))
-    for k in ("utilidad_relativa_actor", "utilidad_pareada"):
-        if k in tablas and len(tablas[k]):
-            secciones.append(("DRL-Q frente al actor y los baselines (diferencias pareadas, IC95 por mundo)" if k == "utilidad_pareada"
-                              else "DRL-Q − DRL relativa al margen del actor (alerta_parada: límite superior del IC95 < −2 %)", tablas[k]))
     nota = ("p* es el costo de oportunidad del transportista (tarifa mínima por milla a la que aceptar la lane "
             "iguala a su mejor alternativa); no es una probabilidad de aceptación del cliente. Su rango [mín, máx] "
             "(parejas AB/BA) mide la variabilidad del estimador, no es un intervalo de confianza. "
@@ -762,16 +726,16 @@ def cargar_datos(num_nodes):
 
 
 def main():
+    """Carga un checkpoint con las cabezas Ṽ A/B ya entrenadas (post_training.py) y corre (b)/(c)/(d) sobre las
+    rutas que la política congelada calcula en mundos frescos. No entrena ni evalúa el ruteo contra sus
+    baselines (B1-B3/UB-PI/UB-DP) — eso ya se hizo aparte, en main.py/evaluation.py."""
     from transfer_learning import checkpoint_tiene_post_head, load_checkpoint_compatible
-    from baselines.dp_relajada import cargar_o_calcular_tabla
-    from evaluation import evaluar_mundos_simulados, evaluar_replay
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--num-nodes", type=int, default=10)
     ap.add_argument("--checkpoint", help="ruta del .pt con las cabezas Ṽ (default: checkpoints[/RUN_TAG]/am_checkpoint_<N>nodes_pricing.pt)")
     ap.add_argument("--restringido", action="store_true", help="valida con K libre y K = K_MAX (default: solo K libre)")
     ap.add_argument("--output-dir", help="carpeta de salida (default: results/<N>nodes[_<RUN_TAG>])")
     ap.add_argument("--quick", action="store_true", help="tamaños reducidos para una prueba rápida")
-    ap.add_argument("--sin-arnes", action="store_true", help="no corre el arnés de evaluación (omite las diferencias pareadas de margen)")
     a = ap.parse_args()
 
     configurar_k(a.restringido)
@@ -783,22 +747,7 @@ def main():
     agent.eval()
     d = cargar_datos(a.num_nodes)
     tam = dict(n_mundos_cf=200, n_estados_cf=100, m_eval=60) if a.quick else {}
-    sim_df = replay_df = None
-    if not a.sin_arnes:
-        tabla = cargar_o_calcular_tabla(d["market"], d["time_matrix"], d["distance_arr"], d["diesel_arr"])
-        cache = os.path.join(cwd, "datos", "cache_eval")
-        sim_df = evaluar_mundos_simulados(
-            agent, d["market"], tabla, d["time_matrix"], d["rate_stack"][:TRAIN_DAYS], d["loads_stack"][:TRAIN_DAYS],
-            d["distance_arr"], d["diesel_arr"], a.num_nodes, d["ltr_stack"],
-            d["avail_expected_arr"], d["reward_global_p95"], k_levels=tuple(K_TRAINING_LEVELS),
-            M=tam.get("m_eval", MARKET_M_EVAL_WORLDS),
-            cache_path=None if a.quick else os.path.join(cache, f"baselines_simulado_{a.num_nodes}nodos.pkl"))
-        replay_df = evaluar_replay(
-            agent, d["market"], tabla, d["time_matrix"], d["rate_stack"][TRAIN_DAYS:], d["loads_stack"][TRAIN_DAYS:],
-            d["distance_arr"], d["diesel_arr"], a.num_nodes, d["ltr_stack"][:, TRAIN_DAYS:],
-            d["avail_expected_arr"], d["reward_global_p95"], k_levels=tuple(K_TRAINING_LEVELS),
-            cache_path=None if a.quick else os.path.join(cache, f"baselines_replay_{a.num_nodes}nodos.pkl"))
-    run_pricing_validation(agent, a.num_nodes, **d, output_dir=a.output_dir, sim_df=sim_df, replay_df=replay_df, **tam)
+    run_pricing_validation(agent, a.num_nodes, **d, output_dir=a.output_dir, **tam)
 
 
 if __name__ == "__main__":

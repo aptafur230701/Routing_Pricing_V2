@@ -50,7 +50,7 @@ anteriores se cargan con esa columna en cero, ver transfer_learning.py):
 
 Condicionamiento en presupuesto de cardinalidad K:
   ContextNetwork recibe, además del bloque temporal y de mercado, un bloque
-  separado de budget features (ver build_budget_features/_batch): k_remaining
+  separado de budget features (ver build_budget_features_batch): k_remaining
   normalizado por K_NORM (constante global) y un flag k_restricted. No forma
   parte de N_NODE_FEATURES (no es una feature por nodo).
 
@@ -73,7 +73,7 @@ N_INDEX_FEATURES      = 1   # índice de mercado: siempre la última columna
 N_NODE_FEATURES = N_BASE_NODE_FEATURES + (N_CONT_FEATURES if USE_CONTINUATION_FEATURES else 0) + N_INDEX_FEATURES
 
 # Número de features de presupuesto de cardinalidad K — debe coincidir con
-# build_budget_features() / build_budget_features_batch().
+# build_budget_features_batch().
 N_BUDGET_FEATURES = 2
 
 # Día de la semana (one-hot, lunes = 0) del día en que está el camión: el proceso de cargas
@@ -453,7 +453,7 @@ class ContextNetwork(nn.Module):
     d_h      : int — dimensión del embedding (debe coincidir con AttentionEncoder).
     n_market : int — número de features de mercado adicionales (default 1).
     n_budget : int — número de features de presupuesto K (default 2, ver
-               build_budget_features()).
+               build_budget_features_batch()).
     n_dow    : int — one-hot del día de la semana (default N_DOW_FEATURES = 7).
     """
 
@@ -494,57 +494,15 @@ class ContextNetwork(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Utilidad: features de mercado para ContextNetwork
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_market_features(
-    current_node: int,
-    day_idx:      int,
-    ltr_stack:    np.ndarray,   # [num_nodes, 120]
-) -> np.ndarray:
-    """Construye el vector de market features (1,) para ContextNetwork.
-
-    [0] ltr_norm — LTR del hub actual en el día actual, normalizado a [0,1].
-    """
-    ltr_raw  = float(ltr_stack[current_node, day_idx])
-    ltr_norm = min(ltr_raw, LTR_CLIP) / LTR_CLIP
-    return np.array([ltr_norm], dtype=np.float32)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Utilidad: features de presupuesto de cardinalidad K para ContextNetwork
 # ─────────────────────────────────────────────────────────────────────────────
-
-def build_budget_features(
-    k_remaining:  int,
-    k_restricted: bool,
-    k_norm:       float = K_NORM,
-) -> np.ndarray:
-    """Construye el vector de budget features (2,) para ContextNetwork.
-
-    [0] k_remaining_norm — k_remaining / K_NORM, escala el presupuesto
-        restante a [0, 1] (con K_NORM = K_MAX, arranca en 1.0 y baja a
-        1/K_MAX en el último arco antes del retorno forzado). 1.0 constante
-        si k_restricted es False (caso libre).
-    [1] k_restricted — 1.0 si el episodio tiene presupuesto K activo, 0.0 si
-        es el caso libre.
-
-    k_remaining puede ser None cuando k_restricted es False (no se
-    dereferencia en ese caso).
-    """
-    if k_restricted:
-        k_remaining_norm = float(k_remaining) / float(k_norm)
-    else:
-        k_remaining_norm = 1.0
-    return np.array([k_remaining_norm, float(bool(k_restricted))], dtype=np.float32)
-
 
 def build_budget_features_batch(
     k_remaining:  np.ndarray,   # (B,) int64 — indefinido donde k_restricted es False
     k_restricted: np.ndarray,   # (B,) bool
     k_norm:       float = K_NORM,
 ) -> np.ndarray:                # (B, 2) float32
-    """Batched version of build_budget_features."""
+    """k_remaining_norm (1.0 si caso libre) y flag k_restricted, para ContextNetwork."""
     restricted = np.asarray(k_restricted, dtype=bool)
     B = len(restricted)
     out = np.empty((B, 2), dtype=np.float32)
@@ -670,7 +628,7 @@ def build_temporal_features_batch(
     max_duration: float,
     num_nodes:    int,
 ) -> np.ndarray:                # (B, 3) float32
-    """Batched version of build_temporal_features."""
+    """Features temporales (elapsed/remaining/progreso) para ContextNetwork, batcheadas."""
     denom = max(max_duration, 1e-6)
     out = np.empty((len(time_elapsed), 3), dtype=np.float32)
     out[:, 0] = np.minimum(time_elapsed, max_duration) / denom
@@ -684,7 +642,7 @@ def build_market_features_batch(
     day_idx:      np.ndarray,   # (B,) int64
     ltr_stack:    np.ndarray,   # (N, num_ltr_days)
 ) -> np.ndarray:                # (B, 1) float32
-    """Batched version of build_market_features."""
+    """LTR del hub actual en el día actual, normalizado a [0,1], para ContextNetwork (batcheado)."""
     max_ltr_day = ltr_stack.shape[1] - 1
     day_idx_safe = np.minimum(day_idx, max_ltr_day)
     ltr_raw = ltr_stack[current_node, day_idx_safe].astype(np.float32)   # (B,)
@@ -692,24 +650,3 @@ def build_market_features_batch(
     return ltr_norm[:, None]   # (B, 1)
 
 
-def build_temporal_features(
-    time_elapsed: float,
-    step_count:   int,
-    max_duration: float,
-    num_nodes:    int,
-) -> np.ndarray:
-    """
-    Construye el vector de features temporales (3,) para ContextNetwork.
-
-    [0] elapsed_time_norm   = time_elapsed / max_duration           (0-1)
-    [1] remaining_time_norm = max(0, max_duration - time_elapsed) / max_duration  (0-1)
-    [2] progress_fraction   = step_count / num_nodes                (puede pasar de 1: se puede revisitar)
-
-    El tensor sigue siendo shape (3,) — sin cambio de dimensión.
-    """
-    denom = max(max_duration, 1e-6)
-    return np.array([
-        min(time_elapsed, max_duration) / denom,
-        max(0.0, max_duration - time_elapsed) / denom,
-        step_count / max(num_nodes, 1),
-    ], dtype=np.float32)

@@ -1,7 +1,7 @@
 conjunto,umbral,margen_medio,validez,largo_tour_medio,n_mundos
-simulado K=libre,break-even,1485.257,1.0,2.707,1000
-simulado K=libre,break-even + 0.30,1485.518,1.0,2.701,1000
-simulado K=libre,p* de DRL-Q,2154.684,1.0,3.589,1000
-replay K=libre,break-even,1829.6866666666667,1.0,2.68,300
-replay K=libre,break-even + 0.30,1843.9433333333334,1.0,2.716666666666667,300
-replay K=libre,p* de DRL-Q,2552.86,1.0,3.5533333333333332,300
+simulado K=libre,break-even,2008.724,1.0,2.67,1000
+simulado K=libre,break-even + 0.30,2021.241,1.0,2.644,1000
+simulado K=libre,p*,2761.929,1.0,3.335,1000
+replay K=libre,break-even,1499.0333333333333,1.0,2.6033333333333335,300
+replay K=libre,break-even + 0.30,1438.4733333333334,1.0,2.513333333333333,300
+replay K=libre,p*,2250.0266666666666,1.0,3.5733333333333333,300

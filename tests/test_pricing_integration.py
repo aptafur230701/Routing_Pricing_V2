@@ -1,8 +1,8 @@
 """
 test_pricing_integration.py
 ===========================
-validate_pricing.py (corrida reducida), pestaña "Pricing" del Excel, formato del bloque de precios de
-inference.py y DRL-Q dentro del arnés de evaluation.py.
+validate_pricing.py (corrida reducida), pestaña "Pricing" del Excel y formato del bloque de precios de
+inference.py.
 """
 
 import numpy as np
@@ -72,7 +72,7 @@ def test_validacion_escribe_tablas_y_figuras(resultado):
     for t in ("contrafactual_resumen", "contrafactual_estados", "arcos_resumen", "umbral_resumen", "umbral_diferencias"):
         assert (base / "tables" / f"{t}.csv").exists()
     assert set(tablas) >= {"contrafactual_resumen", "arcos_resumen", "umbral_resumen", "umbral_diferencias",
-                           "arcos_drl_q_simulado", "arcos_drl_q_replay"}
+                           "arcos_simulado", "arcos_replay"}
 
 
 def test_validacion_resultados_coherentes(resultado):
@@ -82,7 +82,7 @@ def test_validacion_resultados_coherentes(resultado):
     assert cf.loc[1:, "n_estados"].sum() == cf.loc[0, "n_estados"]
     ar = t["arcos_resumen"]
     assert len(ar) == 2 and ar["pct_p_bajo_breakeven"].between(0, 100).all()
-    sim = t["arcos_drl_q_simulado"]
+    sim = t["arcos_simulado"]
     con_p = sim[sim["p"].notna()]
     assert len(con_p) and con_p["percentil"].dropna().between(0, 100).all() and (con_p["p_min"] <= con_p["p"] + 1e-9).all()
     assert con_p["tiene_carga"].all() and not con_p["es_retorno"].any()
@@ -103,14 +103,14 @@ def test_pestana_pricing_en_excel(resultado, tmp_path):
     textos = [c for c in celdas if isinstance(c, str)]
     assert "Nota" in textos
     # todas las secciones sobreviven en la hoja (no solo la última)
-    for titulo in ("Contrafactual", "Arcos de DRL-Q", "Regla de aceptación por umbral"):
+    for titulo in ("Contrafactual", "Arcos de la ruta", "Regla de aceptación por umbral"):
         assert any(t.startswith(titulo) for t in textos), titulo
     assert "sesgo_usd_milla" in textos and "pct_p_bajo_breakeven" in textos
     arcos = pd.read_excel(xlsx, sheet_name="Pricing arcos")
     assert {"conjunto", "ruta", "desde", "hacia", "rate_hoy", "p_estrella", "p_estrella_min", "p_estrella_max",
             "break_even", "percentil_historico", "posicion_valiosa", "nota"} <= set(arcos.columns)
     assert set(arcos["conjunto"]) == {"simulado", "replay (días 90-119)"}
-    n = len(t["arcos_drl_q_simulado"]) + len(t["arcos_drl_q_replay"])
+    n = len(t["arcos_simulado"]) + len(t["arcos_replay"])
     assert len(arcos) == n
     # cada ruta se ve completa: las filas sin p* llevan su explicación
     assert (arcos.loc[arcos["p_estrella"].isna(), "nota"].fillna("") != "").all()

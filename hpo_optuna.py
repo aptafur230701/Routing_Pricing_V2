@@ -82,7 +82,7 @@ import torch
 
 import am_training
 from baselines.politicas import calcular_ev_pronostico
-from config import SEED
+from config import SEED, set_seeds
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
 
@@ -105,15 +105,6 @@ _SEED_STEP_OFFSET = 100_000  # separa el espacio de `step` por semilla dentro
 def _restore_baseline():
     for name, value in _BASELINE.items():
         setattr(am_training, name, value)
-
-
-def set_seeds(seed: int):
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
 
 
 def make_objective(num_nodes: int, updates_per_trial: int, data: dict, seeds: list):

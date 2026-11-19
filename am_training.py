@@ -367,9 +367,9 @@ def _evaluate_greedy(
 
 
 class ValidacionSimulada:
-    """Validación del greedy en mundos simulados fijos, contra B3 y UB-DP.
+    """Validación del greedy en episodios fijos, contra B3 y UB-DP.
 
-    Un conjunto fijo de mundos (nodo, día de la semana y semilla balanceados, con la semilla
+    Un conjunto fijo de episodios (nodo, día de la semana y semilla balanceados, con la semilla
     propia MARKET_SEED_VAL) se evalúa por cada nivel de K de K_TRAINING_LEVELS en una sola
     llamada batcheada de greedy_rollout. Reporta el margen en USD (suma de lane_reward, la
     métrica de la evaluación final) y su gap contra UB-DP; B3 y UB-DP se calculan una sola vez.
@@ -396,11 +396,11 @@ class ValidacionSimulada:
             num_nodes=num_nodes, max_duration=MAX_DURATION, market_process=market_process,
             distance_arr=distance_arr, diesel_arr=diesel_arr,
         )
-        # Referencias: B3 (política de la tabla V) y UB-DP, promedio sobre los mismos mundos.
+        # Referencias: B3 (política de la tabla V) y UB-DP, promedio sobre los mismos episodios.
         tabla = cargar_o_calcular_tabla(market_process, time_matrix, distance_arr, diesel_arr, verbose=False)
         b3 = PoliticaB3(tabla, distance_arr, diesel_arr)
         self.ref = {}
-        self.b3_mundos = {}   # K → (M,) márgenes de B3 mundo a mundo (para la diferencia pareada)
+        self.b3_mundos = {}   # K → (M,) márgenes de B3 episodio a episodio (para la diferencia pareada)
         for K in self.niveles:
             margenes, ubs = [], []
             for m in range(M):
@@ -426,7 +426,7 @@ class ValidacionSimulada:
             v = res.valid[sl]
             m = float(res.raw_reward[sl][v].mean()) if v.any() else 0.0
             ub = self.ref[K]["ub_dp"]
-            dif_b3 = float(np.mean(res.raw_reward[sl] - self.b3_mundos[K]))   # media de (DRL − B3) mundo a mundo
+            dif_b3 = float(np.mean(res.raw_reward[sl] - self.b3_mundos[K]))   # media de (DRL − B3) episodio a episodio
             out["por_k"]["free" if K is None else str(K)] = {
                 "margen": m, "valid_rate": float(v.mean()), "dif_b3": dif_b3,
                 "gap_ub_dp_pct": float((ub - m) / abs(ub) * 100.0) if ub else float("nan"),
@@ -485,9 +485,9 @@ def run_am_training(
                      propia, generada desde MARKET_SEED_TRAIN) en vez de leerse del histórico; el
                      día de inicio solo aporta el día de la semana. No se usa rm_pen_stack.
     best_checkpoint_path : con market_process, guarda {"agent", "critic"} del update con mejor
-                     margen en los mundos de validación (ValidacionSimulada). El log trae el margen
+                     margen en los episodios fijos de validación (ValidacionSimulada). El log trae el margen
                      de validación en `val`, y `greedy_reward` / `greedy_valid_rate` pasan a ser el
-                     margen (USD) y la validez en esos mundos.
+                     margen (USD) y la validez en esos episodios.
     trial_callback : callable opcional fn(step, n_updates, log_entry) -> bool, invocado en
                      cada update de log_freq; si devuelve True, el entrenamiento se detiene
                      ahí mismo (usado por hpo_optuna.py para pruning).
@@ -626,7 +626,8 @@ def run_am_training(
         f"({n_updates} updates × {n_episodes_per_update} ep/update) ---"
     )
     if market_process is not None:
-        print("Modo: proceso exógeno de cargas y tarifas (market_process) — un mundo por episodio.")
+        print("Mercado: realizaciones diarias — cada episodio sortea una vez hub inicial, día real "
+              "inicial y corrimiento de nivel δ.")
 
     # ── Set fijo de evaluación greedy (mismos episodios en cada chequeo) ──────
     # RandomState propio, separado del RNG global de numpy: así no perturba la
@@ -639,7 +640,7 @@ def run_am_training(
     # dedicado (nunca np.random global), calculado una sola vez.
     eval_k_levels    = _balanced_k_assignment(n_eval_episodes, eval_rng)
 
-    # ── Validación en mundos simulados (solo con proceso exógeno) ─────────────
+    # ── Validación con episodios fijos (solo con proceso exógeno) ─────────────
     val = None
     if market_process is not None:
         val = ValidacionSimulada(
@@ -651,8 +652,10 @@ def run_am_training(
             f"K={'libre' if K is None else K}: B3 {r['b3']:.0f}, UB-DP {r['ub_dp']:.0f}"
             for K, r in val.ref.items()
         )
-        print(f"Validación: {val.M} mundos × K∈{{{', '.join('libre' if K is None else str(K) for K in val.niveles)}}} "
-              f"(semilla {MARKET_SEED_VAL}) | referencias (USD): {refs}")
+        print(f"Validación: {val.M} episodios fijos (hub, día inicial y δ sorteados una vez, semilla "
+              f"{MARKET_SEED_VAL}) "
+              f"× K∈{{{', '.join('libre' if K is None else str(K) for K in val.niveles)}}} "
+              f"| referencias (USD): {refs}")
     best_score = -np.inf
     # Selección por media móvil: pesos (CPU) y score de las últimas CKPT_WINDOW validaciones.
     ventana = deque(maxlen=CKPT_WINDOW)
@@ -1129,7 +1132,7 @@ def run_am_training(
         es_log = (update + 1) % log_freq == 0
 
         with fases("validacion"):
-            # Validación en mundos simulados (observacional); guarda el mejor update.
+            # Validación con episodios fijos (observacional); guarda el mejor update.
             v = None
             if val is not None and (es_log or (update + 1) % val_freq == 0 or update == n_updates - 1):
                 v = val.evaluar(agent)
@@ -1181,25 +1184,32 @@ def run_am_training(
                 greedy_reward, greedy_valid_rate = v["margen"], v["valid_rate"]
 
             episodes_done = (update + 1) * n_episodes_per_update
-            # Línea compacta; loss/pol/val/clip/r_greedy/sc_adv/sc_loss siguen
-            # en training_log y en las gráficas de plot_ppo_diagnostics.
-            if val is None:
-                monitor = f"| greedy {greedy_reward:6.1f} "
-            else:
-                monitor = "| val " + " ".join(
-                    f"K={k}:{d['margen']:.0f} (Δ vs B3 {d['dif_b3']:+.1f}, gapDP {d['gap_ub_dp_pct']:.1f}%, B3 {d['b3']:.0f})"
-                    for k, d in v["por_k"].items()
-                ) + (f" | MA{CKPT_WINDOW} {log_entry['val_ma']:.0f} " if log_entry.get("val_ma") is not None else " ") \
-                  + (f"*guardado upd {log_entry['ckpt_update']} " if log_entry.get("val_best") else "")
+            # Detalle completo (loss/pol/val/clip/r_greedy/sc_adv/sc_loss) sigue
+            # en training_log y en las gráficas de plot_ppo_diagnostics; esto es
+            # solo el resumen de consola.
             print(
                 f"  update {update+1:>5}/{n_updates} "
-                f"| ep {episodes_done:>6}/{total_episodes} "
-                f"| reward {avg_reward:6.1f} "
-                f"{monitor}"
-                f"| greedy_valid {greedy_valid_rate:.2f} "
-                f"| ent {avg_entropy:.3f} "
-                f"| kl {avg_kl:.4f} "
-                f"| ev {explained_var:.3f}"
+                f"| episodios {episodes_done:>6}/{total_episodes} "
+                f"| reward_train {avg_reward:6.1f}"
+            )
+            if val is None:
+                print(f"    greedy={greedy_reward:.1f}usd")
+            else:
+                val_linea = " ; ".join(
+                    f"val[K={'libre' if k == 'free' else k}] margen={d['margen']:.0f}usd "
+                    f"(vs_B3 {d['dif_b3']:+.1f}usd, gap_UBDP {d['gap_ub_dp_pct']:.1f}%, ref_B3={d['b3']:.0f}usd)"
+                    for k, d in v["por_k"].items()
+                )
+                print(f"    {val_linea}")
+                if log_entry.get("val_ma") is not None:
+                    ckpt = (f" *checkpoint guardado (mejor update={log_entry['ckpt_update']})"
+                            if log_entry.get("val_best") else "")
+                    print(f"    MA({CKPT_WINDOW} val)={log_entry['val_ma']:.0f}usd{ckpt}")
+            print(
+                f"    validez={greedy_valid_rate:.0%} "
+                f"| entropia={avg_entropy:.3f} "
+                f"| KL={avg_kl:.4f} "
+                f"| var_explicada={explained_var:.3f}"
             )
 
             # Resumen compacto de diagnósticos de K — conformidad debe ser

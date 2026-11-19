@@ -1,23 +1,19 @@
 """
 test_escenario.py
 =================
-Escenario (validate_pricing.py): reproducción del prefijo, selector de DRL-Q, regla por umbral y la prueba
-contrafactual, con un agente aleatorio en CPU sobre los datos reales de N=10 (K libre).
+Escenario (validate_pricing.py): reproducción del prefijo, regla por umbral y la prueba contrafactual, con un
+agente aleatorio en CPU sobre los datos reales de N=10 (K libre). La ruta siempre es la del actor (greedy):
+no hay un segundo método de ruteo por Q.
 """
 
 import numpy as np
-import pandas as pd
 import pytest
 import torch
 
 import validate_pricing as vp
 from model.agent import AMRoutingAgent
-from config import (
-    AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, TRAIN_DAYS, MARKET_SEED_VAL, REWARD_SCALE_FACTOR as S, configurar_k,
-)
+from config import AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, TRAIN_DAYS, MARKET_SEED_VAL, configurar_k
 from evaluation import disenar_mundos
-from greedy_rollout import greedy_rollout
-from pricing import crear_selector_q, q_values
 
 NUM_NODES = 10
 
@@ -50,20 +46,18 @@ def mundos(datos):
     return disenar_mundos(NUM_NODES, M, datos["market"], num_dias=TRAIN_DAYS, semilla=MARKET_SEED_VAL), [None] * M
 
 
-@pytest.mark.parametrize("modo", ["greedy", "q"])
-def test_reproducir_con_la_accion_original_reproduce_la_trayectoria(esc, mundos, modo):
+def test_reproducir_con_la_accion_original_reproduce_la_trayectoria(esc, mundos):
     """Prefijo + la acción tomada en el paso k ⇒ misma lane en k y mismo margen posterior (el actor greedy
-    es determinista; para DRL-Q la continuación es la del actor, así que solo se compara el primer paso)."""
+    es determinista)."""
     dis, k = mundos
-    recs = esc.recolectar(dis, k, modo=modo, con_valores=esc.con_cabezas)
+    recs = esc.recolectar(dis, k, modo="greedy", con_valores=esc.con_cabezas)
     acc = {}
     for r in recs:
         acc.setdefault(r["b"], []).append(r["j"])
     out = esc.reproducir([r["start"] for r in recs], [r["start_day"] for r in recs], [r["world_seed"] for r in recs],
                          [r["k"] for r in recs], [acc[r["b"]][:r["step"]] for r in recs], [r["j"] for r in recs])
     np.testing.assert_allclose(out["r_forzada"], [r["r_raw"] for r in recs], atol=1e-3)
-    if modo == "greedy":
-        np.testing.assert_allclose(out["cont"], [r["futuro_usd"] for r in recs], atol=1e-3)
+    np.testing.assert_allclose(out["cont"], [r["futuro_usd"] for r in recs], atol=1e-3)
     assert out["valida"].all()
 
 
@@ -80,37 +74,6 @@ def test_rama_distinta_cambia_solo_desde_el_estado(esc, mundos):
         esperado = np.round((r["rate"][a] * esc.dist[i, a] if r["loads"][a] > 0 else 0.0) - esc.cost[i, a], 0)
         assert rf == pytest.approx(esperado, abs=1.01)
     assert out["h"].shape == (len(recs), AM_D_H) and torch.isfinite(out["h"]).all() and torch.isfinite(out["e"]).all()
-
-
-def test_selector_q_es_el_argmax_de_q_hecho_a_mano(esc, mundos):
-    dis, k = mundos
-    env = esc.make_env()
-    masks = env.reset(dis["nodo"], dis["start_day"], k_max_arr=k, world_seeds=dis["world_seed"])
-    h_t, emb, _ = esc.encode(env, masks)
-    sel = crear_selector_q(esc.agent, esc.dist, esc.diesel, S)(h_t, emb, masks, env)
-    va, vb = esc.valores(h_t, emb)
-    for b in range(len(sel)):
-        i = int(env.current_node[b])
-        q = q_values(env.rate_row_obs[b].astype(float), env.loads_row_obs[b], esc.dist[i], esc.cost[i], S,
-                     0.5 * (va[b] + vb[b]), int(env.start_node[b]))
-        q[masks[b] == 0] = -np.inf
-        assert sel[b] == int(np.argmax(q))
-        assert masks[b][sel[b]] == 1
-
-
-def test_recolectar_q_coincide_con_greedy_rollout_con_selector(esc, mundos, datos):
-    """El rollout vectorizado de DRL-Q (recolectar) y el de greedy_rollout con el selector dan el mismo margen."""
-    dis, k = mundos
-    recs = esc.recolectar(dis, k, modo="q")
-    margen = np.zeros(len(k))
-    for r in recs:
-        margen[r["b"]] += r["r_raw"]
-    d = datos
-    res = greedy_rollout(esc.agent, esc.make_env(), dis["nodo"], dis["start_day"], np.asarray(d["time_matrix"], float),
-                         d["distance_arr"], d["ltr_stack"], d["reward_global_p95"], NUM_NODES,
-                         k_max_arr=k, avail_expected_arr=d["avail_expected_arr"], world_seeds=dis["world_seed"],
-                         ev_esperado=d["ev_esperado"], selector=esc.selector_q, device=torch.device("cpu"))
-    np.testing.assert_allclose(margen, res.raw_reward, atol=1e-3)
 
 
 def test_umbral_devuelve_un_episodio_valido_por_mundo(esc, mundos):

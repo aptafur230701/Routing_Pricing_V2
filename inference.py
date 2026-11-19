@@ -6,7 +6,7 @@ Inferencia en tiempo real con el modelo AM entrenado.
 Carga el checkpoint con las cabezas Ṽ A/B (am_checkpoint_<NUM_NODES>nodes_pricing.pt, ver post_training.py) y
 genera, desde el nodo que el usuario ingrese y con los datos del día más reciente, dos salidas:
 
-  · la RUTA de DRL-Q: en cada nodo, el argmax de Q(s, a) = r_obs(i→a)/S + Ṽ(s, a), con Ṽ = promedio de A y B;
+  · la RUTA del DRL (actor): en cada nodo, el argmax de la política entrenada (el único método de ruteo);
   · el PRECIO DE RESERVA p* por arco (pricing.py): la tarifa mínima por milla a la que al camión le conviene
     aceptar la lane frente a su mejor alternativa. Se imprime también su rango [mín, máx] entre las parejas AB/BA
     (variabilidad del estimador por partición de datos y ruido de etiquetas, NO es un intervalo de confianza) y se
@@ -19,7 +19,7 @@ Uso
 ---
     python inference.py [--show-board] [--start-node K] [--num-nodes N] [--checkpoint RUTA]
 
-  --show-board   en cada nodo, tabla con el p* de cada lane saliente con carga (además de la acción de DRL-Q)
+  --show-board   en cada nodo, tabla con el p* de cada lane saliente con carga (además de la acción del DRL)
   --start-node   corre un solo tour desde ese nodo, sin el loop interactivo
 """
 
@@ -38,7 +38,7 @@ from baselines.politicas import calcular_ev_pronostico
 from evaluation import make_replay_env
 from greedy_rollout import greedy_rollout
 from market_process import MarketProcess, asegurar_parametros
-from pricing import lane_cost_row, percentil_historico, reservation_price, crear_selector_q
+from pricing import lane_cost_row, percentil_historico, reservation_price
 from problem_data import load_matrices
 from transfer_learning import checkpoint_tiene_post_head, load_checkpoint_compatible
 
@@ -114,15 +114,16 @@ CSV_COLUMNS = ["episode_id", "step", "from", "to", "rate_hoy", "p_estrella", "p_
 
 
 def _rollout_con_pricing(agent, start_node, day, with_board) -> tuple:
-    """Rollout de DRL-Q (argmax de Q) con el p* de cada arco. Retorna (route, reward, duración, arcos, tableros).
+    """Rollout del DRL (actor, argmax de la política) con el p* de cada arco. Retorna (route, reward, duración,
+    arcos, tableros).
 
-    El selector de DRL-Q elige la acción de cada paso y un hook de greedy_rollout calcula el precio de reserva
-    del arco elegido antes de que el entorno lo ejecute. tableros[k] = lanes con carga ofertadas en el paso k.
-    route es None si el tour no cierra el ciclo dentro de max_duration.
+    El actor elige la acción de cada paso (el único método de ruteo) y un hook de greedy_rollout calcula el
+    precio de reserva del arco elegido antes de que el entorno lo ejecute — p* nunca re-decide la ruta, solo la
+    valora. tableros[k] = lanes con carga ofertadas en el paso k. route es None si el tour no cierra el ciclo
+    dentro de max_duration.
     """
     env, N = day["env"], NUM_NODES
     arcos, tableros = [], []
-    selector = crear_selector_q(agent, day["distance_arr"], day["diesel_arr"], REWARD_SCALE_FACTOR)
 
     def hook(c):
         h_t, emb = c["h_t"][:1], c["embeddings"][:1]
@@ -150,7 +151,7 @@ def _rollout_con_pricing(agent, start_node, day, with_board) -> tuple:
         day["time_matrix_arr"], day["distance_arr"], day["ltr_stack"],
         day["reward_global_p95"], NUM_NODES,
         k_max_arr=[None], avail_expected_arr=day["avail_expected_arr"],
-        ev_esperado=day["ev_esperado"], selector=selector, step_hook=hook,
+        ev_esperado=day["ev_esperado"], step_hook=hook,
     )
     if not res.valid[0]:
         return None, -np.inf, np.inf, arcos, tableros
@@ -179,7 +180,7 @@ def formatear_bloque(route, arcos) -> str:
 
 
 def formatear_tablero(i, tablero) -> str:
-    """Tabla del p* de cada lane saliente con carga ofertada en el nodo i (la elegida por DRL-Q lleva *)."""
+    """Tabla del p* de cada lane saliente con carga ofertada en el nodo i (la elegida por el DRL lleva *)."""
     lineas = [f"    Tablero en el nodo {i}:   lane    rate_hoy      p*      rango p*       break-even  percentil"]
     for f in sorted(tablero, key=lambda f: f["to"]):
         if f["only_option"] or not np.isfinite(f["p_estrella"]):
@@ -195,7 +196,7 @@ def formatear_tablero(i, tablero) -> str:
 
 
 def run_inference(agent: AMRoutingAgent, start_node: int, day: dict, show_board: bool = False, filas_csv: list = None):
-    """Genera la ruta de DRL-Q desde start_node, muestra el resultado y el p* por arco."""
+    """Genera la ruta del DRL (actor) desde start_node, muestra el resultado y el p* por arco."""
     import time
 
     print(f"\n  Generando ruta desde nodo {start_node}...")
@@ -210,7 +211,7 @@ def run_inference(agent: AMRoutingAgent, start_node: int, day: dict, show_board:
         print(f"     (Tiempo máximo permitido: {MAX_DURATION:.1f} h)")
     else:
         ruta_str = " → ".join(str(n) for n in route)
-        print(f"  Ruta      : {ruta_str}   (DRL-Q)")
+        print(f"  Ruta      : {ruta_str}   (DRL)")
         print(f"  Reward    : {total_reward:.0f}")
         print(f"  Duración  : {time_elapsed:.2f} h  (máx {MAX_DURATION:.1f} h)")
         print(f"  Nodos vis.: {len(route) - 1} de {NUM_NODES}")

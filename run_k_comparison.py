@@ -20,11 +20,10 @@ Salida
 import argparse
 import os
 
-import numpy as np
 import pandas as pd
 
 from config import (
-    SEED, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, K_MAX, TRAIN_DAYS, MARKET_M_EVAL_WORLDS,
+    SEED, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, K_MAX, TRAIN_DAYS, MARKET_M_EVAL_WORLDS, set_seeds,
 )
 from baselines.dp_relajada import cargar_o_calcular_tabla
 from evaluation import evaluar_mundos_simulados, resumen_metodos
@@ -32,16 +31,6 @@ from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
 from stats_analysis import comparar_con_baselines
 from transfer_learning import load_checkpoint_compatible
-
-
-def set_seeds(seed: int):
-    import random
-    import torch
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
 
 
 def run(num_nodes: int, k_levels, n_worlds: int, checkpoint_dir: str = None,

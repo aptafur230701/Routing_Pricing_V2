@@ -3,7 +3,7 @@ evaluation.py
 =============
 Evaluación posterior al entrenamiento (baselines_drl_ruteo_estocastico.md):
   · rollout_drl_env              — rollout greedy (argmax por nodo) del agente en el entorno
-  · evaluar_mundos_simulados     — DRL, DRL-Q (si el agente trae las cabezas Ṽ), B1, B2, B2P, B3 sobre los mismos mundos simulados + UB-PI (cota) y UB-DP
+  · evaluar_mundos_simulados     — DRL, B1, B2, B2P, B3 sobre los mismos mundos simulados + UB-PI (cota) y UB-DP
                                    (referencia: valor de la política que ignora el mercado, no es cota)
   · evaluar_replay               — el mismo arnés sobre los días reales de evaluación (market_process=None)
   · resumen_metodos              — márgenes, gaps y métricas operativas por método
@@ -31,11 +31,10 @@ import matplotlib.pyplot as plt
 import torch
 from config import (
     MAX_DURATION, K_MAX, TRAIN_DAYS, MARKET_DIAS_EPISODIO,
-    MARKET_SEED_EVAL, MARKET_M_EVAL_WORLDS, REPLAY_MAX_CASOS, REWARD_SCALE_FACTOR,
+    MARKET_SEED_EVAL, MARKET_M_EVAL_WORLDS, REPLAY_MAX_CASOS,
 )
 from baselines.politicas import Observacion, PoliticaB1, PoliticaB2, PoliticaB2P, PoliticaB3, calcular_ev_pronostico
 from greedy_rollout import greedy_rollout
-from pricing import crear_selector_q
 from problem_data import build_rm_pen_stack, lane_reward
 from routing_env import VectorRoutingEnv
 from baselines.ub_pi import solve_ub_pi
@@ -43,7 +42,7 @@ from stats_analysis import gap_pct, ic_bootstrap_media, ub_dp_floja, NOTA_UB_DP_
 
 _DIAS_SIMULADOS_UB_PI = MARKET_DIAS_EPISODIO   # días del mundo que cubren cualquier ruta (6: 77 h = 5,5 días de mercado)
 _BASELINES = ("B1", "B2", "B2P", "B3")   # no dependen del agente: se calculan una vez y se cachean
-_METODOS = ("DRL", "DRL-Q") + _BASELINES   # DRL-Q (argmax de Q con las cabezas A/B) solo si el agente las trae entrenadas
+_METODOS = ("DRL",) + _BASELINES   # único método de ruteo propio: el actor entrenado (DRL)
 
 
 # ── DRL env-based rollout ─────────────────────────────────────
@@ -264,9 +263,6 @@ class ContextoEval:
         self.ltr = ltr_stack
         self.avail, self.p95 = avail_expected_arr, reward_global_p95
         self.ev = calcular_ev_pronostico(market, distance_arr, diesel_arr)   # una vez por evaluación
-        # DRL-Q (argmax de Q con Ṽ = promedio de las cabezas A y B): solo si las cabezas están entrenadas.
-        self.selector_q = (crear_selector_q(self.agent_cpu, distance_arr, diesel_arr, REWARD_SCALE_FACTOR)
-                           if getattr(agent, "post_entrenadas", False) else None)
         self.politicas = {
             "B1": PoliticaB1(distance_arr, diesel_arr),
             "B2": PoliticaB2(market, self.T, distance_arr, diesel_arr),
@@ -275,10 +271,8 @@ class ContextoEval:
         }
 
 
-def _ejecutar_drl(ctx, env, nodo, dia, K, world_seed, dow0, loads_stack=None, rate_stack=None, q=False) -> dict:
+def _ejecutar_drl(ctx, env, nodo, dia, K, world_seed, dow0, loads_stack=None, rate_stack=None) -> dict:
     """Rollout greedy del DRL (greedy_rollout, sin cambios) + métricas con el arnés común.
-
-    q=True: DRL-Q, la misma ruta paso a paso pero eligiendo el argmax de Q (ctx.selector_q) en vez del actor.
 
     El tiempo por decisión es el del rollout menos el del entorno (reset/step).
     """
@@ -292,7 +286,7 @@ def _ejecutar_drl(ctx, env, nodo, dia, K, world_seed, dow0, loads_stack=None, ra
             ctx.agent_cpu, envc, np.array([nodo], dtype=np.int64), np.array([dia], dtype=np.int64),
             ctx.T, ctx.dist, ctx.ltr, ctx.p95, ctx.N,
             k_max_arr=[K], avail_expected_arr=ctx.avail, world_seeds=seeds, device=torch.device("cpu"),
-            ev_esperado=ctx.ev, selector=ctx.selector_q if q else None,
+            ev_esperado=ctx.ev,
         )
         total = time.perf_counter() - t0
         ruta = res.routes[0]
@@ -380,6 +374,18 @@ def _faltantes(df: pd.DataFrame, k_levels) -> set:
     return {(K, nombre) for K in k_levels for nombre in _BASELINES if (_etiqueta_k(K), nombre) not in hay}
 
 
+def _completar_con_baselines(df: pd.DataFrame, k_levels, baselines_fn) -> pd.DataFrame:
+    """Añade al caché los pares (K, método) de B1/B2/B2P/B3 que le falten (p. ej. un nivel de K que
+    el caché vigente no traía), con las cotas ya calculadas — sin recalcularlas ni recalcular los
+    demás baselines. Usado como `completar` en evaluar_mundos_simulados y evaluar_replay."""
+    faltan = _faltantes(df, k_levels)
+    if not faltan:
+        return df
+    print(f"  completando el caché con {sorted(faltan, key=str)}", flush=True)
+    extra = baselines_fn(faltan, df.groupby(["K", "mundo"])[["ub_dp", "ub_pi"]].first())
+    return pd.concat([df, extra], ignore_index=True)
+
+
 def _filas_con_cache(cache_path, firma, calcular, verbose=True, completar=None) -> pd.DataFrame:
     """Filas de B1, B2, B2P, B3 y cotas (no dependen del DRL): se calculan una vez y se reusan.
 
@@ -422,7 +428,7 @@ def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, load
                              avail_expected_arr, reward_global_p95,
                              M=MARKET_M_EVAL_WORLDS, k_levels=(K_MAX, None), verbose=True,
                              cache_path=None, semilla_eval=MARKET_SEED_EVAL) -> pd.DataFrame:
-    """DRL, DRL-Q (si hay cabezas Ṽ entrenadas), B1, B2, B2P y B3 sobre los mismos M mundos simulados, por nivel de K.
+    """DRL, B1, B2, B2P y B3 sobre los mismos M mundos simulados, por nivel de K.
 
     Los mismos mundos (nodo, día, world_seed) se usan en todos los niveles de K. Devuelve un
     DataFrame largo: una fila por (K, mundo, método) con el margen en USD, la factibilidad,
@@ -468,12 +474,7 @@ def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, load
         return pd.DataFrame(filas)
 
     def completar(df):
-        faltan = _faltantes(df, k_levels)
-        if not faltan:
-            return df
-        print(f"  completando el caché con {sorted(faltan, key=str)}", flush=True)
-        extra = baselines(faltan, df.groupby(["K", "mundo"])[["ub_dp", "ub_pi"]].first())
-        return pd.concat([df, extra], ignore_index=True)
+        return _completar_con_baselines(df, k_levels, baselines)
 
     firma = _firma_cache(ctx, "simulado", num_nodes, M, semilla_eval, tuple(k_levels), rate_train.shape[0])
     base = _filas_con_cache(cache_path, firma, baselines, verbose, completar)
@@ -484,9 +485,6 @@ def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, load
         # Calentamiento de torch (primera llamada) fuera de la medición.
         _ejecutar_drl(ctx, env, int(dis["nodo"][0]), int(dis["start_day"][0]), k_levels[0],
                       int(dis["world_seed"][0]), int(dis["dow"][0]))
-        if ctx.selector_q is not None:
-            _ejecutar_drl(ctx, env, int(dis["nodo"][0]), int(dis["start_day"][0]), k_levels[0],
-                          int(dis["world_seed"][0]), int(dis["dow"][0]), q=True)
         for m in range(M):
             nodo, dow = int(dis["nodo"][m]), int(dis["dow"][m])
             dia, ws = int(dis["start_day"][m]), int(dis["world_seed"][m])
@@ -494,9 +492,6 @@ def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, load
                 dp, pi = cota.loc[(_etiqueta_k(K), m)]
                 res = _ejecutar_drl(ctx, env, nodo, dia, K, ws, dow)
                 filas.append(_fila("simulado", K, m, nodo, dia, dia, ws, dow, "DRL", res, dp, pi))
-                if ctx.selector_q is not None:
-                    res = _ejecutar_drl(ctx, env, nodo, dia, K, ws, dow, q=True)
-                    filas.append(_fila("simulado", K, m, nodo, dia, dia, ws, dow, "DRL-Q", res, dp, pi))
             if verbose and (m + 1) % 100 == 0:
                 print(f"  mundos simulados (DRL): {m + 1}/{M}", flush=True)
     df = _combinar(base, pd.DataFrame(filas), k_levels)
@@ -558,12 +553,7 @@ def evaluar_replay(agent, market, tabla, time_matrix, rate_eval, loads_eval,
         return pd.DataFrame(filas)
 
     def completar(df):
-        faltan = _faltantes(df, k_levels)
-        if not faltan:
-            return df
-        print(f"  completando el caché con {sorted(faltan, key=str)}", flush=True)
-        extra = baselines(faltan, df.groupby(["K", "mundo"])[["ub_dp", "ub_pi"]].first())
-        return pd.concat([df, extra], ignore_index=True)
+        return _completar_con_baselines(df, k_levels, baselines)
 
     firma = _firma_cache(ctx, "replay", num_nodes, max_casos, tuple(k_levels), rate_eval.shape[0],
                          loads_eval.shape, float(loads_eval.sum()), float(rate_eval.sum()))
@@ -580,10 +570,6 @@ def evaluar_replay(agent, market, tabla, time_matrix, rate_eval, loads_eval,
                 res = _ejecutar_drl(ctx, env, nodo, dia, K, None, dow, loads_eval, rate_eval)
                 filas.append(_fila("replay", K, c, nodo, TRAIN_DAYS + dia, dia, None, dow,
                                    "DRL", res, dp, pi))
-                if ctx.selector_q is not None:
-                    res = _ejecutar_drl(ctx, env, nodo, dia, K, None, dow, loads_eval, rate_eval, q=True)
-                    filas.append(_fila("replay", K, c, nodo, TRAIN_DAYS + dia, dia, None, dow,
-                                       "DRL-Q", res, dp, pi))
             if verbose and (c + 1) % 100 == 0:
                 print(f"  replay (DRL): {c + 1}/{len(nodos)}", flush=True)
     df = _combinar(base, pd.DataFrame(filas), k_levels)

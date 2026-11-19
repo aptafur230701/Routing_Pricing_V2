@@ -7,7 +7,9 @@ This file is imported by all modules, so it should not contain any heavy depende
 """
 
 import os
+import random
 
+import numpy as np
 import torch
 
 # ── Problem identity ──────────────────────────────────────────
@@ -152,6 +154,16 @@ LOADS_EXPECTED_CLIP = 100.0  # p95 de E[loads] por lane (train, excl. diagonal) 
 # ── Reproducibility ───────────────────────────────────────────
 SEED = int(os.environ.get("SEED", 42))   # torch/numpy del entrenamiento; variable de entorno SEED para variar por corrida
 
+
+def set_seeds(seed: int) -> None:
+    """Semilla de random/numpy/torch (CPU y CUDA si hay GPU). Único lugar: antes estaba
+    duplicada en main.py, hpo_optuna.py y run_k_comparison.py."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+
 # ── Generador de realizaciones diarias (market_process) ──────
 # Ver metodologia_realizaciones_mercado_reefer.md (generador) y proceso_exogeno_cargas_tarifas.md
 # (índice de mercado por nodo, conservado). Ningún índice de día va escrito a mano: el número de
@@ -232,6 +244,14 @@ def configurar_hp(num_nodes: int) -> None:
 def hp(nombre: str, default):
     """Valor de la variante activa para `nombre`, o `default` si la variante no lo cambia."""
     return HP_OVERRIDES.get(nombre, default)
+
+# ── Debug ──────────────────────────────────────────────────────
+CHECK_TENSORS = os.environ.get("CHECK_TENSORS", "0") == "1"   # True: valida NaN/Inf en cada tensor
+                                  # de _forward (model/debug_utils.check_tensor). Cada check fuerza
+                                  # una sincronización CPU-GPU; con d_h=192/N chico (overhead de
+                                  # kernels domina, ver comentario de PPO_BATCH_SIZE) representan
+                                  # ~200 syncs/update dentro de ppo_calculo (el 77% del tiempo/update
+                                  # del log). Activar con CHECK_TENSORS=1 solo para diagnosticar NaN/Inf.
 
 # ── Device ───────────────────────────────────────────────────
 GPU_PREFERIDA = "3070 Ti"   # Subcadena del nombre de la GPU a usar; si no está, cuda:0.

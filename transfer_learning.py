@@ -115,6 +115,42 @@ def _reconcile_state_dict(target_sd: dict, source_sd: dict) -> tuple:
     return merged, transferred, skipped
 
 
+def _instanciar_y_transferir(
+    checkpoint_path: str,
+    num_nodes:       int,
+    d_h:      int,
+    n_heads:  int,
+    n_layers: int,
+    d_ff:     int,
+) -> tuple:
+    """Carga el .pt, instancia agent+critic con la arquitectura actual y les transfiere los
+    pesos vía _reconcile_state_dict. Compartido por load_checkpoint_compatible (mismo tamaño
+    de grafo) y transfer_checkpoint (tamaño mayor); solo cambia num_nodes y el mensaje verbose.
+
+    Retorna
+    -------
+    agent, critic, checkpoint, transferred (lista combinada), skipped (lista combinada)
+    """
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint no encontrado: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+
+    agent  = AMRoutingAgent(
+        num_nodes=num_nodes, d_h=d_h, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff,
+        device=DEVICE,
+    )
+    critic = CriticHead(d_h).to(DEVICE)
+
+    agent_sd,  transferred_a, skipped_a = _reconcile_state_dict(agent.state_dict(),  checkpoint["agent"])
+    critic_sd, transferred_c, skipped_c = _reconcile_state_dict(critic.state_dict(), checkpoint["critic"])
+
+    agent.load_state_dict(agent_sd)
+    critic.load_state_dict(critic_sd)
+
+    return agent, critic, checkpoint, transferred_a + transferred_c, skipped_a + skipped_c
+
+
 def load_checkpoint_compatible(
     checkpoint_path: str,
     num_nodes:       int,
@@ -134,33 +170,19 @@ def load_checkpoint_compatible(
     Uso: reemplaza el torch.load + load_state_dict directo en
     main.py._load_agent e inference.py.load_agent.
     """
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint no encontrado: {checkpoint_path}")
-
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-
-    agent  = AMRoutingAgent(
-        num_nodes=num_nodes, d_h=d_h, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff,
-        device=DEVICE,
+    agent, critic, checkpoint, transferred, skipped = _instanciar_y_transferir(
+        checkpoint_path, num_nodes, d_h, n_heads, n_layers, d_ff,
     )
-    critic = CriticHead(d_h).to(DEVICE)
-
-    agent_sd,  transferred_a, skipped_a = _reconcile_state_dict(agent.state_dict(),  checkpoint["agent"])
-    critic_sd, transferred_c, skipped_c = _reconcile_state_dict(critic.state_dict(), checkpoint["critic"])
-
-    agent.load_state_dict(agent_sd)
-    critic.load_state_dict(critic_sd)
-    # ¿las cabezas Ṽ del checkpoint están entrenadas? (si no, DRL-Q y p* no tienen sentido)
+    # ¿las cabezas Ṽ del checkpoint están entrenadas? (si no, p* no tiene sentido)
     agent.post_entrenadas = bool(agent.has_post_heads) and any(k.startswith("post_value_a.") for k in checkpoint["agent"]) \
         and any(k.startswith("post_value_b.") for k in checkpoint["agent"])
 
     if verbose:
-        total = len(transferred_a) + len(skipped_a) + len(transferred_c) + len(skipped_c)
-        pct   = 100 * (len(transferred_a) + len(transferred_c)) / max(total, 1)
+        total = len(transferred) + len(skipped)
+        pct   = 100 * len(transferred) / max(total, 1)
         print(f"  [load_checkpoint_compatible] {os.path.basename(checkpoint_path)} "
-              f"({len(transferred_a) + len(transferred_c)}/{total} tensores, {pct:.1f}%)", end="")
-        skipped_all = skipped_a + skipped_c
-        print(f" — omitidos: {skipped_all}" if skipped_all else " ✓")
+              f"({len(transferred)}/{total} tensores, {pct:.1f}%)", end="")
+        print(f" — omitidos: {skipped}" if skipped else " ✓")
 
     return agent, critic
 
@@ -170,7 +192,7 @@ def checkpoint_tiene_post_head(checkpoint_path: str) -> bool:
 
     Los checkpoints del PPO no las traen: las agrega post_training.py en un checkpoint nuevo
     (am_checkpoint_<N>nodes_pricing.pt). Al cargar uno sin ellas las cabezas arrancan sin entrenar
-    (_reconcile_state_dict omite lo que falta) y ni p* ni DRL-Q tendrían sentido.
+    (_reconcile_state_dict omite lo que falta) y p* no tendría sentido.
     """
     if not os.path.exists(checkpoint_path):
         return False
@@ -210,16 +232,12 @@ def get_source_checkpoint(base_dir: str, target_num_nodes: int) -> str | None:
     source_nodes = NODE_SEQUENCE[idx - 1]
     fname = f"am_checkpoint_{source_nodes}nodes.pt"
 
-    # Buscar: 1) carpeta compartida checkpoints/  2) results/Nnodes/  3) raíz
+    # Buscar: 1) raíz  2) carpeta compartida checkpoints/  3) results/Nnodes/
     candidates = [
         os.path.join(base_dir, fname),
         os.path.join(os.path.dirname(base_dir), "checkpoints", fname),
         os.path.join(base_dir, "results", f"{source_nodes}nodes", fname),
-        os.path.join(base_dir, fname),
     ]
-    # eliminar duplicados manteniendo orden
-    seen = set()
-    candidates = [p for p in candidates if not (p in seen or seen.add(p))]
 
     for path in candidates:
         if os.path.exists(path):
@@ -267,31 +285,15 @@ def transfer_checkpoint(
     agent  : AMRoutingAgent inicializado con pesos transferidos.
     critic : CriticHead     inicializado con pesos transferidos.
     """
-    if not os.path.exists(source_checkpoint):
-        raise FileNotFoundError(f"Checkpoint no encontrado: {source_checkpoint}")
-
-    checkpoint = torch.load(source_checkpoint, map_location=DEVICE)
-
-    # Instanciar modelos destino con la arquitectura actual (N_NODE_FEATURES según USE_CONTINUATION_FEATURES, n_market=1)
-    agent  = AMRoutingAgent(
-        num_nodes=target_num_nodes,
-        d_h=d_h, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff,
-        device=DEVICE,
+    # Instancia agent/critic con la arquitectura actual y les transfiere los pesos —
+    # vía _reconcile_state_dict (ver arriba): copia directa, zero-padding de columnas
+    # de entrada nuevas, u omisión si la forma no encaja. Lanza FileNotFoundError si
+    # source_checkpoint no existe.
+    agent, critic, _checkpoint, transferred, skipped = _instanciar_y_transferir(
+        source_checkpoint, target_num_nodes, d_h, n_heads, n_layers, d_ff,
     )
-    critic = CriticHead(d_h).to(DEVICE)
 
-    # Transferir pesos — vía _reconcile_state_dict (ver arriba): copia directa,
-    # zero-padding de columnas de entrada nuevas, u omisión si la forma no encaja.
-    agent_sd,  transferred_a, skipped_a = _reconcile_state_dict(agent.state_dict(),  checkpoint["agent"])
-    critic_sd, transferred_c, skipped_c = _reconcile_state_dict(critic.state_dict(), checkpoint["critic"])
-
-    agent.load_state_dict(agent_sd)
-    critic.load_state_dict(critic_sd)
-
-    transferred = transferred_a + transferred_c
-    skipped     = skipped_a + skipped_c
-
-    total = len(agent_sd) + len(critic_sd)
+    total = len(agent.state_dict()) + len(critic.state_dict())
     pct   = 100 * len(transferred) / total
 
     if verbose:

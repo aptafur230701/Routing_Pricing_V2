@@ -201,6 +201,21 @@ class AttentionDecoder(nn.Module):
         """Convierte la máscara Gymnasium (1=válido) a bool (True=inválido)."""
         return action_mask == 0
 
+    def _dist(
+        self,
+        context:     torch.Tensor,   # (batch, d_h)
+        embeddings:  torch.Tensor,   # (batch, N, d_h)
+        action_mask: torch.Tensor,   # (batch, N) int8: 1=válido, 0=inválido
+        tag:         str = "decoder softmax probs",
+    ) -> Categorical:
+        """logits → softmax → clamp → Categorical, compartido por act() y evaluate_action()."""
+        mask   = self._bool_mask(action_mask)
+        logits = self._logits(context, embeddings, mask)
+        probs  = F.softmax(logits, dim=-1)
+        check_tensor(tag, probs)
+        probs  = torch.clamp(probs, min=1e-8)
+        return Categorical(probs=probs)
+
     # ── API pública ───────────────────────────────────────────────────────────
 
     def act(
@@ -218,12 +233,7 @@ class AttentionDecoder(nn.Module):
         log_prob : Tensor (batch,)        — log π(a|s).
         entropy  : Tensor (batch,)        — entropía de la distribución.
         """
-        mask   = self._bool_mask(action_mask)
-        logits = self._logits(context, embeddings, mask)
-        probs  = F.softmax(logits, dim=-1)
-        check_tensor("decoder softmax probs", probs)
-        probs  = torch.clamp(probs, min=1e-8)
-        dist   = Categorical(probs=probs)
+        dist   = self._dist(context, embeddings, action_mask)
         action = dist.sample()
         return action, dist.log_prob(action), dist.entropy()
 
@@ -263,12 +273,7 @@ class AttentionDecoder(nn.Module):
         log_prob : Tensor (batch,)
         entropy  : Tensor (batch,)
         """
-        mask   = self._bool_mask(action_mask)
-        logits = self._logits(context, embeddings, mask)
-        probs  = F.softmax(logits, dim=-1)
-        check_tensor("decoder softmax probs (eval)", probs)
-        probs  = torch.clamp(probs, min=1e-8)
-        dist   = Categorical(probs=probs)
+        dist = self._dist(context, embeddings, action_mask, tag="decoder softmax probs (eval)")
         return dist.log_prob(action), dist.entropy()
 
     def forward(

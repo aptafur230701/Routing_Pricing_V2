@@ -150,7 +150,7 @@ def _entrenar_cabeza(cabeza, H, E, y, Hv, Ev, yv, gen, verbose=False, nombre="")
 
 
 def metricas_val(va: torch.Tensor, vb: torch.Tensor, yv: torch.Tensor) -> dict:
-    """Error de Ṽ en validación (USD): cada cabeza y el promedio de las dos (el que usa DRL-Q)."""
+    """Error de Ṽ en validación (USD): cada cabeza y el promedio de las dos."""
     y = yv.cpu().numpy().astype(np.float64) * S
     out = dict(n_val=len(y), sd_objetivo_usd=float(y.std()), media_objetivo_usd=float(y.mean()))
     for nombre, p in (("A", va), ("B", vb), ("promedio", 0.5 * (va + vb))):

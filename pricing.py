@@ -17,13 +17,14 @@ margen esperado desde la llegada a `a` hasta volver a casa siguiendo el actor gr
   · p* = promedio de ambos; el rango es [mínimo, máximo] de los dos. El rango mide la variabilidad del
     estimador (partición de datos y ruido de las etiquetas), NO es un intervalo de confianza: las dos cabezas
     comparten encoder, contexto y actor.
-La ruta que se entrega (DRL-Q) elige en cada nodo el argmax de Q con Ṽ = promedio de A y B (`crear_selector_q`).
+p* se calcula para el arco i→j que la política de ruteo (el actor) ya decidió tomar; j nunca se re-decide con Q
+— Q solo sirve aquí para valorar la MEJOR ALTERNATIVA a esa decisión (el costo de oportunidad).
 
 p* solo existe para lanes con carga (y que no sean el retorno a casa); si j es la única acción factible no hay
 alternativa y p* tampoco está definido (`only_option`). En esos casos el resultado trae p* = NaN.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -127,22 +128,3 @@ def reservation_price(
         alt_a=alt_a, alt_b=alt_b,
     )
 
-
-def crear_selector_q(agent, distance_arr: np.ndarray, diesel_arr: np.ndarray, S: float):
-    """Selector de acciones de DRL-Q para greedy_rollout: argmax de Q sobre la máscara, con Ṽ = promedio de A y B.
-
-    Devuelve selector(h_t, embeddings, masks, env) → (B,) int64. r_obs se lee de la fila observada del entorno
-    (sorteada al llegar al nodo en simulado; del histórico en replay), igual que p*.
-    """
-    cost_all = lane_cost_row(np.asarray(distance_arr, dtype=np.float64), np.asarray(diesel_arr, dtype=np.float64))
-    dist_all = np.asarray(distance_arr, dtype=np.float64)
-
-    def selector(h_t, embeddings, masks, env) -> np.ndarray:
-        va, vb = agent.post_values(h_t, embeddings)
-        v = 0.5 * (va + vb).detach().cpu().numpy().astype(np.float64)
-        cur = np.asarray(env.current_node)
-        q = q_values(env.rate_row_obs, env.loads_row_obs, dist_all[cur], cost_all[cur], S, v, env.start_node)
-        q = np.where(np.asarray(masks) > 0, q, -np.inf)
-        return q.argmax(axis=1).astype(np.int64)
-
-    return selector
