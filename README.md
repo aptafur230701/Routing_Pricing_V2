@@ -220,5 +220,6 @@ con carga más el retorno.
 
 ## Requisitos
 
-Ver [requirements.txt](requirements.txt). Entorno principal: PyTorch,
+Ver [requirements.txt](requirements.txt). **Python 3.10 – 3.12** (el piso lo marca `requires_python >= 3.10` de los
+pins; probado en 3.10.16 y 3.12.2). Entorno principal: PyTorch,
 Gymnasium, NumPy/Pandas/SciPy, Optuna, Matplotlib, openpyxl.
