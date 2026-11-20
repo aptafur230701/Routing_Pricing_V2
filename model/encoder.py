@@ -227,11 +227,8 @@ def build_node_features(
     # Copia antes de normalizar: preserva la escala absoluta para feature [5]
     raw_rewards = feats[:, 0].copy()
 
-    # reward y distancia:
-    # normalización relativa intra-fila para preservar ranking local
-    # entre las alternativas disponibles desde current_node.
-    # Esto ayuda al encoder a comparar qué nodos son mejores/peores
-    # dentro del estado actual independientemente de la escala absoluta.
+    # reward y distancia: normalización relativa intra-fila para preservar ranking
+    # local entre las alternativas disponibles desde current_node.
     for col in (0, 2):
         col_min = feats[:, col].min()
         col_max = feats[:, col].max()
@@ -240,12 +237,8 @@ def build_node_features(
         else:
             feats[:, col] = 0.0
 
-    # tiempo:
-    # normalización absoluta respecto al presupuesto global
-    # para preservar información de factibilidad temporal.
-    # Un arco largo debe seguir viéndose "caro" temporalmente aunque
-    # todos los demás arcos también sean largos.
-    # Se aplica UNA sola vez para preservar la escala temporal real.
+    # tiempo: normalización absoluta respecto al presupuesto global, para preservar
+    # información de factibilidad temporal (se aplica una sola vez).
     feats[:, 1] = np.clip(feats[:, 1] / max(max_duration, 1e-6), 0.0, 1.0)
 
     # Feature [5]: reward absoluto normalizado por el P95 global del entrenamiento.

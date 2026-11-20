@@ -202,20 +202,10 @@ def checkpoint_tiene_post_head(checkpoint_path: str) -> bool:
 
 
 def get_source_checkpoint(base_dir: str, target_num_nodes: int) -> str | None:
-    """
-    Dado el tamaño destino, devuelve la ruta al checkpoint del tamaño
-    anterior en NODE_SEQUENCE, o None si target es el primero (10 nodos).
+    """Dado target_num_nodes, devuelve la ruta al checkpoint del tamaño anterior en
+    NODE_SEQUENCE, o None si target es el primero (10 nodos).
 
     Busca primero en results/{N}nodes/ y luego en la raíz del proyecto.
-
-    Parámetros
-    ----------
-    base_dir         : directorio raíz del proyecto.
-    target_num_nodes : tamaño al que vas a entrenar.
-
-    Retorna
-    -------
-    str con la ruta al .pt fuente, o None si no hay predecesor.
     """
     if target_num_nodes not in NODE_SEQUENCE:
         raise ValueError(
@@ -263,32 +253,15 @@ def transfer_checkpoint(
     d_ff:     int = 512,
     verbose:  bool = True,
 ) -> tuple:
-    """
-    Transfiere los pesos de un checkpoint entrenado a un agente de mayor tamaño.
+    """Transfiere los pesos de un checkpoint entrenado a un agente de mayor tamaño.
 
     Los pesos independientes de N se copian tal cual. Si la arquitectura del
     checkpoint fuente es más antigua que la actual, _reconcile_state_dict lo
     tolera: las capas lineales con menos columnas de entrada (p. ej.
     context_net.proj al añadir budget features) se expanden con columnas nuevas
     en cero, y cualquier otro mismatch de forma se omite y queda con su
-    inicialización aleatoria.
-
-    Parámetros
-    ----------
-    source_checkpoint : ruta al .pt del modelo fuente.
-    target_num_nodes  : tamaño del grafo destino.
-    d_h, n_heads, n_layers, d_ff : hiperparámetros (deben coincidir con la fuente).
-    verbose           : imprime resumen del transfer.
-
-    Retorna
-    -------
-    agent  : AMRoutingAgent inicializado con pesos transferidos.
-    critic : CriticHead     inicializado con pesos transferidos.
+    inicialización aleatoria. d_h, n_heads, n_layers, d_ff deben coincidir con la fuente.
     """
-    # Instancia agent/critic con la arquitectura actual y les transfiere los pesos —
-    # vía _reconcile_state_dict (ver arriba): copia directa, zero-padding de columnas
-    # de entrada nuevas, u omisión si la forma no encaja. Lanza FileNotFoundError si
-    # source_checkpoint no existe.
     agent, critic, _checkpoint, transferred, skipped = _instanciar_y_transferir(
         source_checkpoint, target_num_nodes, d_h, n_heads, n_layers, d_ff,
     )
@@ -322,23 +295,9 @@ def build_agent_for_training(
     d_ff:     int = 512,
     verbose:  bool = True,
 ) -> tuple:
-    """
-    Función de conveniencia para main.py.
-
-    Si use_transfer=True y existe un checkpoint del tamaño anterior en
-    NODE_SEQUENCE, inicializa el agente con esos pesos (transfer learning).
-    Si no, crea un agente con pesos aleatorios.
-
-    Parámetros
-    ----------
-    base_dir     : directorio raíz del proyecto (donde están results/Nnodes/).
-    num_nodes    : tamaño del grafo a entrenar.
-    use_transfer : activar/desactivar transfer learning.
-
-    Retorna
-    -------
-    agent  : AMRoutingAgent listo para entrenar.
-    critic : CriticHead listo para entrenar.
+    """Función de conveniencia para main.py: si use_transfer=True y existe un checkpoint
+    del tamaño anterior en NODE_SEQUENCE, inicializa el agente con esos pesos (transfer
+    learning); si no, crea un agente con pesos aleatorios.
     """
     if use_transfer and num_nodes in NODE_SEQUENCE:
         try:

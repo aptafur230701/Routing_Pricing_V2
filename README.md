@@ -4,7 +4,7 @@ Agente de ruteo basado en un **Attention Model (Transformer encoder-decoder)**
 entrenado con **PPO (Proximal Policy Optimization)**, para un problema de
 ruteo estocástico con revelación post-decisión de disponibilidad de carga
 (Stochastic DVRP). El agente decide, en cada nodo, a qué nodo moverse a
-continuación para maximizar la recompensa acumulada (margen de flete) dentro
+continuación para maximizar la recompensa acumulada de una ruta completa dentro
 de una ventana de duración máxima.
 
 
@@ -56,17 +56,9 @@ problem_data.py ──► matrices (tiempo, tarifa, carga, distancia, diesel, LT
                 results/<N>nodes/  (Excel + gráficos + training log)
 ```
 
-**Reglas del entorno**: el camión puede volver a pasar por un nodo intermedio dentro del tour (no hay
-registro de visitados). La máscara solo excluye el self-loop (no hay acción de esperar), los nodos desde
-los que no se alcanza a volver a casa dentro de `MAX_DURATION` y las lanes sin carga (salvo en el primer
-movimiento desde casa); volver a casa termina el episodio y con K activo el último arco es el retorno
-forzado. Las features por nodo son 6 base + 4 de continuación + 1 de índice de mercado (última columna) = 11.
+**Reglas del entorno**: el camión puede volver a pasar por un nodo intermedio dentro del tour (no hay registro de visitados). La máscara solo excluye el self-loop (no hay acción de esperar), los nodos desde los que no se alcanza a volver a casa dentro de `MAX_DURATION` y las lanes sin carga (salvo en el primer movimiento desde casa); volver a casa termina el episodio y con K activo el último arco es el retorno forzado. Las features por nodo son 6 base + 4 de continuación + 1 de índice de mercado (última columna) = 11.
 
-**Por qué el modelo escala sin reentrenar desde cero**: ninguna capa de
-`AMRoutingAgent` ni de `CriticHead` (`model/`) depende de `num_nodes` — el Transformer
-opera sobre conjuntos de tamaño variable. Esto es lo que permite el transfer
-learning en `transfer_learning.py` (cadena 10 → 20 → 35 → 50 → 75 → 100
-nodos, ver `NODE_SEQUENCE`).
+**Por qué el modelo escala sin reentrenar desde cero**: ninguna capa de `AMRoutingAgent` ni de `CriticHead` (`model/`) depende de `num_nodes` — el Transformer opera sobre conjuntos de tamaño variable. Esto es lo que permite el transfer learning en `transfer_learning.py` (cadena 10 → 20 → 35 → 50 → 75 → 100 nodos, ver `NODE_SEQUENCE`).
 
 ## Estructura de archivos
 
@@ -92,22 +84,11 @@ nodos, ver `NODE_SEQUENCE`).
 | [baselines/ub_pi.py](baselines/ub_pi.py) | DP hacia atrás de UB-PI (`solve_ub_pi`), único solver que se conserva: mejor ruta con el mundo completo conocido, estado (nodo, franja de 1 min, k). |
 | [inference.py](inference.py) | Inferencia standalone: carga el checkpoint con las cabezas Ṽ y genera la ruta del DRL desde un nodo dado, con el precio de reserva p* por arco. |
 
-### Generador de realizaciones diarias (opcional)
+### Generador de realizaciones diarias
 
-Diseño completo en [metodologia_realizaciones_mercado_reefer.md](metodologia_realizaciones_mercado_reefer.md)
-(generador de cargas/tarifas) y [proceso_exogeno_cargas_tarifas.md](proceso_exogeno_cargas_tarifas.md)
-(índice de mercado por nodo, conservado — ver la nota al inicio de ese documento). Con
-`USE_MARKET_PROCESS = True` el entrenamiento ya no reproduce el mismo día del histórico tal cual:
-cada episodio recorre días REALES consecutivos de jun–oct 2026 (nunca un día inventado), y cada día
-real se convierte en una realización con (a) binomial negativa centrada en la media de 6 días
-vecinos, (b) interpolación inversa sobre los cuantiles reales de precio de ese día/lane, y (c) un
-único corrimiento de nivel nacional δ, fijo por episodio. Con `False` el entrenamiento reproduce
-los días reales exactos como antes (replay literal). La evaluación usa ambos: mundos simulados (con
-δ) y replay de los días de prueba (oct 2026, fuera de muestra).
+Cada episodio recorre días REALES consecutivos de jun–oct 2026 (nunca un día inventado), y cada uno se convierte en una realización sintética de cargas y tarifas por lane con (a) binomial negativa centrada en la media de 6 días vecinos, (b) interpolación inversa sobre los cuantiles reales de precio de ese día/lane, y (c) un corrimiento de nivel nacional δ, fijo por episodio. Con `USE_MARKET_PROCESS = False` se usa el replay literal de los días reales. La evaluación usa ambos esquemas: mundos simulados (con δ) y replay de los días de prueba (oct 2026, fuera de muestra).
 
-El índice de mercado por nodo (lento/rápido AR(1), usado como feature del agente y por B2P para
-pronosticar) se mantiene, pero ya no se simula: como los episodios siempre recorren días reales, el
-índice de cualquier día es un dato observado (lookup), no una trayectoria generada.
+El índice de mercado por nodo (nivel lento + rápido AR(1), feature del agente y usado por B2P para pronosticar) no se simula: al recorrer siempre días reales, es un dato observado (lookup) para cualquier día, no una trayectoria generada.
 
 | Archivo | Rol |
 |---|---|
@@ -122,7 +103,6 @@ Constantes (`FECHA_INICIO`, `DIAS_EXCLUIDOS`, `MARKET_R_MAX`, `MARKET_N_GRUPOS`,
 
 ### Baselines y evaluación
 
-Diseño completo en [baselines_drl_ruteo_estocastico.md](baselines_drl_ruteo_estocastico.md).
 El DRL se compara contra tres políticas no anticipativas y dos cotas superiores, todas sobre
 los mismos mundos simulados (mismo `world_seed`), paso a paso en `VectorRoutingEnv`:
 
@@ -167,8 +147,8 @@ el DRL.
 
 ## Pricing: precio de reserva por arco
 
-Descripción completa en [PRICING_PLAN.md](PRICING_PLAN.md). El DRL (el actor del PPO) es el único método de ruteo;
-el pricing es estrictamente downstream de esa ruta ya decidida: para cada arco con carga calcula el **precio mínimo
+El DRL (el actor del PPO) es el único método de ruteo; el pricing es estrictamente downstream de
+esa ruta ya decidida: para cada arco con carga calcula el **precio mínimo
 por milla** (p\*) al que al camión le conviene aceptar esa lane frente a su mejor alternativa. p\* nunca re-decide
 qué lane tomar — es una recomendación del lado del transportista sobre la decisión que el actor ya hizo. **No
 modela aceptación** (no hay datos de aceptación y rechazo) y p\* es un costo de oportunidad, no una probabilidad.
@@ -186,6 +166,14 @@ volver a casa siguiendo el actor en modo greedy. Hay dos cabezas, A y B, entrena
 mundos: p\*_AB elige la alternativa con A y evalúa con B (p\*_BA, al revés); p\* es el promedio y el **rango**
 [mín, máx] es la variabilidad del estimador (partición de datos y ruido de etiquetas), **no un intervalo de
 confianza** (comparten encoder, contexto y actor).
+
+El LTR (load-to-truck ratio) del nodo **actual** `i` (de donde sale el arco, no del destino) no se agrega como
+feature a Ṽ: alimentar un valor que es el mismo para todas las alternativas desde un mismo estado se cancelaría
+casi exactamente en `Q_alt − Ṽ(s, j)`, que por construcción solo es sensible a diferencias ENTRE alternativas del
+mismo estado. Ya está implícito en `r_obs` (si el mercado en `i` está tensionado, debería subir la tarifa
+observada de todas las lanes que salen de `i`, no solo de una). `validate_pricing.py` correlaciona (p\* −
+break-even) con el LTR de `i` en la prueba de plausibilidad (d) — esperada positiva: mercado tensionado en `i` ⇒
+más poder de negociación sobre las lanes que salen de ahí ⇒ p\* más alto — sin tocar el modelo ni reentrenar nada.
 
 **Entrenamiento.** El PPO no entrena Ṽ. Después del PPO (`post_training.py`), con encoder, contexto y actor
 congelados: se generan ~200 000 ejemplos (estado de una ruta del actor, acción al azar entre las válidas salvo volver

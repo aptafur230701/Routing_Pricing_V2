@@ -6,7 +6,7 @@ Entry point for the AM-PPO pipeline.
   1. Load data          (problem_data.py)
   2. Training           (am_training.py)
   3. Ṽ posterior al PPO (post_training.py: cabezas A/B del precio de reserva, actor congelado)
-  4. Evaluation         (evaluation.py: mundos simulados + replay; DRL, baselines B1-B3, UB-PI, UB-DP)
+  4. Evaluation         (evaluation.py: mundos simulados + replay; DRL, baselines B1-B3 y B2P, UB-PI, UB-DP)
   5. Save results       (evaluation.py, excel_report.py, stats_analysis.py)
   6. Validación del pricing (validate_pricing.py: contrafactual de p*, utilidad, plausibilidad)
 
@@ -19,7 +19,7 @@ Uso
 
 Checkpoints (transfer learning)
 --------------------------------
-  Los .pt se guardan en  checkpoints/  (raíz del proyecto, ignorada por git).
+  Los .pt se guardan en  checkpoints/  (raíz del proyecto; sí se versionan en git).
   Para usar transfer learning, copia el .pt del tamaño anterior en esa carpeta
   antes de entrenar (o entrena en orden y se guarda sólo).
 """
@@ -208,11 +208,10 @@ def _evaluate_and_report(
 
 
 def main():
-    NUM_NODES       = 20      # opciones: 10 · 20 · 35 · 50 · 75 · 100
+    NUM_NODES       = 35      # opciones: 10 · 20 · 35 · 50 · 75 · 100
     EVAL_ONLY       = os.environ.get("EVAL_ONLY", "0") == "1"   # True (EVAL_ONLY=1): carga checkpoint y salta entrenamiento
-    USE_TRANSFER    = True   # True: warm-start desde el checkpoint del tamaño anterior en
-                              # NODE_SEQUENCE (requiere mismo AM_D_H/AM_N_LAYERS que la fuente).
-                              # False: entrena desde pesos aleatorios con la arquitectura de config.py.
+    USE_TRANSFER    = True   # True: inicializa los pesos desde el checkpoint del tamaño anterior. False: entrena desde pesos aleatorios con la
+                              # arquitectura de config.py.
     EVAL_BEST_CHECKPOINT = False  # False (por defecto): evalúa el último update, el modelo que dejó el
                                  # entrenamiento ya con el LR decaído. True: evalúa el update con mejor
                                  # margen en los mundos de validación (checkpoints/am_checkpoint_<N>nodes_best.pt,
@@ -222,19 +221,14 @@ def main():
                                  # de test (8-32 USD). El checkpoint am_checkpoint_<N>nodes.pt (último) se
                                  # guarda siempre, y es el que usa el transfer learning.
     USE_MARKET_PROCESS = True  # True: el entrenamiento sortea cargas y tarifas del proceso exógeno
-                                # (proceso_exogeno_cargas_tarifas.md) en vez de reproducir días del
-                                # histórico. False: entrena con días reales. La evaluación siempre
-                                # usa el proceso (mundos simulados) y además el replay de los días
-                                # de eval. Si datos/market_params.npz no existe, corre el ajuste.
+                                # en vez de reproducir días del histórico. False: entrena con días reales.
     EVAL_SET = os.environ.get("EVAL_SET", "dev")   # "dev": mundos de MARKET_SEED_EVAL (desarrollo, resultados de siempre).
                                                     # "final": mundos de MARKET_SEED_EVAL_FINAL (test final, un solo uso con
                                                     # la configuración congelada); escribe DRL_Routing_Summary_AM_final.xlsx.
     K_RESTRINGIDO = False      # True: entrena, valida y evalúa con K libre y K = K_MAX (5).
-                                # False: solo K libre (sin presupuesto de cardinalidad). Sirve para
-                                # pulir el método contra los baselines antes de añadir la restricción.
-    RUN_PRICING = True       # True (y USE_POST_HEAD activo): entrena las cabezas Ṽ A/B con el actor congelado (si el
-                              # checkpoint *_pricing.pt no existe) y valida el precio de reserva p* sobre la ruta
-                              # del actor (validate_pricing.py), con la pestaña "Pricing" del Excel.
+                                # False: solo K libre (sin presupuesto de cardinalidad).
+    RUN_PRICING = True       # True (y USE_POST_HEAD activo): entrena las cabezas Ṽ A/B con el actor congelado (si
+                              # no hay un checkpoint *_pricing.pt vigente para este actor 
     RETRAIN_POST = False     # True: reentrena las cabezas Ṽ aunque ya exista un checkpoint *_pricing.pt válido
                               # para este actor (pricing_vigente); con False, pricing_vigente decide y solo
                               # reentrena cuando el actor cambió o el checkpoint no existe.
@@ -266,7 +260,7 @@ def main():
         ltr_stack, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
 
     # ── Proceso exógeno de cargas y tarifas ──────────────────────────────────
-    # La evaluación (UB-PI, UB-DP, B2, B3 y los mundos simulados) lo necesita siempre;
+    # La evaluación (UB-PI, UB-DP, B2, B2P, B3 y los mundos simulados) lo necesita siempre;
     # el entrenamiento lo usa solo si USE_MARKET_PROCESS.
     asegurar_parametros()
     market_process = MarketProcess(NUM_NODES)

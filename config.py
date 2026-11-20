@@ -230,7 +230,10 @@ RUN_TAG = os.environ.get("RUN_TAG", "")
 HP_POR_NODOS = {
     10: {},
     20: {"PPO_ENTROPY_COEF_START": 0.10, "PPO_ENTROPY_COEF_END": 0.04},   # más exploración al final
-    35: {"EPISODES_PER_NODE": 60000, "LR_FINAL_FRAC": 0.30},              # el doble de episodios, piso de LR más alto
+    35: {"EPISODES_PER_NODE": 13000, "LR_FINAL_FRAC": 0.30},              # calibrado con la curva de convergencia
+                                    # de 10/20 nodos (val_score estabiliza ~update 400 a 20 nodos,
+                                    # ~update 20 a 10 nodos); antes eran 60000 (3000 updates), muy por
+                                    # encima del punto de saturación observado
 }
 HP_OVERRIDES = {}   # se llena en configurar_hp()
 
@@ -254,15 +257,20 @@ CHECK_TENSORS = os.environ.get("CHECK_TENSORS", "0") == "1"   # True: valida NaN
                                   # del log). Activar con CHECK_TENSORS=1 solo para diagnosticar NaN/Inf.
 
 # ── Device ───────────────────────────────────────────────────
-GPU_PREFERIDA = "3070 Ti"   # Subcadena del nombre de la GPU a usar; si no está, cuda:0.
+GPU_PREFERIDA = ""   # Subcadena del nombre de la GPU a preferir (p.ej. "3070 Ti");
+                      # vacío = usar la GPU por defecto (cuda:0) de la máquina.
 
 
 def _elegir_device() -> torch.device:
-    """GPU cuyo nombre contiene GPU_PREFERIDA (por nombre, no por índice: el orden de CUDA
+    """Si GPU_PREFERIDA está vacío, usa la GPU por defecto (cuda:0). Si se especifica,
+    busca una GPU cuyo nombre la contenga (por nombre, no por índice: el orden de CUDA
     puede diferir del de nvidia-smi). Se fija además como dispositivo por defecto, para que
     torch.cuda.manual_seed y current_device() apunten a la misma GPU."""
     if not torch.cuda.is_available():
         return torch.device("cpu")
+    if not GPU_PREFERIDA:
+        torch.cuda.set_device(0)
+        return torch.device("cuda:0")
     for i in range(torch.cuda.device_count()):
         if GPU_PREFERIDA in torch.cuda.get_device_name(i):
             torch.cuda.set_device(i)

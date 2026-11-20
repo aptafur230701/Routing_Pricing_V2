@@ -20,7 +20,14 @@ el precio de reserva del arco que el actor ya elige.
       en evaluation.py/main.py, que ya corren esa comparación.)
   (d) Plausibilidad: percentil de p* en las tarifas históricas de la lane (días de entrenamiento con carga) y
       correlación de (p* − break-even) con el índice de mercado del destino (esperada negativa: un destino con
-      índice alto vale más ⇒ Ṽ(j) mayor ⇒ p* menor).
+      índice alto vale más ⇒ Ṽ(j) mayor ⇒ p* menor) y con el LTR del nodo ACTUAL i, no del destino (esperada
+      positiva: mercado tensionado en i ⇒ más poder de negociación del transportista sobre las lanes que salen
+      de i ⇒ tarifas observadas r_obs(i→·) más altas en todas las alternativas ⇒ Q_alt sube sin que suba Ṽ(j)
+      (que es el valor de la continuación desde j, ajeno a la economía de salida de i) ⇒ p* sube. A diferencia
+      del índice del destino, el LTR de i NO se agrega como feature al modelo: ya está implícito en r_obs
+      (pricing.py), así que esta correlación valida el p* existente, no requiere tocar Ṽ ni reentrenar nada
+      — alimentar el LTR de i a Ṽ(s, j) de forma simétrica entre candidatos se cancelaría casi exactamente en
+      Q_alt − Ṽ(j), que por construcción solo es sensible a diferencias ENTRE alternativas del mismo estado.
   (a) Las pruebas internas (Q(s, j) = Q_alt a tarifa p*, monotonía en el costo, invariancia en S) están en tests/.
 
 p* es un costo de oportunidad del transportista, no una probabilidad de aceptación. Su rango [mín, máx] entre
@@ -170,6 +177,10 @@ class Escenario:
             actions = self.acciones(h_t, emb, mask_t, modo)
             rate, loads = env.rate_row_obs, env.loads_row_obs
             idx = env.market_index if con_indice else None
+            ltr_i = None                                        # LTR del nodo ACTUAL (no del destino): no entra al
+            if con_indice and self.ltr is not None:               # modelo, solo se usa para validar el p* ya calculado
+                dia_ltr = np.minimum(env.current_day_idx, self.ltr.shape[1] - 1)
+                ltr_i = self.ltr[env.current_node, dia_ltr]
             paso = []
             for b in np.where(active)[0]:
                 paso.append(len(recs))
@@ -180,7 +191,9 @@ class Escenario:
                     loads=np.array(loads[b]), k_rem=int(env.k_remaining[b]), dow=int(env.current_dow[b]),
                     world_seed=None if dis.get("world_seed") is None else int(dis["world_seed"][b]),
                     va=None if va is None else va[b].copy(), vb=None if vb is None else vb[b].copy(),
-                    idx=None if idx is None else np.array(idx[b], dtype=np.float64), term=False, valido=False,
+                    idx=None if idx is None else np.array(idx[b], dtype=np.float64),
+                    ltr_i=None if ltr_i is None else float(ltr_i[b]),
+                    term=False, valido=False,
                 ))
             _, term, masks = env.step(actions)
             for r, b in zip(paso, np.where(active)[0]):
@@ -417,8 +430,9 @@ def validar_contrafactual(esc: Escenario, n_mundos: int, n_estados: int, rng, k_
 
 def arcos_ruta(esc: Escenario, dis, k_arr) -> pd.DataFrame:
     """Una fila por arco de la ruta del actor (también el retorno y los arcos sin carga, con p* = NaN): ruta, tarifa
-    de hoy, p*, rango, break-even, percentil histórico e índice de mercado del destino. Los arcos con p* definido
-    (con carga, no retorno, con alternativa) son los que entran en los resúmenes."""
+    de hoy, p*, rango, break-even, percentil histórico, índice de mercado del destino y LTR del nodo ACTUAL (de
+    donde sale el arco, no a donde llega). Los arcos con p* definido (con carga, no retorno, con alternativa) son
+    los que entran en los resúmenes."""
     recs = esc.recolectar(dis, k_arr, modo="greedy", con_indice=True)
     rutas = {}
     for r in recs:
@@ -435,7 +449,7 @@ def arcos_ruta(esc: Escenario, dis, k_arr) -> pd.DataFrame:
             dist_j=esc.dist[i, j], rate_j=float(r["rate"][j]), break_even=pr.break_even,
             p=pr.p, p_min=pr.p_min, p_max=pr.p_max, ancho_rango=pr.p_max - pr.p_min,
             percentil=percentil_historico(pr.p, esc.rate_hist[:, i, j], esc.loads_hist[:, i, j]) if pr.definido else float("nan"),
-            indice_j=float(r["idx"][j]),
+            indice_j=float(r["idx"][j]), ltr_i=r["ltr_i"],
         ))
     df = pd.DataFrame(filas)
     df["margen_mundo"] = df["mundo"].map(margen)                       # margen del tour completo (USD), repetido en cada arco
@@ -443,8 +457,10 @@ def arcos_ruta(esc: Escenario, dis, k_arr) -> pd.DataFrame:
 
 
 def resumen_arcos(df: pd.DataFrame, nombre: str) -> dict:
-    """% de arcos con p* bajo el break-even y sobre break-even + BE_MARGEN; percentil y correlación con el índice.
-    Solo cuentan los arcos con p* definido."""
+    """% de arcos con p* bajo el break-even y sobre break-even + BE_MARGEN; percentil y correlación con el índice
+    de mercado del destino (esperada negativa) y con el LTR del nodo ACTUAL (esperada positiva: mercado tensionado
+    en origen ⇒ más poder de negociación sobre las lanes que salen de ahí ⇒ p* más alto; ver validate_pricing.py
+    docstring (d) y README). Solo cuentan los arcos con p* definido."""
     df = df[df["p"].notna()]
     if len(df) == 0:
         return dict(conjunto=nombre, n_arcos=0)
@@ -452,6 +468,9 @@ def resumen_arcos(df: pd.DataFrame, nombre: str) -> dict:
     ok = df["indice_j"].notna() & dif.notna()
     pear = float(np.corrcoef(dif[ok], df["indice_j"][ok])[0, 1]) if ok.sum() > 2 else float("nan")
     spear = float(spearmanr(dif[ok], df["indice_j"][ok])[0]) if ok.sum() > 2 else float("nan")
+    ok_ltr = df["ltr_i"].notna() & dif.notna()
+    pear_ltr = float(np.corrcoef(dif[ok_ltr], df["ltr_i"][ok_ltr])[0, 1]) if ok_ltr.sum() > 2 else float("nan")
+    spear_ltr = float(spearmanr(dif[ok_ltr], df["ltr_i"][ok_ltr])[0]) if ok_ltr.sum() > 2 else float("nan")
     pc = df["percentil"].dropna()
     lo_m, hi_m = ic_bootstrap_cluster(dif, df["mundo"])
     return dict(
@@ -463,6 +482,7 @@ def resumen_arcos(df: pd.DataFrame, nombre: str) -> dict:
         percentil_medio=pc.mean(), percentil_mediana=pc.median(), n_percentil=len(pc),
         pct_percentil_bajo_5=100.0 * (pc < 5).mean(), pct_percentil_sobre_95=100.0 * (pc > 95).mean(),
         corr_pearson_dif_indice=pear, corr_spearman_dif_indice=spear,
+        corr_pearson_dif_ltr=pear_ltr, corr_spearman_dif_ltr=spear_ltr,
     )
 
 
@@ -620,7 +640,8 @@ def _hoja_arcos(tablas: dict) -> pd.DataFrame:
     if not partes:
         return pd.DataFrame()
     d = pd.concat(partes, ignore_index=True)
-    d["posicion_valiosa"] = (d["p"] < d["break_even"]).where(d["p"].notna())
+    d = d.sort_values(["conjunto", "mundo", "paso"], kind="stable").reset_index(drop=True)   # los arcos de
+    d["posicion_valiosa"] = (d["p"] < d["break_even"]).where(d["p"].notna())                 # una misma ruta quedan juntos
     d["nota"] = np.select([d["es_retorno"], ~d["tiene_carga"], d["only_option"]],
                           ["retorno al depot (sin p*)", "sin carga: reposicionamiento (sin p*)",
                            "única acción factible (sin p*)"], "")
@@ -646,7 +667,7 @@ def append_pricing_sheet(excel_path: str, tablas: dict) -> None:
     for k in tablas:
         if k.startswith("contrafactual_resumen"):
             secciones.append(("Contrafactual — sesgo = p* predicho − p* realizado (USD/mi y USD/lane); IC95 por bootstrap de mundos", tablas[k]))
-    secciones.append(("Arcos de la ruta: p* vs break-even, percentil histórico y correlación con el índice del destino", tablas["arcos_resumen"]))
+    secciones.append(("Arcos de la ruta: p* vs break-even, percentil histórico, correlación con el índice del destino y con el LTR del nodo actual", tablas["arcos_resumen"]))
     for k in tablas:
         if k.startswith("umbral_resumen"):
             secciones.append(("Regla de aceptación por umbral (pisos: break-even, break-even + margen, p*)", tablas[k]))

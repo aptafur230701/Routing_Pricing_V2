@@ -897,7 +897,7 @@ def run_am_training(
 
         for epoch_i in range(n_ppo_epochs):
 
-            kl_too_high = False # Flag para detectar si el KL se dispara en este epoch
+            kl_too_high = False
 
             for _batch_idx, idx_batch in enumerate(buffer.get_batches(ppo_batch_size)):
                 B = len(idx_batch)
@@ -1046,11 +1046,12 @@ def run_am_training(
                         clip_frac  = ((ratio - 1).abs() > clip_eps).float().mean().item()
 
                 if approx_kl > 0.05:
-                    kl_too_high = True                   # ← marca la bandera
-                    batch_kl_divs.append(approx_kl)     # ← registra antes de salir
+                    kl_too_high = True
+                    batch_kl_divs.append(approx_kl)
                     batch_clip_fracs.append(clip_frac)
-                    break     
-                
+                    break
+
+
                 batch_total_losses.append(actor_loss_total.item())
                 batch_actor_losses.append(actor_loss.item())
                 batch_value_losses.append(value_loss.item())
