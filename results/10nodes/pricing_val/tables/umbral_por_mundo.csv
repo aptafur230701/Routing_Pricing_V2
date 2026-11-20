@@ -17,7 +17,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 15,1521.0,True,2,break-even,simulado K=libre
 16,1030.0,True,2,break-even,simulado K=libre
 17,202.0,True,2,break-even,simulado K=libre
-18,-591.0,True,2,break-even,simulado K=libre
+18,-107.0,True,2,break-even,simulado K=libre
 19,-4519.0,True,2,break-even,simulado K=libre
 20,1188.0,True,2,break-even,simulado K=libre
 21,-1697.0,True,2,break-even,simulado K=libre
@@ -318,7 +318,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 316,1613.0,True,2,break-even,simulado K=libre
 317,-1003.0,True,2,break-even,simulado K=libre
 318,1453.0,True,2,break-even,simulado K=libre
-319,125.0,True,2,break-even,simulado K=libre
+319,419.0,True,2,break-even,simulado K=libre
 320,-4519.0,True,2,break-even,simulado K=libre
 321,-904.0,True,2,break-even,simulado K=libre
 322,1807.0,True,2,break-even,simulado K=libre
@@ -536,7 +536,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 534,460.0,True,2,break-even,simulado K=libre
 535,1132.0,True,2,break-even,simulado K=libre
 536,1004.0,True,2,break-even,simulado K=libre
-537,14.0,True,2,break-even,simulado K=libre
+537,1408.0,True,2,break-even,simulado K=libre
 538,1114.0,True,2,break-even,simulado K=libre
 539,2243.0,True,2,break-even,simulado K=libre
 540,817.0,True,2,break-even,simulado K=libre
@@ -716,7 +716,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 714,2333.0,True,2,break-even,simulado K=libre
 715,472.0,True,2,break-even,simulado K=libre
 716,1353.0,True,2,break-even,simulado K=libre
-717,2313.0,True,2,break-even,simulado K=libre
+717,848.0,True,2,break-even,simulado K=libre
 718,122.0,True,2,break-even,simulado K=libre
 719,-234.0,True,2,break-even,simulado K=libre
 720,1913.0,True,2,break-even,simulado K=libre
@@ -797,7 +797,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 795,-4519.0,True,2,break-even,simulado K=libre
 796,522.0,True,2,break-even,simulado K=libre
 797,774.0,True,2,break-even,simulado K=libre
-798,827.0,True,2,break-even,simulado K=libre
+798,1625.0,True,2,break-even,simulado K=libre
 799,854.0,True,2,break-even,simulado K=libre
 800,1695.0,True,2,break-even,simulado K=libre
 801,1018.0,True,2,break-even,simulado K=libre
@@ -805,7 +805,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 803,269.0,True,2,break-even,simulado K=libre
 804,2180.0,True,2,break-even,simulado K=libre
 805,1308.0,True,2,break-even,simulado K=libre
-806,-142.0,True,2,break-even,simulado K=libre
+806,1602.0,True,2,break-even,simulado K=libre
 807,871.0,True,2,break-even,simulado K=libre
 808,393.0,True,2,break-even,simulado K=libre
 809,2082.0,True,2,break-even,simulado K=libre
@@ -815,7 +815,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 813,1529.0,True,2,break-even,simulado K=libre
 814,2559.0,True,2,break-even,simulado K=libre
 815,2265.0,True,2,break-even,simulado K=libre
-816,-100.0,True,2,break-even,simulado K=libre
+816,1810.0,True,2,break-even,simulado K=libre
 817,1225.0,True,2,break-even,simulado K=libre
 818,1794.0,True,2,break-even,simulado K=libre
 819,396.0,True,2,break-even,simulado K=libre
@@ -893,7 +893,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 891,1063.0,True,2,break-even,simulado K=libre
 892,1137.0,True,2,break-even,simulado K=libre
 893,2113.0,True,2,break-even,simulado K=libre
-894,911.0,True,2,break-even,simulado K=libre
+894,1129.0,True,2,break-even,simulado K=libre
 895,-4519.0,True,2,break-even,simulado K=libre
 896,2243.0,True,2,break-even,simulado K=libre
 897,985.0,True,2,break-even,simulado K=libre
@@ -1002,7 +1002,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 0,4156.0,True,2,break-even + 0.30,simulado K=libre
 1,2478.0,True,2,break-even + 0.30,simulado K=libre
 2,798.0,True,2,break-even + 0.30,simulado K=libre
-3,1579.0,True,2,break-even + 0.30,simulado K=libre
+3,942.0,True,2,break-even + 0.30,simulado K=libre
 4,441.0,True,2,break-even + 0.30,simulado K=libre
 5,2160.0,True,2,break-even + 0.30,simulado K=libre
 6,1263.0,True,2,break-even + 0.30,simulado K=libre
@@ -1014,10 +1014,10 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 12,632.0,True,2,break-even + 0.30,simulado K=libre
 13,1609.0,True,2,break-even + 0.30,simulado K=libre
 14,1265.0,True,2,break-even + 0.30,simulado K=libre
-15,1521.0,True,2,break-even + 0.30,simulado K=libre
+15,939.0,True,2,break-even + 0.30,simulado K=libre
 16,1030.0,True,2,break-even + 0.30,simulado K=libre
 17,202.0,True,2,break-even + 0.30,simulado K=libre
-18,-591.0,True,2,break-even + 0.30,simulado K=libre
+18,-107.0,True,2,break-even + 0.30,simulado K=libre
 19,-4519.0,True,2,break-even + 0.30,simulado K=libre
 20,1188.0,True,2,break-even + 0.30,simulado K=libre
 21,-1697.0,True,2,break-even + 0.30,simulado K=libre
@@ -1306,7 +1306,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 304,-44.0,True,2,break-even + 0.30,simulado K=libre
 305,450.0,True,2,break-even + 0.30,simulado K=libre
 306,1084.0,True,2,break-even + 0.30,simulado K=libre
-307,1048.0,True,2,break-even + 0.30,simulado K=libre
+307,1781.0,True,2,break-even + 0.30,simulado K=libre
 308,-4519.0,True,2,break-even + 0.30,simulado K=libre
 309,1425.0,True,2,break-even + 0.30,simulado K=libre
 310,897.0,True,2,break-even + 0.30,simulado K=libre
@@ -1318,7 +1318,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 316,1613.0,True,2,break-even + 0.30,simulado K=libre
 317,-1003.0,True,2,break-even + 0.30,simulado K=libre
 318,1453.0,True,2,break-even + 0.30,simulado K=libre
-319,125.0,True,2,break-even + 0.30,simulado K=libre
+319,419.0,True,2,break-even + 0.30,simulado K=libre
 320,-4519.0,True,2,break-even + 0.30,simulado K=libre
 321,-904.0,True,2,break-even + 0.30,simulado K=libre
 322,1807.0,True,2,break-even + 0.30,simulado K=libre
@@ -1526,7 +1526,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 524,-585.0,True,2,break-even + 0.30,simulado K=libre
 525,1898.0,True,2,break-even + 0.30,simulado K=libre
 526,1690.0,True,2,break-even + 0.30,simulado K=libre
-527,-2384.0,True,2,break-even + 0.30,simulado K=libre
+527,633.0,True,2,break-even + 0.30,simulado K=libre
 528,2480.0,True,2,break-even + 0.30,simulado K=libre
 529,1524.0,True,2,break-even + 0.30,simulado K=libre
 530,1412.0,True,2,break-even + 0.30,simulado K=libre
@@ -1536,7 +1536,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 534,460.0,True,2,break-even + 0.30,simulado K=libre
 535,1132.0,True,2,break-even + 0.30,simulado K=libre
 536,1004.0,True,2,break-even + 0.30,simulado K=libre
-537,14.0,True,2,break-even + 0.30,simulado K=libre
+537,1408.0,True,2,break-even + 0.30,simulado K=libre
 538,1114.0,True,2,break-even + 0.30,simulado K=libre
 539,2243.0,True,2,break-even + 0.30,simulado K=libre
 540,817.0,True,2,break-even + 0.30,simulado K=libre
@@ -1716,7 +1716,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 714,2333.0,True,2,break-even + 0.30,simulado K=libre
 715,472.0,True,2,break-even + 0.30,simulado K=libre
 716,1353.0,True,2,break-even + 0.30,simulado K=libre
-717,2313.0,True,2,break-even + 0.30,simulado K=libre
+717,848.0,True,2,break-even + 0.30,simulado K=libre
 718,122.0,True,2,break-even + 0.30,simulado K=libre
 719,390.0,True,2,break-even + 0.30,simulado K=libre
 720,1913.0,True,2,break-even + 0.30,simulado K=libre
@@ -1797,7 +1797,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 795,-4519.0,True,2,break-even + 0.30,simulado K=libre
 796,522.0,True,2,break-even + 0.30,simulado K=libre
 797,774.0,True,2,break-even + 0.30,simulado K=libre
-798,827.0,True,2,break-even + 0.30,simulado K=libre
+798,1625.0,True,2,break-even + 0.30,simulado K=libre
 799,854.0,True,2,break-even + 0.30,simulado K=libre
 800,1695.0,True,2,break-even + 0.30,simulado K=libre
 801,1018.0,True,2,break-even + 0.30,simulado K=libre
@@ -1805,7 +1805,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 803,269.0,True,2,break-even + 0.30,simulado K=libre
 804,2180.0,True,2,break-even + 0.30,simulado K=libre
 805,1308.0,True,2,break-even + 0.30,simulado K=libre
-806,-142.0,True,2,break-even + 0.30,simulado K=libre
+806,1602.0,True,2,break-even + 0.30,simulado K=libre
 807,871.0,True,2,break-even + 0.30,simulado K=libre
 808,393.0,True,2,break-even + 0.30,simulado K=libre
 809,2082.0,True,2,break-even + 0.30,simulado K=libre
@@ -1815,7 +1815,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 813,1529.0,True,2,break-even + 0.30,simulado K=libre
 814,2559.0,True,2,break-even + 0.30,simulado K=libre
 815,2265.0,True,2,break-even + 0.30,simulado K=libre
-816,-100.0,True,2,break-even + 0.30,simulado K=libre
+816,1810.0,True,2,break-even + 0.30,simulado K=libre
 817,1225.0,True,2,break-even + 0.30,simulado K=libre
 818,1794.0,True,2,break-even + 0.30,simulado K=libre
 819,396.0,True,2,break-even + 0.30,simulado K=libre
@@ -1893,7 +1893,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 891,1063.0,True,2,break-even + 0.30,simulado K=libre
 892,1137.0,True,2,break-even + 0.30,simulado K=libre
 893,2113.0,True,2,break-even + 0.30,simulado K=libre
-894,911.0,True,2,break-even + 0.30,simulado K=libre
+894,1129.0,True,2,break-even + 0.30,simulado K=libre
 895,-4519.0,True,2,break-even + 0.30,simulado K=libre
 896,2243.0,True,2,break-even + 0.30,simulado K=libre
 897,985.0,True,2,break-even + 0.30,simulado K=libre
@@ -2026,11 +2026,11 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 24,950.0,True,2,p*,simulado K=libre
 25,1853.0,True,2,p*,simulado K=libre
 26,1752.0,True,2,p*,simulado K=libre
-27,502.0,True,2,p*,simulado K=libre
+27,835.0,True,2,p*,simulado K=libre
 28,1526.0,True,2,p*,simulado K=libre
 29,1501.0,True,2,p*,simulado K=libre
 30,271.0,True,2,p*,simulado K=libre
-31,1381.0,True,2,p*,simulado K=libre
+31,1976.0,True,2,p*,simulado K=libre
 32,-441.0,True,2,p*,simulado K=libre
 33,553.0,True,2,p*,simulado K=libre
 34,-1578.0,True,2,p*,simulado K=libre
@@ -2047,7 +2047,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 45,-90.0,True,2,p*,simulado K=libre
 46,528.0,True,2,p*,simulado K=libre
 47,567.0,True,2,p*,simulado K=libre
-48,1440.0,True,2,p*,simulado K=libre
+48,428.0,True,2,p*,simulado K=libre
 49,1839.0,True,2,p*,simulado K=libre
 50,1744.0,True,2,p*,simulado K=libre
 51,760.0,True,2,p*,simulado K=libre
@@ -2085,7 +2085,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 83,1092.0,True,2,p*,simulado K=libre
 84,3084.0,True,2,p*,simulado K=libre
 85,877.0,True,2,p*,simulado K=libre
-86,1039.0,True,2,p*,simulado K=libre
+86,1718.0,True,2,p*,simulado K=libre
 87,1350.0,True,2,p*,simulado K=libre
 88,-4519.0,True,2,p*,simulado K=libre
 89,358.0,True,2,p*,simulado K=libre
@@ -2129,7 +2129,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 127,137.0,True,2,p*,simulado K=libre
 128,321.0,True,2,p*,simulado K=libre
 129,1345.0,True,2,p*,simulado K=libre
-130,1291.0,True,2,p*,simulado K=libre
+130,1515.0,True,2,p*,simulado K=libre
 131,-4519.0,True,2,p*,simulado K=libre
 132,1602.0,True,2,p*,simulado K=libre
 133,2332.0,True,2,p*,simulado K=libre
@@ -2139,7 +2139,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 137,1691.0,True,2,p*,simulado K=libre
 138,580.0,True,2,p*,simulado K=libre
 139,1558.0,True,2,p*,simulado K=libre
-140,2331.0,True,2,p*,simulado K=libre
+140,2088.0,True,2,p*,simulado K=libre
 141,1025.0,True,2,p*,simulado K=libre
 142,2540.0,True,2,p*,simulado K=libre
 143,1042.0,True,2,p*,simulado K=libre
@@ -2147,12 +2147,12 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 145,762.0,True,2,p*,simulado K=libre
 146,-202.0,True,2,p*,simulado K=libre
 147,2069.0,True,2,p*,simulado K=libre
-148,1588.0,True,2,p*,simulado K=libre
+148,1210.0,True,2,p*,simulado K=libre
 149,1635.0,True,2,p*,simulado K=libre
 150,726.0,True,2,p*,simulado K=libre
 151,1245.0,True,2,p*,simulado K=libre
 152,1717.0,True,2,p*,simulado K=libre
-153,486.0,True,2,p*,simulado K=libre
+153,793.0,True,2,p*,simulado K=libre
 154,2354.0,True,2,p*,simulado K=libre
 155,1313.0,True,2,p*,simulado K=libre
 156,730.0,True,2,p*,simulado K=libre
@@ -2174,7 +2174,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 172,316.0,True,2,p*,simulado K=libre
 173,1993.0,True,2,p*,simulado K=libre
 174,2614.0,True,2,p*,simulado K=libre
-175,1296.0,True,2,p*,simulado K=libre
+175,1214.0,True,2,p*,simulado K=libre
 176,1164.0,True,2,p*,simulado K=libre
 177,-952.0,True,2,p*,simulado K=libre
 178,1882.0,True,2,p*,simulado K=libre
@@ -2205,7 +2205,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 203,1054.0,True,2,p*,simulado K=libre
 204,2461.0,True,2,p*,simulado K=libre
 205,2640.0,True,2,p*,simulado K=libre
-206,464.0,True,2,p*,simulado K=libre
+206,1129.0,True,2,p*,simulado K=libre
 207,1152.0,True,2,p*,simulado K=libre
 208,427.0,True,2,p*,simulado K=libre
 209,627.0,True,2,p*,simulado K=libre
@@ -2217,7 +2217,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 215,-4519.0,True,2,p*,simulado K=libre
 216,1621.0,True,2,p*,simulado K=libre
 217,-222.0,True,2,p*,simulado K=libre
-218,1136.0,True,2,p*,simulado K=libre
+218,1305.0,True,2,p*,simulado K=libre
 219,774.0,True,2,p*,simulado K=libre
 220,1437.0,True,2,p*,simulado K=libre
 221,1067.0,True,2,p*,simulado K=libre
@@ -2226,7 +2226,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 224,1155.0,True,2,p*,simulado K=libre
 225,1375.0,True,2,p*,simulado K=libre
 226,1001.0,True,2,p*,simulado K=libre
-227,465.0,True,2,p*,simulado K=libre
+227,-148.0,True,2,p*,simulado K=libre
 228,-258.0,True,2,p*,simulado K=libre
 229,1294.0,True,2,p*,simulado K=libre
 230,-4519.0,True,2,p*,simulado K=libre
@@ -2288,7 +2288,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 286,-4519.0,True,2,p*,simulado K=libre
 287,-4519.0,True,2,p*,simulado K=libre
 288,1235.0,True,2,p*,simulado K=libre
-289,1632.0,True,2,p*,simulado K=libre
+289,1602.0,True,2,p*,simulado K=libre
 290,1565.0,True,2,p*,simulado K=libre
 291,1028.0,True,2,p*,simulado K=libre
 292,-4519.0,True,2,p*,simulado K=libre
@@ -2298,7 +2298,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 296,1681.0,True,2,p*,simulado K=libre
 297,-856.0,True,2,p*,simulado K=libre
 298,2187.0,True,2,p*,simulado K=libre
-299,1633.0,True,2,p*,simulado K=libre
+299,2418.0,True,2,p*,simulado K=libre
 300,2210.0,True,2,p*,simulado K=libre
 301,299.0,True,2,p*,simulado K=libre
 302,197.0,True,2,p*,simulado K=libre
@@ -2390,9 +2390,9 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 388,978.0,True,2,p*,simulado K=libre
 389,1473.0,True,2,p*,simulado K=libre
 390,1432.0,True,2,p*,simulado K=libre
-391,2275.0,True,2,p*,simulado K=libre
+391,1142.0,True,2,p*,simulado K=libre
 392,1794.0,True,2,p*,simulado K=libre
-393,2001.0,True,2,p*,simulado K=libre
+393,1289.0,True,2,p*,simulado K=libre
 394,2135.0,True,2,p*,simulado K=libre
 395,871.0,True,2,p*,simulado K=libre
 396,1131.0,True,2,p*,simulado K=libre
@@ -2407,7 +2407,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 405,808.0,True,2,p*,simulado K=libre
 406,500.0,True,2,p*,simulado K=libre
 407,1531.0,True,2,p*,simulado K=libre
-408,848.0,True,2,p*,simulado K=libre
+408,-1482.0,True,2,p*,simulado K=libre
 409,2369.0,True,2,p*,simulado K=libre
 410,-4519.0,True,2,p*,simulado K=libre
 411,2067.0,True,2,p*,simulado K=libre
@@ -2415,7 +2415,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 413,2292.0,True,2,p*,simulado K=libre
 414,-612.0,True,2,p*,simulado K=libre
 415,2287.0,True,2,p*,simulado K=libre
-416,173.0,True,2,p*,simulado K=libre
+416,948.0,True,2,p*,simulado K=libre
 417,1032.0,True,2,p*,simulado K=libre
 418,1724.0,True,2,p*,simulado K=libre
 419,956.0,True,2,p*,simulado K=libre
@@ -2460,7 +2460,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 458,1078.0,True,2,p*,simulado K=libre
 459,-1788.0,True,2,p*,simulado K=libre
 460,2507.0,True,2,p*,simulado K=libre
-461,1025.0,True,2,p*,simulado K=libre
+461,937.0,True,2,p*,simulado K=libre
 462,2.0,True,2,p*,simulado K=libre
 463,1710.0,True,2,p*,simulado K=libre
 464,3132.0,True,2,p*,simulado K=libre
@@ -2506,7 +2506,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 504,1108.0,True,2,p*,simulado K=libre
 505,1022.0,True,2,p*,simulado K=libre
 506,662.0,True,2,p*,simulado K=libre
-507,1388.0,True,2,p*,simulado K=libre
+507,361.0,True,2,p*,simulado K=libre
 508,3013.0,True,2,p*,simulado K=libre
 509,1045.0,True,2,p*,simulado K=libre
 510,1089.0,True,2,p*,simulado K=libre
@@ -2564,7 +2564,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 562,1185.0,True,2,p*,simulado K=libre
 563,-4519.0,True,2,p*,simulado K=libre
 564,742.0,True,2,p*,simulado K=libre
-565,1085.0,True,2,p*,simulado K=libre
+565,703.0,True,2,p*,simulado K=libre
 566,2180.0,True,2,p*,simulado K=libre
 567,965.0,True,2,p*,simulado K=libre
 568,-1.0,True,2,p*,simulado K=libre
@@ -2577,7 +2577,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 575,1798.0,True,2,p*,simulado K=libre
 576,-106.0,True,2,p*,simulado K=libre
 577,2173.0,True,2,p*,simulado K=libre
-578,1165.0,True,2,p*,simulado K=libre
+578,981.0,True,2,p*,simulado K=libre
 579,-4519.0,True,2,p*,simulado K=libre
 580,508.0,True,2,p*,simulado K=libre
 581,-1322.0,True,2,p*,simulado K=libre
@@ -2609,12 +2609,12 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 607,2731.0,True,2,p*,simulado K=libre
 608,301.0,True,2,p*,simulado K=libre
 609,2807.0,True,2,p*,simulado K=libre
-610,2171.0,True,2,p*,simulado K=libre
+610,2891.0,True,2,p*,simulado K=libre
 611,1106.0,True,2,p*,simulado K=libre
 612,1695.0,True,2,p*,simulado K=libre
 613,1154.0,True,2,p*,simulado K=libre
 614,713.0,True,2,p*,simulado K=libre
-615,1061.0,True,2,p*,simulado K=libre
+615,327.0,True,2,p*,simulado K=libre
 616,-2236.0,True,2,p*,simulado K=libre
 617,631.0,True,2,p*,simulado K=libre
 618,1060.0,True,2,p*,simulado K=libre
@@ -2623,7 +2623,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 621,1807.0,True,2,p*,simulado K=libre
 622,-2244.0,True,2,p*,simulado K=libre
 623,-346.0,True,2,p*,simulado K=libre
-624,-251.0,True,2,p*,simulado K=libre
+624,2809.0,True,2,p*,simulado K=libre
 625,2364.0,True,2,p*,simulado K=libre
 626,3636.0,True,2,p*,simulado K=libre
 627,1659.0,True,2,p*,simulado K=libre
@@ -2653,7 +2653,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 651,610.0,True,2,p*,simulado K=libre
 652,1289.0,True,2,p*,simulado K=libre
 653,1189.0,True,2,p*,simulado K=libre
-654,2043.0,True,2,p*,simulado K=libre
+654,2511.0,True,2,p*,simulado K=libre
 655,783.0,True,2,p*,simulado K=libre
 656,636.0,True,2,p*,simulado K=libre
 657,1034.0,True,2,p*,simulado K=libre
@@ -2692,7 +2692,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 690,1706.0,True,2,p*,simulado K=libre
 691,2831.0,True,2,p*,simulado K=libre
 692,1767.0,True,2,p*,simulado K=libre
-693,2961.0,True,2,p*,simulado K=libre
+693,1112.0,True,2,p*,simulado K=libre
 694,1745.0,True,2,p*,simulado K=libre
 695,1137.0,True,2,p*,simulado K=libre
 696,-4519.0,True,2,p*,simulado K=libre
@@ -2713,20 +2713,20 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 711,1638.0,True,2,p*,simulado K=libre
 712,-309.0,True,2,p*,simulado K=libre
 713,799.0,True,2,p*,simulado K=libre
-714,2333.0,True,2,p*,simulado K=libre
+714,1444.0,True,2,p*,simulado K=libre
 715,472.0,True,2,p*,simulado K=libre
 716,1353.0,True,2,p*,simulado K=libre
 717,848.0,True,2,p*,simulado K=libre
 718,122.0,True,2,p*,simulado K=libre
 719,390.0,True,2,p*,simulado K=libre
 720,1913.0,True,2,p*,simulado K=libre
-721,-1905.0,True,2,p*,simulado K=libre
+721,1404.0,True,2,p*,simulado K=libre
 722,1475.0,True,2,p*,simulado K=libre
 723,-4519.0,True,2,p*,simulado K=libre
 724,1738.0,True,2,p*,simulado K=libre
 725,1507.0,True,2,p*,simulado K=libre
 726,1886.0,True,2,p*,simulado K=libre
-727,1254.0,True,2,p*,simulado K=libre
+727,257.0,True,2,p*,simulado K=libre
 728,1542.0,True,2,p*,simulado K=libre
 729,2359.0,True,2,p*,simulado K=libre
 730,592.0,True,2,p*,simulado K=libre
@@ -2734,7 +2734,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 732,700.0,True,2,p*,simulado K=libre
 733,179.0,True,2,p*,simulado K=libre
 734,1390.0,True,2,p*,simulado K=libre
-735,809.0,True,2,p*,simulado K=libre
+735,1649.0,True,2,p*,simulado K=libre
 736,920.0,True,2,p*,simulado K=libre
 737,1932.0,True,2,p*,simulado K=libre
 738,134.0,True,2,p*,simulado K=libre
@@ -2829,7 +2829,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 827,1642.0,True,2,p*,simulado K=libre
 828,2528.0,True,2,p*,simulado K=libre
 829,1436.0,True,2,p*,simulado K=libre
-830,337.0,True,2,p*,simulado K=libre
+830,1164.0,True,2,p*,simulado K=libre
 831,-1143.0,True,2,p*,simulado K=libre
 832,2177.0,True,2,p*,simulado K=libre
 833,-67.0,True,2,p*,simulado K=libre
@@ -2844,7 +2844,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 842,2492.0,True,2,p*,simulado K=libre
 843,2237.0,True,2,p*,simulado K=libre
 844,2339.0,True,2,p*,simulado K=libre
-845,-2863.0,True,2,p*,simulado K=libre
+845,2446.0,True,2,p*,simulado K=libre
 846,1761.0,True,2,p*,simulado K=libre
 847,1807.0,True,2,p*,simulado K=libre
 848,850.0,True,2,p*,simulado K=libre
@@ -2870,12 +2870,12 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 868,2394.0,True,2,p*,simulado K=libre
 869,1291.0,True,2,p*,simulado K=libre
 870,544.0,True,2,p*,simulado K=libre
-871,1182.0,True,2,p*,simulado K=libre
-872,-959.0,True,2,p*,simulado K=libre
+871,1423.0,True,2,p*,simulado K=libre
+872,1219.0,True,2,p*,simulado K=libre
 873,2820.0,True,2,p*,simulado K=libre
 874,230.0,True,2,p*,simulado K=libre
 875,771.0,True,2,p*,simulado K=libre
-876,1213.0,True,2,p*,simulado K=libre
+876,1420.0,True,2,p*,simulado K=libre
 877,3027.0,True,2,p*,simulado K=libre
 878,802.0,True,2,p*,simulado K=libre
 879,2000.0,True,2,p*,simulado K=libre
@@ -2913,12 +2913,12 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 911,-2105.0,True,2,p*,simulado K=libre
 912,1719.0,True,2,p*,simulado K=libre
 913,1435.0,True,2,p*,simulado K=libre
-914,789.0,True,2,p*,simulado K=libre
+914,1960.0,True,2,p*,simulado K=libre
 915,851.0,True,2,p*,simulado K=libre
 916,1486.0,True,2,p*,simulado K=libre
 917,761.0,True,2,p*,simulado K=libre
 918,1351.0,True,2,p*,simulado K=libre
-919,1607.0,True,2,p*,simulado K=libre
+919,658.0,True,2,p*,simulado K=libre
 920,1590.0,True,2,p*,simulado K=libre
 921,1627.0,True,2,p*,simulado K=libre
 922,827.0,True,2,p*,simulado K=libre
@@ -2937,7 +2937,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 935,3188.0,True,2,p*,simulado K=libre
 936,1763.0,True,2,p*,simulado K=libre
 937,1122.0,True,2,p*,simulado K=libre
-938,2349.0,True,2,p*,simulado K=libre
+938,1885.0,True,2,p*,simulado K=libre
 939,1086.0,True,2,p*,simulado K=libre
 940,754.0,True,2,p*,simulado K=libre
 941,2176.0,True,2,p*,simulado K=libre
@@ -2978,12 +2978,12 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 976,3070.0,True,2,p*,simulado K=libre
 977,1340.0,True,2,p*,simulado K=libre
 978,1125.0,True,2,p*,simulado K=libre
-979,3412.0,True,2,p*,simulado K=libre
+979,2095.0,True,2,p*,simulado K=libre
 980,1799.0,True,2,p*,simulado K=libre
 981,757.0,True,2,p*,simulado K=libre
 982,1346.0,True,2,p*,simulado K=libre
 983,1343.0,True,2,p*,simulado K=libre
-984,376.0,True,2,p*,simulado K=libre
+984,823.0,True,2,p*,simulado K=libre
 985,-4519.0,True,2,p*,simulado K=libre
 986,1123.0,True,2,p*,simulado K=libre
 987,869.0,True,2,p*,simulado K=libre
@@ -2991,7 +2991,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 989,1840.0,True,2,p*,simulado K=libre
 990,2084.0,True,2,p*,simulado K=libre
 991,1825.0,True,2,p*,simulado K=libre
-992,1257.0,True,2,p*,simulado K=libre
+992,2075.0,True,2,p*,simulado K=libre
 993,1912.0,True,2,p*,simulado K=libre
 994,729.0,True,2,p*,simulado K=libre
 995,1510.0,True,2,p*,simulado K=libre
@@ -3616,7 +3616,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 14,1475.0,True,2,p*,replay K=libre
 15,1426.0,True,2,p*,replay K=libre
 16,1468.0,True,2,p*,replay K=libre
-17,649.0,True,2,p*,replay K=libre
+17,-758.0,True,2,p*,replay K=libre
 18,985.0,True,2,p*,replay K=libre
 19,667.0,True,2,p*,replay K=libre
 20,1013.0,True,2,p*,replay K=libre
@@ -3641,7 +3641,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 39,-4519.0,True,2,p*,replay K=libre
 40,1496.0,True,2,p*,replay K=libre
 41,-4519.0,True,2,p*,replay K=libre
-42,1553.0,True,2,p*,replay K=libre
+42,1228.0,True,2,p*,replay K=libre
 43,1024.0,True,2,p*,replay K=libre
 44,768.0,True,2,p*,replay K=libre
 45,1258.0,True,2,p*,replay K=libre
@@ -3652,7 +3652,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 50,1238.0,True,2,p*,replay K=libre
 51,864.0,True,2,p*,replay K=libre
 52,855.0,True,2,p*,replay K=libre
-53,662.0,True,2,p*,replay K=libre
+53,1742.0,True,2,p*,replay K=libre
 54,489.0,True,2,p*,replay K=libre
 55,1455.0,True,2,p*,replay K=libre
 56,1816.0,True,2,p*,replay K=libre
@@ -3671,7 +3671,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 69,687.0,True,2,p*,replay K=libre
 70,905.0,True,2,p*,replay K=libre
 71,-376.0,True,2,p*,replay K=libre
-72,890.0,True,2,p*,replay K=libre
+72,-1205.0,True,2,p*,replay K=libre
 73,794.0,True,2,p*,replay K=libre
 74,1773.0,True,2,p*,replay K=libre
 75,1117.0,True,2,p*,replay K=libre
@@ -3682,11 +3682,11 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 80,-282.0,True,2,p*,replay K=libre
 81,2940.0,True,2,p*,replay K=libre
 82,1277.0,True,2,p*,replay K=libre
-83,1886.0,True,2,p*,replay K=libre
+83,3043.0,True,2,p*,replay K=libre
 84,953.0,True,2,p*,replay K=libre
 85,1452.0,True,2,p*,replay K=libre
 86,1054.0,True,2,p*,replay K=libre
-87,1160.0,True,2,p*,replay K=libre
+87,924.0,True,2,p*,replay K=libre
 88,1871.0,True,2,p*,replay K=libre
 89,1378.0,True,2,p*,replay K=libre
 90,1157.0,True,2,p*,replay K=libre
@@ -3694,7 +3694,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 92,824.0,True,2,p*,replay K=libre
 93,1238.0,True,2,p*,replay K=libre
 94,-4519.0,True,2,p*,replay K=libre
-95,3133.0,True,2,p*,replay K=libre
+95,1649.0,True,2,p*,replay K=libre
 96,1554.0,True,2,p*,replay K=libre
 97,-4519.0,True,2,p*,replay K=libre
 98,1019.0,True,2,p*,replay K=libre
@@ -3760,7 +3760,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 158,1830.0,True,2,p*,replay K=libre
 159,1214.0,True,2,p*,replay K=libre
 160,-282.0,True,2,p*,replay K=libre
-161,890.0,True,2,p*,replay K=libre
+161,-1205.0,True,2,p*,replay K=libre
 162,1284.0,True,2,p*,replay K=libre
 163,1137.0,True,2,p*,replay K=libre
 164,-376.0,True,2,p*,replay K=libre
@@ -3806,7 +3806,7 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 204,1682.0,True,2,p*,replay K=libre
 205,1316.0,True,2,p*,replay K=libre
 206,1641.0,True,2,p*,replay K=libre
-207,1290.0,True,2,p*,replay K=libre
+207,1340.0,True,2,p*,replay K=libre
 208,1126.0,True,2,p*,replay K=libre
 209,1126.0,True,2,p*,replay K=libre
 210,-40.0,True,2,p*,replay K=libre
@@ -3873,13 +3873,13 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 271,-4519.0,True,2,p*,replay K=libre
 272,1024.0,True,2,p*,replay K=libre
 273,735.0,True,2,p*,replay K=libre
-274,662.0,True,2,p*,replay K=libre
+274,1742.0,True,2,p*,replay K=libre
 275,1040.0,True,2,p*,replay K=libre
 276,1298.0,True,2,p*,replay K=libre
 277,-4519.0,True,2,p*,replay K=libre
 278,1648.0,True,2,p*,replay K=libre
 279,1554.0,True,2,p*,replay K=libre
-280,1290.0,True,2,p*,replay K=libre
+280,1340.0,True,2,p*,replay K=libre
 281,1651.0,True,2,p*,replay K=libre
 282,985.0,True,2,p*,replay K=libre
 283,1629.0,True,2,p*,replay K=libre
@@ -3896,6 +3896,6 @@ mundo,margen,valido,n_arcos,umbral,conjunto
 294,1279.0,True,2,p*,replay K=libre
 295,1423.0,True,2,p*,replay K=libre
 296,1277.0,True,2,p*,replay K=libre
-297,1553.0,True,2,p*,replay K=libre
+297,1228.0,True,2,p*,replay K=libre
 298,744.0,True,2,p*,replay K=libre
 299,-4519.0,True,2,p*,replay K=libre
