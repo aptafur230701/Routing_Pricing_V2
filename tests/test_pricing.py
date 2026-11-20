@@ -117,12 +117,23 @@ def test_valuable_position_is_below_break_even_and_worthless_above(lane):
     assert price(lane, j, v).p > lane["cost"][j] / lane["dist"][j]
 
 
-def test_no_price_without_load_or_for_the_return(lane, heads):
+def test_no_price_without_load(lane, heads):
     sin_carga = price(lane, 1, *heads, loads_row=np.array([5, 0, 0, 2, 9, 1]))
     assert not sin_carga.has_load and not sin_carga.definido and np.isnan(sin_carga.p)
     assert sin_carga.break_even == pytest.approx(lane["cost"][1] / lane["dist"][1])
+
+
+def test_return_with_load_gets_a_price(lane, heads):
+    """El regreso al depot cotiza igual que cualquier otra lane si trae carga: Ṽ(s, depot) = 0 (q_values), no un
+    caso especial de reservation_price. loads[START] = 5 > 0 en el fixture `lane`."""
     retorno = price(lane, START, *heads)
-    assert not retorno.has_load and np.isnan(retorno.p) and retorno.break_even == pytest.approx(lane["cost"][START] / lane["dist"][START])
+    assert retorno.has_load and retorno.definido and np.isfinite(retorno.p)
+    assert retorno.break_even == pytest.approx(lane["cost"][START] / lane["dist"][START])
+
+
+def test_return_without_load_has_no_price(lane, heads):
+    sin_carga_retorno = price(lane, START, *heads, loads_row=np.array([0, 3, 0, 2, 9, 1]))
+    assert not sin_carga_retorno.has_load and np.isnan(sin_carga_retorno.p)
 
 
 def test_only_option(lane, heads):

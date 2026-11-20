@@ -163,18 +163,18 @@ def formatear_bloque(route, arcos) -> str:
     lineas = ["Ruta: " + " → ".join(str(n) for n in route), "Precio de reserva por arco:"]
     for a in arcos:
         cab = f"  {a['from']}→{a['to']}: "
-        if a["is_return"]:
-            lineas.append(cab + "p* = cost/dist (retorno al depot, Ṽ = 0)")
-        elif not a["has_load"]:
-            lineas.append(cab + "sin carga en esta lane (reposicionamiento): sin p*")
+        if not a["has_load"]:
+            nota_sin_carga = "sin carga en este regreso: sin p*" if a["is_return"] else "sin carga en esta lane (reposicionamiento): sin p*"
+            lineas.append(cab + nota_sin_carga)
         elif a["only_option"]:
             lineas.append(cab + "p* = cost/dist (única acción factible)")
         else:
             marca = "  ← posición valiosa" if a["p_estrella"] < a["break_even"] else ""
+            nota_retorno = "  (regreso a casa, Ṽ = 0)" if a["is_return"] else ""
             lineas.append(
                 cab + f"p* = {a['p_estrella']:.2f} /mi  [rango {a['p_min']:.2f}–{a['p_max']:.2f}]  "
                 f"(rate_hoy = {a['rate_hoy']:.2f}, break-even = {a['break_even']:.2f}, "
-                f"percentil histórico {a['percentil_historico']:.0f} %)" + marca
+                f"percentil histórico {a['percentil_historico']:.0f} %)" + nota_retorno + marca
             )
     return "\n".join(lineas)
 

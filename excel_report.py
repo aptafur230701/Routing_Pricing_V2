@@ -5,7 +5,8 @@ Libro de Excel con los resultados de la evaluación (baselines_drl_ruteo_estocas
   · Resumen            — por (K, método): margen medio, gaps contra UB-DP (política que ignora el
                          mercado, no es cota) y UB-PI (cota),
                          factibilidad y métricas operativas; mundos simulados y replay
-                         (días reales 90-119, fuera de muestra; etiquetado "replay, fuera de muestra (días 90-119)"); tiempos
+                         (días reales desde TRAIN_DAYS, fuera de muestra; etiquetado con
+                         stats_analysis.NOTA_REPLAY, calculado desde FECHA_INICIO/TRAIN_DAYS); tiempos
                          fuera de línea.
   · Mundos simulados   — una fila por (K, mundo, método)
   · Replay             — ídem sobre los días reales de evaluación

@@ -397,6 +397,12 @@ def main():
             print(f"  FALLÓ el tamaño {NUM_NODES} nodos — se continúa con el siguiente de NODE_SIZES")
             print(f"{'!'*60}")
             traceback.print_exc()
+        finally:
+            # Libera la memoria GPU del tamaño recién corrido (o del intento fallido) antes de
+            # pasar al siguiente: todos los tamaños comparten el mismo proceso, y sin esto la
+            # memoria reservada (y su fragmentación) se acumula de un tamaño al siguiente.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     print(f"\n{'='*60}")
     print(f"  Secuencia terminada: {NODE_SIZES}")

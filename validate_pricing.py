@@ -71,7 +71,7 @@ from pricing import (
     lane_cost_row, percentil_historico, reservation_price, PrecioReserva,
 )
 from problem_data import load_matrices
-from stats_analysis import ic_bootstrap_media, ic_bootstrap_cluster
+from stats_analysis import ic_bootstrap_media, ic_bootstrap_cluster, ETIQUETA_REPLAY_CORTA
 
 TRAMOS = [("< 300 mi", 0.0, 300.0), ("300-800 mi", 300.0, 800.0), ("> 800 mi", 800.0, np.inf)]
 
@@ -631,7 +631,7 @@ def _run_pricing_validation(
 def _hoja_arcos(tablas: dict) -> pd.DataFrame:
     """Una fila por arco de la ruta del actor (simulado y replay), lista para la hoja "Pricing arcos"."""
     partes = []
-    for k, nombre in (("arcos_simulado", "simulado"), ("arcos_replay", "replay (días 90-119)")):
+    for k, nombre in (("arcos_simulado", "simulado"), ("arcos_replay", ETIQUETA_REPLAY_CORTA)):
         for clave in [c for c in tablas if c.startswith(k)]:
             d = tablas[clave].copy()
             sufijo = clave[len(k):].replace("_K", " K=")
@@ -642,9 +642,11 @@ def _hoja_arcos(tablas: dict) -> pd.DataFrame:
     d = pd.concat(partes, ignore_index=True)
     d = d.sort_values(["conjunto", "mundo", "paso"], kind="stable").reset_index(drop=True)   # los arcos de
     d["posicion_valiosa"] = (d["p"] < d["break_even"]).where(d["p"].notna())                 # una misma ruta quedan juntos
-    d["nota"] = np.select([d["es_retorno"], ~d["tiene_carga"], d["only_option"]],
-                          ["retorno al depot (sin p*)", "sin carga: reposicionamiento (sin p*)",
-                           "única acción factible (sin p*)"], "")
+    d["nota"] = np.select(
+        [d["es_retorno"] & ~d["tiene_carga"], ~d["es_retorno"] & ~d["tiene_carga"], d["only_option"],
+         d["es_retorno"] & d["tiene_carga"] & ~d["only_option"]],
+        ["retorno sin carga (sin p*)", "sin carga: reposicionamiento (sin p*)", "única acción factible (sin p*)",
+         "regreso a casa con carga (Ṽ = 0)"], "")
     cols = ["conjunto", "mundo", "paso", "ruta", "i", "j", "dist_j", "rate_j", "p", "p_min", "p_max", "break_even",
             "percentil", "posicion_valiosa", "indice_j", "margen_mundo", "nota"]
     d = d[cols].rename(columns={"i": "desde", "j": "hacia", "dist_j": "distancia_mi", "rate_j": "rate_hoy",

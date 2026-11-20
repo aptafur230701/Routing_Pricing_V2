@@ -166,14 +166,34 @@ def _firma(market, time_matrix, distance_arr, diesel_arr, K, S, dt, seed) -> str
     return h.hexdigest()
 
 
+_BARRIDO_CAND_BYTES = 1.5e9   # presupuesto de memoria para `cand` (H_chunk, I, S, J) float32
+
+
+def _h_chunk(N, S):
+    """Tamaño de bloque de H tal que (h_chunk, N, S, N) float32 no pase de `_BARRIDO_CAND_BYTES`.
+
+    `cand` crece como N²·S (ver docstring de `_barrido`); sin partir por H, a partir de ~75-100
+    nodos el tensor completo ya no cabe en una GPU de 16 GB (confirmado en producción: OOM a 75 y
+    100 nodos, cand de 7.86 GiB y 18.63 GiB respectivamente). Partir por H da el mismo resultado
+    (es la misma suma, solo que en bloques) con memoria pico acotada e independiente de N.
+    """
+    bytes_por_h = N * S * N * 4
+    return max(1, min(N, int(_BARRIDO_CAND_BYTES // bytes_por_h)))
+
+
 def _barrido(V, V_prev, R, A, f, ok_est, base, smax, dt):
     """Rellena V[d0, h, i, s] hacia atrás en s (bucle de Bellman de una tabla).
 
     V_prev : tabla del nivel k−1 (o None para k = 1, solo retorno). Si es la misma
              tensor que V (caso libre) se lee de franjas posteriores, ya calculadas.
+
+    El candidato (H, I, S, J) se calcula en bloques de H (ver `_h_chunk`) para no materializar
+    nunca el tensor completo: su tamaño crece como N²·S y a N ≳ 75 ya no cabe en una GPU de 16 GB.
     """
     N = f.shape[0]
+    S = R.shape[2]
     jj = torch.arange(N, device=f.device)[None, :]            # (1, J) → broadcast con (I, J)
+    h_chunk = _h_chunk(N, S)
     for s in range(smax, -1, -1):
         q = int((s * dt) // _DIA_HORAS)                      # días enteros transcurridos
         ok = ok_est & (s + base <= smax)                     # (H, I, J) destino factible
@@ -182,12 +202,14 @@ def _barrido(V, V_prev, R, A, f, ok_est, base, smax, dt):
             dw = (d0 + q) % 7
             Rd = R[dw]                                       # (I, S, J)
             # Retorno a casa: siempre disponible, recompensa del arco i→h (con o sin carga).
-            mejor = Rd.permute(2, 0, 1)                      # (H, I, S): R[i, :, h]
+            mejor = Rd.permute(2, 0, 1).clone()              # (H, I, S): R[i, :, h]
             if V_prev is not None:
                 Vn = V_prev[d0][:, jj, s_sig]                # (H, I, J) = V(j, s + f_ij) del hogar h
-                cand = Rd[None] + Vn[:, :, None, :]          # (H, I, S, J)
-                cand.masked_fill_(~(ok[:, :, None, :] & A[dw][None]), _NEG)
-                mejor = torch.maximum(cand.amax(dim=-1), mejor)
+                for h0 in range(0, N, h_chunk):
+                    h1 = min(h0 + h_chunk, N)
+                    cand = Rd[None] + Vn[h0:h1, :, None, :]  # (h_chunk, I, S, J)
+                    cand.masked_fill_(~(ok[h0:h1, :, None, :] & A[dw][None]), _NEG)
+                    mejor[h0:h1] = torch.maximum(cand.amax(dim=-1), mejor[h0:h1])
             V[d0, :, :, s] = mejor.mean(dim=-1)
 
 

@@ -14,19 +14,26 @@ Unidad de análisis: la diferencia de margen (USD) DRL − baseline en un mismo 
     promedios de los mismos mundos, con intervalo bootstrap. UB-PI es cota; UB-DP es el valor de la
     política que ignora el mercado (no es cota): un gap negativo contra UB-DP significa que el método la supera.
 
-El replay (días reales 90-119, que ni el entrenamiento ni el ajuste del proceso vieron) se calcula
-igual pero va etiquetado: "replay, fuera de muestra (días 90-119)".
+El replay (días reales desde TRAIN_DAYS, que ni el entrenamiento ni el ajuste del proceso vieron) se
+calcula igual pero va etiquetado con la fecha real de inicio (NOTA_REPLAY), calculada a partir de
+FECHA_INICIO y TRAIN_DAYS en vez de quemar un rango de días a mano.
 """
+
+import datetime
 
 import numpy as np
 import pandas as pd
 from scipy.stats import wilcoxon
 
-from config import BOOTSTRAP_B, BOOTSTRAP_SEED
+from config import BOOTSTRAP_B, BOOTSTRAP_SEED, FECHA_INICIO, TRAIN_DAYS
 
 REFERENCIA = "DRL"
 BASELINES = ("B1", "B2", "B2P", "B3")
-NOTA_REPLAY = "replay, fuera de muestra (días 90-119)"
+_FECHA_INICIO_REPLAY = (
+    datetime.date.fromisoformat(FECHA_INICIO) + datetime.timedelta(days=TRAIN_DAYS)
+).isoformat()
+NOTA_REPLAY = f"replay, fuera de muestra (días reales desde {_FECHA_INICIO_REPLAY})"
+ETIQUETA_REPLAY_CORTA = f"replay (desde {_FECHA_INICIO_REPLAY})"
 
 
 def etiqueta_modo(modo: str) -> str:

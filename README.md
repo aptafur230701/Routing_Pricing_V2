@@ -178,8 +178,9 @@ más poder de negociación sobre las lanes que salen de ahí ⇒ p\* más alto �
 **Entrenamiento.** El PPO no entrena Ṽ. Después del PPO (`post_training.py`), con encoder, contexto y actor
 congelados: se generan ~200 000 ejemplos (estado de una ruta del actor, acción al azar entre las válidas salvo volver
 a casa, y margen real posterior con el actor greedy en el mismo mundo) y se ajustan A y B. Config: `USE_POST_HEAD`,
-`POST_*`, `MARKET_SEED_POST_*` en `config.py`. Solo se calcula p\* para lanes con carga (no para el retorno ni para
-arcos de reposicionamiento).
+`POST_*`, `MARKET_SEED_POST_*` en `config.py`. Solo se calcula p\* para lanes con carga (no para arcos de
+reposicionamiento, sin carga). El regreso al depot cotiza igual que cualquier otra lane si trae carga — no es un
+caso especial de `reservation_price`, Ṽ(s, depot) = 0 por `q_values` sea `j` el regreso o una alternativa.
 
 **Cómo ejecutarlo.**
 

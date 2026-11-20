@@ -14,6 +14,7 @@ import inference
 import validate_pricing as vp
 from model.agent import AMRoutingAgent
 from config import AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, TRAIN_DAYS, configurar_k
+from stats_analysis import ETIQUETA_REPLAY_CORTA
 
 NUM_NODES = 10
 
@@ -35,7 +36,7 @@ def test_formatear_bloque_sigue_el_formato_del_plan():
         _arco(7, 5, 2.44, 2.19, 2.10, 2.30, 2.28, 18.0),
         _arco(5, 9, 2.50, nan, nan, nan, 2.28, nan, only=True),
         _arco(9, 8, 2.0, nan, nan, nan, 2.28, nan, carga=False),
-        _arco(8, 0, 2.0, nan, nan, nan, 2.28, nan, ret=True, carga=False),
+        _arco(8, 0, 2.95, 2.70, 2.60, 2.80, 2.28, 55.0, ret=True),
     ]
     assert inference.formatear_bloque([0, 7, 5, 9, 8, 0], arcos) == "\n".join([
         "Ruta: 0 → 7 → 5 → 9 → 8 → 0",
@@ -44,7 +45,17 @@ def test_formatear_bloque_sigue_el_formato_del_plan():
         "  7→5: p* = 2.19 /mi  [rango 2.10–2.30]  (rate_hoy = 2.44, break-even = 2.28, percentil histórico 18 %)  ← posición valiosa",
         "  5→9: p* = cost/dist (única acción factible)",
         "  9→8: sin carga en esta lane (reposicionamiento): sin p*",
-        "  8→0: p* = cost/dist (retorno al depot, Ṽ = 0)",
+        "  8→0: p* = 2.70 /mi  [rango 2.60–2.80]  (rate_hoy = 2.95, break-even = 2.28, percentil histórico 55 %)  (regreso a casa, Ṽ = 0)",
+    ])
+
+
+def test_formatear_bloque_retorno_sin_carga():
+    nan = float("nan")
+    arcos = [_arco(8, 0, 2.0, nan, nan, nan, 2.28, nan, ret=True, carga=False)]
+    assert inference.formatear_bloque([8, 0], arcos) == "\n".join([
+        "Ruta: 8 → 0",
+        "Precio de reserva por arco:",
+        "  8→0: sin carga en este regreso: sin p*",
     ])
 
 
@@ -85,8 +96,10 @@ def test_validacion_resultados_coherentes(resultado):
     sim = t["arcos_simulado"]
     con_p = sim[sim["p"].notna()]
     assert len(con_p) and con_p["percentil"].dropna().between(0, 100).all() and (con_p["p_min"] <= con_p["p"] + 1e-9).all()
-    assert con_p["tiene_carga"].all() and not con_p["es_retorno"].any()
-    assert sim.loc[sim["es_retorno"], "p"].isna().all() and sim["es_retorno"].any()      # el retorno aparece, sin p*
+    assert con_p["tiene_carga"].all()                                                   # todo arco con p* definido tiene carga
+    assert sim["es_retorno"].any()                                                      # el retorno aparece en la tabla
+    sin_carga_retorno = sim[sim["es_retorno"] & ~sim["tiene_carga"]]
+    assert sin_carga_retorno["p"].isna().all()                                          # el retorno sin carga, sin p*
     um = t["umbral_resumen"]
     assert len(um) == 6 and (um["validez"] > 0.9).all()
     assert len(t["umbral_diferencias"]) == 4
@@ -109,7 +122,7 @@ def test_pestana_pricing_en_excel(resultado, tmp_path):
     arcos = pd.read_excel(xlsx, sheet_name="Pricing arcos")
     assert {"conjunto", "ruta", "desde", "hacia", "rate_hoy", "p_estrella", "p_estrella_min", "p_estrella_max",
             "break_even", "percentil_historico", "posicion_valiosa", "nota"} <= set(arcos.columns)
-    assert set(arcos["conjunto"]) == {"simulado", "replay (días 90-119)"}
+    assert set(arcos["conjunto"]) == {"simulado", ETIQUETA_REPLAY_CORTA}
     n = len(t["arcos_simulado"]) + len(t["arcos_replay"])
     assert len(arcos) == n
     # cada ruta se ve completa: las filas sin p* llevan su explicación

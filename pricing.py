@@ -20,8 +20,9 @@ margen esperado desde la llegada a `a` hasta volver a casa siguiendo el actor gr
 p* se calcula para el arco i→j que la política de ruteo (el actor) ya decidió tomar; j nunca se re-decide con Q
 — Q solo sirve aquí para valorar la MEJOR ALTERNATIVA a esa decisión (el costo de oportunidad).
 
-p* solo existe para lanes con carga (y que no sean el retorno a casa); si j es la única acción factible no hay
-alternativa y p* tampoco está definido (`only_option`). En esos casos el resultado trae p* = NaN.
+p* solo existe para lanes con carga; si j es el regreso al depot y trae carga, cotiza igual que cualquier otra
+lane (con Ṽ(s, depot) = 0, ya impuesto en q_values). Si j es la única acción factible no hay alternativa y p*
+tampoco está definido (`only_option`). En esos casos el resultado trae p* = NaN.
 """
 
 from dataclasses import dataclass
@@ -76,7 +77,7 @@ class PrecioReserva:
     p_min: float
     p_max: float
     break_even: float        # costo / dist
-    has_load: bool           # hay carga en la lane y no es el retorno a casa
+    has_load: bool           # hay carga en la lane (el retorno a casa cotiza igual si trae carga)
     only_option: bool        # j es la única acción factible (no hay alternativa)
     alt_a: int = -1          # mejor alternativa según A (usada en p*_AB); -1 si no hay
     alt_b: int = -1          # mejor alternativa según B (usada en p*_BA)
@@ -105,7 +106,7 @@ def reservation_price(
     la acción cuesta el costo sin ingreso. El retorno a casa (start_node) es una alternativa más, con Ṽ = 0.
     """
     break_even = float(cost_row[j] / distance_row[j])
-    tiene_carga = (j != start_node) and (loads_row is None or loads_row[j] > 0)
+    tiene_carga = loads_row is None or loads_row[j] > 0
     nan = float("nan")
     valid = np.asarray(action_mask).astype(bool).copy()
     valid[current_node] = False
