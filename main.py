@@ -12,10 +12,16 @@ Entry point for the AM-PPO pipeline.
 
 Uso
 ---
-  Cambia NUM_NODES en main() (opciones: 10 · 20 · 35 · 50 · 75 · 100).
-
-  Luego ejecuta simplemente:
+  Edita NODE_SIZES en main() (por defecto, la cadena completa de transfer_learning.NODE_SEQUENCE:
+  10 · 20 · 35 · 50 · 75 · 100). Luego ejecuta simplemente:
     python main.py
+
+  Corre cada tamaño en orden: entrena, guarda checkpoint y resultados, y pasa al siguiente usando
+  ese checkpoint recién guardado como punto de partida (transfer learning automático, ver
+  transfer_learning.get_source_checkpoint). Si un tamaño falla, se imprime el error y se continúa
+  con el siguiente en vez de abortar toda la corrida.
+
+  Para correr un solo tamaño, deja NODE_SIZES con un único elemento, p. ej. NODE_SIZES = [35].
 
 Checkpoints (transfer learning)
 --------------------------------
@@ -27,6 +33,7 @@ Checkpoints (transfer learning)
 import os
 import time
 import warnings
+import traceback
 import torch
 import pandas as pd
 
@@ -47,7 +54,9 @@ from evaluation import (
 )
 from market_process import MarketProcess, asegurar_parametros
 from stats_analysis import append_stats_sheets_to_excel, NOTA_REPLAY
-from transfer_learning import build_agent_for_training, checkpoint_tiene_post_head, load_checkpoint_compatible
+from transfer_learning import (
+    NODE_SEQUENCE, build_agent_for_training, checkpoint_tiene_post_head, load_checkpoint_compatible,
+)
 from post_training import entrenar_cabezas_post, ruta_checkpoint_pricing, pricing_vigente
 from validate_pricing import run_pricing_validation, append_pricing_sheet
 
@@ -207,37 +216,21 @@ def _evaluate_and_report(
     return sim_df, replay_df
 
 
-def main():
-    NUM_NODES       = 35      # opciones: 10 · 20 · 35 · 50 · 75 · 100
-    EVAL_ONLY       = os.environ.get("EVAL_ONLY", "0") == "1"   # True (EVAL_ONLY=1): carga checkpoint y salta entrenamiento
-    USE_TRANSFER    = True   # True: inicializa los pesos desde el checkpoint del tamaño anterior. False: entrena desde pesos aleatorios con la
-                              # arquitectura de config.py.
-    EVAL_BEST_CHECKPOINT = False  # False (por defecto): evalúa el último update, el modelo que dejó el
-                                 # entrenamiento ya con el LR decaído. True: evalúa el update con mejor
-                                 # margen en los mundos de validación (checkpoints/am_checkpoint_<N>nodes_best.pt,
-                                 # solo si se entrenó con el proceso exógeno). Se dejó en False porque elegir
-                                 # el máximo entre ~80 validaciones de 200 mundos sobreajusta esa validación:
-                                 # en 10, 20 y 35 nodos el último update rindió igual o mejor en los mundos
-                                 # de test (8-32 USD). El checkpoint am_checkpoint_<N>nodes.pt (último) se
-                                 # guarda siempre, y es el que usa el transfer learning.
-    USE_MARKET_PROCESS = True  # True: el entrenamiento sortea cargas y tarifas del proceso exógeno
-                                # en vez de reproducir días del histórico. False: entrena con días reales.
-    EVAL_SET = os.environ.get("EVAL_SET", "dev")   # "dev": mundos de MARKET_SEED_EVAL (desarrollo, resultados de siempre).
-                                                    # "final": mundos de MARKET_SEED_EVAL_FINAL (test final, un solo uso con
-                                                    # la configuración congelada); escribe DRL_Routing_Summary_AM_final.xlsx.
-    K_RESTRINGIDO = False      # True: entrena, valida y evalúa con K libre y K = K_MAX (5).
-                                # False: solo K libre (sin presupuesto de cardinalidad).
-    RUN_PRICING = True       # True (y USE_POST_HEAD activo): entrena las cabezas Ṽ A/B con el actor congelado (si
-                              # no hay un checkpoint *_pricing.pt vigente para este actor 
-    RETRAIN_POST = False     # True: reentrena las cabezas Ṽ aunque ya exista un checkpoint *_pricing.pt válido
-                              # para este actor (pricing_vigente); con False, pricing_vigente decide y solo
-                              # reentrena cuando el actor cambió o el checkpoint no existe.
-    # ──────────────────────────────────────────────────────────────────────────
+def _run_one_size(
+    NUM_NODES, cwd,
+    EVAL_ONLY, USE_TRANSFER, EVAL_BEST_CHECKPOINT, USE_MARKET_PROCESS,
+    EVAL_SET, K_RESTRINGIDO, RUN_PRICING, RETRAIN_POST,
+):
+    """Pipeline completo (entrenamiento + Ṽ + evaluación + pricing) para un solo tamaño de grafo.
 
+    Aislado en su propia función para que main() pueda llamarlo en secuencia sobre varios
+    NUM_NODES: cada llamada guarda su checkpoint y sus resultados antes de que empiece la
+    siguiente, y build_agent_for_training (transfer_learning.py) recoge automáticamente el
+    checkpoint del tamaño anterior en NODE_SEQUENCE.
+    """
     configurar_k(K_RESTRINGIDO)    # antes de entrenar/evaluar: fija K_TRAINING_LEVELS en el sitio
     configurar_hp(NUM_NODES)       # hiperparámetros del tamaño (config.HP_POR_NODOS)
 
-    cwd         = os.path.dirname(os.path.abspath(__file__))
     summary_rows = []
 
     print(f"\n{'='*60}")
@@ -269,7 +262,6 @@ def main():
     # ── Train / eval split (temporal — el modelo no ve los días de eval) ──────
     rate_train  = rate_stack[:TRAIN_DAYS]
     loads_train = loads_stack[:TRAIN_DAYS]
-
 
     usar_best = False
     if EVAL_ONLY:
@@ -357,6 +349,62 @@ def main():
         append_pricing_sheet(excel_path, tablas)
 
     print(f"\nDone! Checkpoint guardado en: checkpoints/am_checkpoint_{NUM_NODES}nodes.pt")
+
+
+def main():
+    # Tamaños a correr, en orden. Por defecto la cadena completa de transfer_learning.NODE_SEQUENCE
+    # (10 → 20 → 35 → 50 → 75 → 100): cada tamaño arranca con el checkpoint recién guardado del
+    # anterior. Para correr uno solo, deja aquí un único elemento, p. ej. NODE_SIZES = [35].
+    NODE_SIZES      = list(NODE_SEQUENCE)
+    EVAL_ONLY       = os.environ.get("EVAL_ONLY", "0") == "1"   # True (EVAL_ONLY=1): carga checkpoint y salta entrenamiento
+    USE_TRANSFER    = True   # True: inicializa los pesos desde el checkpoint del tamaño anterior. False: entrena desde pesos aleatorios con la
+                              # arquitectura de config.py.
+    EVAL_BEST_CHECKPOINT = False  # False (por defecto): evalúa el último update, el modelo que dejó el
+                                 # entrenamiento ya con el LR decaído. True: evalúa el update con mejor
+                                 # margen en los mundos de validación (checkpoints/am_checkpoint_<N>nodes_best.pt,
+                                 # solo si se entrenó con el proceso exógeno). Se dejó en False porque elegir
+                                 # el máximo entre ~80 validaciones de 200 mundos sobreajusta esa validación:
+                                 # en 10, 20 y 35 nodos el último update rindió igual o mejor en los mundos
+                                 # de test (8-32 USD). El checkpoint am_checkpoint_<N>nodes.pt (último) se
+                                 # guarda siempre, y es el que usa el transfer learning.
+    USE_MARKET_PROCESS = True  # True: el entrenamiento sortea cargas y tarifas del proceso exógeno
+                                # en vez de reproducir días del histórico. False: entrena con días reales.
+    EVAL_SET = os.environ.get("EVAL_SET", "dev")   # "dev": mundos de MARKET_SEED_EVAL (desarrollo, resultados de siempre).
+                                                    # "final": mundos de MARKET_SEED_EVAL_FINAL (test final, un solo uso con
+                                                    # la configuración congelada); escribe DRL_Routing_Summary_AM_final.xlsx.
+    K_RESTRINGIDO = False      # True: entrena, valida y evalúa con K libre y K = K_MAX (5).
+                                # False: solo K libre (sin presupuesto de cardinalidad).
+    RUN_PRICING = True       # True (y USE_POST_HEAD activo): entrena las cabezas Ṽ A/B con el actor congelado (si
+                              # no hay un checkpoint *_pricing.pt vigente para este actor
+    RETRAIN_POST = False     # True: reentrena las cabezas Ṽ aunque ya exista un checkpoint *_pricing.pt válido
+                              # para este actor (pricing_vigente); con False, pricing_vigente decide y solo
+                              # reentrena cuando el actor cambió o el checkpoint no existe.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    cwd = os.path.dirname(os.path.abspath(__file__))
+
+    fallidos = []
+    for NUM_NODES in NODE_SIZES:
+        try:
+            _run_one_size(
+                NUM_NODES, cwd,
+                EVAL_ONLY, USE_TRANSFER, EVAL_BEST_CHECKPOINT, USE_MARKET_PROCESS,
+                EVAL_SET, K_RESTRINGIDO, RUN_PRICING, RETRAIN_POST,
+            )
+        except Exception:
+            fallidos.append(NUM_NODES)
+            print(f"\n{'!'*60}")
+            print(f"  FALLÓ el tamaño {NUM_NODES} nodos — se continúa con el siguiente de NODE_SIZES")
+            print(f"{'!'*60}")
+            traceback.print_exc()
+
+    print(f"\n{'='*60}")
+    print(f"  Secuencia terminada: {NODE_SIZES}")
+    if fallidos:
+        print(f"  Tamaños que fallaron: {fallidos} (revisa el traceback de cada uno arriba)")
+    else:
+        print("  Todos los tamaños terminaron sin errores.")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

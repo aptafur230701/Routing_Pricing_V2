@@ -230,10 +230,10 @@ RUN_TAG = os.environ.get("RUN_TAG", "")
 HP_POR_NODOS = {
     10: {},
     20: {"PPO_ENTROPY_COEF_START": 0.10, "PPO_ENTROPY_COEF_END": 0.04},   # más exploración al final
-    35: {"EPISODES_PER_NODE": 13000, "LR_FINAL_FRAC": 0.30},              # calibrado con la curva de convergencia
-                                    # de 10/20 nodos (val_score estabiliza ~update 400 a 20 nodos,
-                                    # ~update 20 a 10 nodos); antes eran 60000 (3000 updates), muy por
-                                    # encima del punto de saturación observado
+    35: {"LR_FINAL_FRAC": 0.30},
+    50: {},
+    75: {},
+    100: {},
 }
 HP_OVERRIDES = {}   # se llena en configurar_hp()
 
@@ -288,13 +288,15 @@ def get_episodes_per_node(num_nodes: int) -> int:
     """Episodes per start-node for the full training run."""
     if "EPISODES_PER_NODE" in HP_OVERRIDES:      # hiperparámetros propios del tamaño (HP_POR_NODOS)
         return HP_OVERRIDES["EPISODES_PER_NODE"]
-    if num_nodes <= 10:  return 20000  # subido de 5000: a 5000 (71 updates) reward/entropy
-                                        # no se aplanaban; 20000 da ~285 updates de margen
-    if num_nodes <= 20:  return 25000
-    if num_nodes <= 35:  return 30000   # bajado de 25000: la política saturaba ~update 400;
-                                        # con ~700 ep/update da ~500-600 updates, holgura sobre
-                                        # el punto de saturación observado
-    if num_nodes <= 50:  return 60000
-    if num_nodes <= 75:  return 38000
-    return 60000          # 100 nodos
+    if num_nodes <= 10:  return 20000   # val_score se aplana ~update 200-220 (training_log_10nodes.pkl);
+                                        # 20000 da ~285 updates, margen ~1.6x
+    if num_nodes <= 20:  return 25000   # meseta ~update 400 (training_log_20nodes.pkl); 25000 da
+                                        # ~714 updates, margen ~1.7x
+    if num_nodes <= 35:  return 13000   # meseta ~update 350-400 (training_log_35nodes.pkl, corrida
+                                        # vieja de 3000 updates); 13000 da ~650 updates, margen ~1.7x
+    if num_nodes <= 50:  return 14000   # meseta ~update 550-600 (training_log_50nodes.pkl, corrida
+                                        # vieja de 4285 updates); 14000 da ~1000 updates, margen ~1.7x
+    if num_nodes <= 75:  return 10000   # PROVISIONAL: sin log propio, extrapolado del patrón 35/50;
+                                        # recalibrar tras la primera corrida real
+    return 9000           # 100 nodos — PROVISIONAL, mismo caso que 75
 
