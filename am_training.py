@@ -16,7 +16,8 @@ Interfaz análoga a run_training() de training.py:
         num_nodes
     )
 
-· Usa RoutingEnv como entorno estándar (Siguiendo practicas de API Gymnasium).
+· La acción es (destino, nivel de precio) en el entorno con cotización (routing_env.VectorRoutingEnv;
+  especificacion_fase0_ruteo_pricing.md §4-5).
 """
 
 import math
@@ -46,24 +47,15 @@ from config import (
     MARKET_SEED_TRAIN,
     USE_CONTINUATION_FEATURES,
     CKPT_SELECTION, CKPT_WINDOW, USE_LR_COSINE, LR_FINAL_FRAC, hp,
+    PPO_ENTROPY_COEF_PRECIO_START, PPO_ENTROPY_COEF_PRECIO_END,
 )
-from routing_env import VectorRoutingEnv, max_pasos
-from greedy_rollout import greedy_rollout
-from problem_data import build_rm_pen_stack
-from model.encoder import (
-    build_node_features_batch,
-    build_temporal_features_batch,
-    build_market_features_batch,
-    build_budget_features_batch,
-    build_dow_features_batch,
-    N_DOW_FEATURES,
-)
+from routing_env import VectorRoutingEnv
+from greedy_rollout import greedy_rollout, construir_features
 from model.agent import AMRoutingAgent
 from model.critic_head import CriticHead
-from baselines.politicas import calcular_ev_pronostico, PoliticaB3
+from baselines.politicas import calcular_ev_pronostico
 from model.debug_utils import check_tensor
-from baselines.dp_relajada import cargar_o_calcular_tabla
-from evaluation import disenar_mundos, ejecutar_politica
+from evaluation import disenar_mundos
 from market_process import MarketProcess, asegurar_parametros
 
 
@@ -117,6 +109,9 @@ class RolloutBuffer:
         self.market_feats  = []   # list of np.ndarray (1,)
         self.budget_feats  = []   # list of np.ndarray (2,)
         self.dow_feats     = []   # list of np.ndarray (7,)
+        self.cot_feats     = []   # list of np.ndarray (N_COT_CONTEXT,)
+        self.opciones      = []   # list of np.ndarray (N, K+1) bool — opciones válidas del estado
+        self.opcion        = []   # list of int — opción elegida (nivel o VACÍO)
         self.current_nodes = []   # list of int
         self.masks         = []   # list of np.ndarray (N,) int8
         self.actions       = []   # list of int
@@ -144,18 +139,21 @@ class RolloutBuffer:
         log_prob:      float,
         value:         float,
         done:          bool,
-        market_feats:  np.ndarray = None,   # (1,)
-        budget_feats:  np.ndarray = None,   # (2,)
-        dow_feats:     np.ndarray = None,   # (7,)
+        market_feats:  np.ndarray,   # (1,)
+        budget_feats:  np.ndarray,   # (2,)
+        dow_feats:     np.ndarray,   # (7,)
+        cot_feats:     np.ndarray,   # (N_COT_CONTEXT,)
+        opciones:      np.ndarray,   # (N, K+1) bool
+        opcion:        int,
     ):
         self.node_feats.append(node_feats)
         self.temporal_feats.append(temporal)
-        self.market_feats.append(market_feats if market_feats is not None
-                                 else np.zeros(1, dtype=np.float32))
-        self.budget_feats.append(budget_feats if budget_feats is not None
-                                 else np.array([1.0, 0.0], dtype=np.float32))
-        self.dow_feats.append(dow_feats if dow_feats is not None
-                              else np.zeros(N_DOW_FEATURES, dtype=np.float32))
+        self.market_feats.append(market_feats)
+        self.budget_feats.append(budget_feats)
+        self.dow_feats.append(dow_feats)
+        self.cot_feats.append(cot_feats)
+        self.opciones.append(opciones)
+        self.opcion.append(int(opcion))
         self.current_nodes.append(current_node)
         self.masks.append(mask)
         self.actions.append(action)
@@ -224,68 +222,32 @@ class RolloutBuffer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _forward(
-    agent:          AMRoutingAgent,
-    critic:         CriticHead,
-    node_feats_t:   torch.Tensor,    # (B, N, N_NODE_FEATURES)
-    temporal_t:     torch.Tensor,    # (B, 3)
-    current_nodes:  torch.Tensor,    # (B,) int64
-    mask_t:         torch.Tensor,    # (B, N) int8
-    actions_t:      torch.Tensor = None,   # (B,) int64 — None en recolección
-    market_feats_t: torch.Tensor = None,   # (B, 1)
-    budget_feats_t: torch.Tensor = None,   # (B, 2)
-    dow_feats_t:    torch.Tensor = None,   # (B, 7)
+    agent, critic, feats_t: dict, current_nodes, mask_t, opciones_t, actions_t=None, opcion_t=None,
 ):
+    """encoder → context → decoder → critic para un batch, con la acción (destino, opción de precio).
+
+    feats_t : tensores node_feats, temporal, market, budget, dow, cot. Si actions_t es None samplea
+    (recolección); si no, evalúa las acciones almacenadas (actualización PPO).
+    Retorna (destino, opción, log π(j, o), H_destino, H_precio, V(s)).
     """
-    Ejecuta encoder → context → decoder → critic para un batch.
-
-    Si actions_t es None (recolección): samplea acciones nuevas.
-    Si actions_t no es None (actualización PPO): evalúa acciones almacenadas.
-
-    Retorna
-    -------
-    actions   : Tensor (B,) int64
-    log_probs : Tensor (B,)
-    entropies : Tensor (B,)
-    values    : Tensor (B,)
-    """
-    B = node_feats_t.shape[0]
-
-    check_tensor("node_feats_t", node_feats_t)
-    check_tensor("temporal_t", temporal_t)
-
-    embeddings, graph_emb = agent.encoder(node_feats_t)           # (B,N,d_h), (B,d_h)
-
+    B = feats_t["node_feats"].shape[0]
+    embeddings, graph_emb = agent.encoder(feats_t["node_feats"])
     check_tensor("embeddings", embeddings)
-    check_tensor("graph_emb", graph_emb)
-
-    current_emb = embeddings[torch.arange(B), current_nodes, :]   # (B, d_h)
-    check_tensor("current_emb", current_emb)
-
-    h_t = agent.context_net(graph_emb, current_emb, temporal_t, market_feats_t, budget_feats_t, dow_feats_t)   # (B, d_h)
+    current_emb = embeddings[torch.arange(B, device=embeddings.device), current_nodes, :]
+    h_t = agent.context_net(graph_emb, current_emb, feats_t["temporal"], feats_t["market"], feats_t["budget"],
+                            feats_t["dow"], feats_t["cot"])
     check_tensor("context h_t", h_t)
-
-    values = critic(h_t)                                           # (B,)
-    check_tensor("values", values)
-
-    # Validate mask: every sample must have at least one valid action
-    valid_actions = mask_t.sum(dim=-1)
-    if (valid_actions == 0).any():
-        raise RuntimeError(
-            f"Invalid mask: sample(s) with zero valid actions detected "
-            f"(valid counts per sample: {valid_actions.tolist()})"
-        )
-
+    values = critic(h_t)
+    if (mask_t.sum(dim=-1) == 0).any():
+        raise RuntimeError("Invalid mask: sample(s) with zero valid actions detected")
     if actions_t is None:
-        actions, log_probs, entropies = agent.decoder.act(h_t, embeddings, mask_t)
+        actions, opcion, log_probs, h_dest, h_precio = agent.decoder.act_cotizacion(h_t, embeddings, mask_t, opciones_t)
     else:
-        log_probs, entropies = agent.decoder.evaluate_action(
-            h_t, embeddings, mask_t, actions_t
-        )
-        actions = actions_t
-
+        log_probs, h_dest, h_precio = agent.decoder.evaluate_cotizacion(
+            h_t, embeddings, mask_t, opciones_t, actions_t, opcion_t)
+        actions, opcion = actions_t, opcion_t
     check_tensor("log_probs", log_probs)
-
-    return actions, log_probs, entropies, values
+    return actions, opcion, log_probs, h_dest, h_precio, values
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -329,6 +291,7 @@ def _evaluate_greedy(
     eval_k_levels:    list = None,   # niveles de K por episodio (None ⇒ todos libres)
     avail_expected_arr: np.ndarray = None,
     ev_esperado:      np.ndarray = None,   # EvEsperado (calcular_ev_pronostico) para las features de continuación
+    world_seeds:      np.ndarray = None,   # (B,) semillas del competidor (fijas entre llamadas)
 ) -> tuple:
     """
     Recompensa promedio en modo greedy (argmax en cada nodo, sin búsqueda) sobre
@@ -337,9 +300,7 @@ def _evaluate_greedy(
     producción — distinto del avg_reward de los rollouts de entrenamiento, que
     samplean de la política.
 
-    eval_env es un VectorRoutingEnv de replay (market_process=None) sobre los días
-    de entrenamiento: el mismo entorno y la misma recompensa que el rollout
-    muestreado, sin ruido de mundo simulado.
+    eval_env es un VectorRoutingEnv de replay (mercado_replay) sobre los días de entrenamiento.
 
     Los episodios que no cierran el ciclo en el depot dentro de max_duration se
     excluyen del promedio de reward (para no contaminarlo) y se cuentan aparte
@@ -360,6 +321,7 @@ def _evaluate_greedy(
         k_max_arr=eval_k_levels,
         avail_expected_arr=avail_expected_arr,
         ev_esperado=ev_esperado,
+        world_seeds=world_seeds,
     )
     avg_reward = float(res.raw_reward[res.valid].mean()) if res.valid.any() else 0.0
     valid_rate = float(res.valid.mean())
@@ -367,21 +329,23 @@ def _evaluate_greedy(
 
 
 class ValidacionSimulada:
-    """Validación del greedy en episodios fijos, contra B3 y UB-DP.
+    """Validación del greedy en episodios fijos de mundos simulados.
 
     Un conjunto fijo de episodios (nodo, día de la semana y semilla balanceados, con la semilla
     propia MARKET_SEED_VAL) se evalúa por cada nivel de K de K_TRAINING_LEVELS en una sola
-    llamada batcheada de greedy_rollout. Reporta el margen en USD (suma de lane_reward, la
-    métrica de la evaluación final) y su gap contra UB-DP; B3 y UB-DP se calculan una sola vez.
+    llamada batcheada de greedy_rollout. Reporta el margen en USD (suma del reward de cada lane
+    con el precio cotizado), la validez, la tasa de aceptación y el nivel medio cotizado.
     Es observacional: no afecta los gradientes ni el RNG global.
+
+    No calcula B3 ni UB-DP: el entrenamiento no puede depender de la tabla de la DP (a 75-100 nodos
+    puede no ser tratable). Las comparaciones contra los baselines son de la evaluación final.
     """
 
-    def __init__(self, market_process, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
+    def __init__(self, market_process, time_matrix, num_dias, distance_arr, diesel_arr,
                  num_nodes, time_matrix_arr, ltr_stack, reward_global_p95, avail_expected_arr,
                  ev_esperado=None):
         M = get_val_worlds(num_nodes)
-        dis = disenar_mundos(num_nodes, M, market_process, num_dias=rate_stack.shape[0],
-                             semilla=MARKET_SEED_VAL)
+        dis = disenar_mundos(num_nodes, M, market_process, num_dias=num_dias, semilla=MARKET_SEED_VAL)
         self.niveles = list(K_TRAINING_LEVELS)
         self.M = M
         self.nodos = np.tile(dis["nodo"], len(self.niveles))
@@ -392,28 +356,12 @@ class ValidacionSimulada:
         self.avail = avail_expected_arr
         self.ev = ev_esperado
         self.env = VectorRoutingEnv(
-            time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack, rm_pen_stack=None,
-            num_nodes=num_nodes, max_duration=MAX_DURATION, market_process=market_process,
-            distance_arr=distance_arr, diesel_arr=diesel_arr,
+            time_matrix, num_nodes, distance_arr, diesel_arr, num_dias,
+            max_duration=MAX_DURATION, market_process=market_process,
         )
-        # Referencias: B3 (política de la tabla V) y UB-DP, promedio sobre los mismos episodios.
-        tabla = cargar_o_calcular_tabla(market_process, time_matrix, distance_arr, diesel_arr, verbose=False)
-        b3 = PoliticaB3(tabla, distance_arr, diesel_arr)
-        self.ref = {}
-        self.b3_mundos = {}   # K → (M,) márgenes de B3 episodio a episodio (para la diferencia pareada)
-        for K in self.niveles:
-            margenes, ubs = [], []
-            for m in range(M):
-                h, dow = int(dis["nodo"][m]), int(dis["dow"][m])
-                r = ejecutar_politica(b3, self.env, h, int(dis["start_day"][m]), K, int(dis["world_seed"][m]),
-                                      distance_arr, diesel_arr, dow)
-                margenes.append(r["margen"])
-                ubs.append(tabla.ub_dp(h, dow, K))
-            self.b3_mundos[K] = np.asarray(margenes, dtype=float)
-            self.ref[K] = {"b3": float(np.mean(margenes)), "ub_dp": float(np.mean(ubs))}
 
     def evaluar(self, agent) -> dict:
-        """Margen medio del greedy por nivel de K y global, validez y gap contra UB-DP."""
+        """Margen medio del greedy por nivel de K y global, validez, aceptación y nivel medio."""
         res = greedy_rollout(
             agent, self.env, self.nodos, self.dias, *self.args,
             k_max_arr=self.k_arr, avail_expected_arr=self.avail, world_seeds=self.semillas,
@@ -424,18 +372,53 @@ class ValidacionSimulada:
         for i, K in enumerate(self.niveles):
             sl = slice(i * self.M, (i + 1) * self.M)
             v = res.valid[sl]
-            m = float(res.raw_reward[sl][v].mean()) if v.any() else 0.0
-            ub = self.ref[K]["ub_dp"]
-            dif_b3 = float(np.mean(res.raw_reward[sl] - self.b3_mundos[K]))   # media de (DRL − B3) episodio a episodio
+            cot = int(res.n_cotizaciones[sl].sum())
+            niv = [n for lista in res.niveles[sl] for n in lista]
             out["por_k"]["free" if K is None else str(K)] = {
-                "margen": m, "valid_rate": float(v.mean()), "dif_b3": dif_b3,
-                "gap_ub_dp_pct": float((ub - m) / abs(ub) * 100.0) if ub else float("nan"),
-                "b3": self.ref[K]["b3"], "ub_dp": ub,
+                "margen": float(res.raw_reward[sl][v].mean()) if v.any() else 0.0,
+                "valid_rate": float(v.mean()),
+                "tasa_aceptacion": float(res.n_ganadas[sl].sum() / cot) if cot else float("nan"),
+                "nivel_medio": float(np.mean(niv)) if niv else float("nan"),
             }
         out["margen"] = float(res.raw_reward[res.valid].mean()) if res.valid.any() else 0.0
         out["valid_rate"] = float(res.valid.mean())
         out["score"] = float(margen.mean())    # inválidos cuentan 0: elige el mejor update
         return out
+
+
+def _paso_rollout(agent, critic, env, masks, start_nodes, active, ep_bufs, fases,
+                     time_matrix_arr, distance_arr, ltr_stack, reward_global_p95, num_nodes,
+                     avail_expected_arr, ev_esperado) -> tuple:
+    """Un paso del rollout muestreado: features, (destino, opción) muestreados, env.step y
+    transiciones de las filas activas. Retorna (next_masks, terminated)."""
+    B = len(start_nodes)
+    cur_nodes = env.current_node.copy()
+    with fases("rollout_features"):
+        feats = construir_features(env, start_nodes, time_matrix_arr, distance_arr, ltr_stack,
+                                   reward_global_p95, num_nodes, avail_expected_arr, ev_esperado, MAX_DURATION)
+    with fases("rollout_gpu"):
+        feats_t = {k: torch.from_numpy(v).to(DEVICE) for k, v in feats.items()}
+        cur_t = torch.tensor(cur_nodes, dtype=torch.long, device=DEVICE)
+        mask_t = torch.from_numpy(masks).to(DEVICE)
+        a_t, o_t, lp_t, _, _, v_t = _forward(agent, critic, feats_t, cur_t, mask_t, feats_t["opciones"])
+        actions, opciones, log_probs, values = (x.cpu().numpy() for x in (a_t, o_t, lp_t, v_t))
+    with fases("rollout_env"):
+        rewards, terminated, next_masks = env.step(actions, opciones)
+        time_violation = env.last_time_violation
+        viajo = ~(env.last_cotizo & ~env.last_gano)
+        cotizo, gano = env.last_cotizo.copy(), env.last_gano.copy()
+    with fases("rollout_buffer"):
+        for b in np.flatnonzero(active):
+            ep_bufs[b].append({
+                "node_feats": feats["node_feats"][b], "temporal": feats["temporal"][b],
+                "market_feats": feats["market"][b], "budget_feats": feats["budget"][b], "dow_feats": feats["dow"][b],
+                "cot_feats": feats["cot"][b], "opciones": feats["opciones"][b], "opcion": int(opciones[b]),
+                "current_node": int(cur_nodes[b]), "mask": masks[b], "action": int(actions[b]),
+                "reward": float(rewards[b]), "log_prob": float(log_probs[b]), "value": float(values[b]),
+                "done": bool(terminated[b]), "time_violation": bool(time_violation[b]),
+                "viajo": bool(viajo[b]), "cotizo": bool(cotizo[b]), "gano": bool(gano[b]),
+            })
+    return next_masks, terminated
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -454,8 +437,8 @@ def run_am_training(
     ltr_stack:         np.ndarray = None,   # [num_nodes, num_days]
     reward_global_p95: float      = 1.0,
     avail_expected_arr: np.ndarray = None,  # [num_nodes, num_nodes]
-    market_process = None,   # MarketProcess opcional (proceso exógeno de cargas y tarifas). None = días
-                             # reales del histórico (comportamiento de siempre).
+    market_process = None,   # MarketProcess (proceso exógeno): cada episodio es un mundo simulado. None =
+                             # replay de los días reales de entrenamiento (tableros de tablero_real).
     best_checkpoint_path: str = None,  # con market_process: ruta donde se guarda el update con mejor
                                        # margen de validación (agent + critic); None = no se guarda.
     trial_callback: callable = None,  # HPO opcional: fn(step, n_updates, log_entry) -> bool
@@ -472,18 +455,18 @@ def run_am_training(
     Parámetros
     ----------
     time_matrix    : np.ndarray — tiempos entre nodos.
-    rate_stack     : np.ndarray [num_days, N, N]
-    loads_stack    : np.ndarray [num_days, N, N]
+    rate_stack, loads_stack : np.ndarray [num_days, N, N] — solo fijan el número de días de entrenamiento
+                     (min(TRAIN_DAYS, num_days)); los tableros salen del MarketProcess.
     distance_arr   : np.ndarray [N, N]
     diesel_arr     : np.ndarray [N, N]
     num_nodes      : int
     ltr_stack      : np.ndarray [num_nodes, num_days] — LTR por hub y día
     avail_expected_arr : np.ndarray [num_nodes, num_nodes] — E[loads] histórico
                      (train), usado solo como feature de entrada (avail_prior)
-    market_process : MarketProcess | None — si se pasa, en cada llegada a un nodo las cargas y
-                     tarifas se sortean del proceso exógeno (cada episodio es un mundo con semilla
-                     propia, generada desde MARKET_SEED_TRAIN) en vez de leerse del histórico; el
-                     día de inicio solo aporta el día de la semana. No se usa rm_pen_stack.
+    market_process : MarketProcess | None — si se pasa, en cada llegada a un nodo el tablero (cargas,
+                     precios por nivel y competencia) se sortea del proceso exógeno (cada episodio es un
+                     mundo con semilla propia, generada desde MARKET_SEED_TRAIN); si no, se reproducen
+                     los días reales de entrenamiento y solo se sortea el competidor.
     best_checkpoint_path : con market_process, guarda {"agent", "critic"} del update con mejor
                      margen en los episodios fijos de validación (ValidacionSimulada). El log trae el margen
                      de validación en `val`, y `greedy_reward` / `greedy_valid_rate` pasan a ser el
@@ -516,6 +499,8 @@ def run_am_training(
     gae_lambda            = PPO_GAE_LAMBDA
     clip_eps              = PPO_CLIP_EPS
     grad_clip             = PPO_GRAD_CLIP
+    entropy_precio_start  = hp("PPO_ENTROPY_COEF_PRECIO_START", PPO_ENTROPY_COEF_PRECIO_START)
+    entropy_precio_end    = hp("PPO_ENTROPY_COEF_PRECIO_END",   PPO_ENTROPY_COEF_PRECIO_END)
 
     torch.manual_seed(SEED)
     np.random.seed(SEED)
@@ -530,7 +515,7 @@ def run_am_training(
     agent  = pretrained_agent  if pretrained_agent  is not None \
              else AMRoutingAgent(
                  num_nodes, d_h, n_heads, n_layers, d_ff, device=DEVICE,
-                 pre_norm=AM_PRE_NORM, dropout=AM_DROPOUT, use_post_head=False,
+                 pre_norm=AM_PRE_NORM, dropout=AM_DROPOUT,
              )
     critic = pretrained_critic if pretrained_critic is not None \
              else CriticHead(d_h).to(DEVICE)
@@ -543,11 +528,7 @@ def run_am_training(
     # corrompe el ratio de importancia como lo haría dropout en el path de logits).
     # Critic se deja en Adam puro (sin weight decay): su objetivo es MSE de
     # regresión, no política, y no comparte el problema de corrupción del ratio.
-    # Las cabezas post-decisión (PRICING_PLAN.md), si el agente las trae, NO son de la política y el PPO no las
-    # toca: se entrenan después (post_training.py). Quedan fuera del actor para que el PPO sea el mismo con o sin ellas.
-    post_ids     = {id(p) for h in (getattr(agent, "post_value_a", None), getattr(agent, "post_value_b", None))
-                    if h is not None for p in h.parameters()}
-    actor_params = [p for p in agent.parameters() if id(p) not in post_ids]
+    actor_params = list(agent.parameters())
     actor_optimizer  = torch.optim.AdamW(actor_params, lr=lr, weight_decay=PPO_WEIGHT_DECAY)
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=lr * 10)
 
@@ -559,19 +540,11 @@ def run_am_training(
             return f + (1.0 - f) * 0.5 * (1.0 + math.cos(math.pi * min(u, n) / max(n, 1)))
         schedulers = [torch.optim.lr_scheduler.LambdaLR(o, _cos) for o in (actor_optimizer, critic_optimizer)]
 
-    # ── Precomputar stack de reward matrices (una sola vez, fuera del loop) ──────
     time_matrix_arr = (
         time_matrix.to_numpy(dtype=float)
         if hasattr(time_matrix, "to_numpy")
         else np.asarray(time_matrix, dtype=float)
     )
-    if market_process is None:
-        rm_pen_stack = build_rm_pen_stack(
-            rate_stack[:num_train_days], loads_stack[:num_train_days],
-            distance_arr, diesel_arr,
-        )   # (num_train_days, N, N) float32
-    else:
-        rm_pen_stack = None   # con proceso exógeno la recompensa sale de las filas sorteadas
 
     # ── Valor esperado por lane (features de continuación): una sola vez, fuera de los loops ──
     if ev_esperado is None and USE_CONTINUATION_FEATURES:
@@ -579,43 +552,21 @@ def run_am_training(
             raise ValueError("USE_CONTINUATION_FEATURES requiere ev_esperado o market_process")
         ev_esperado = calcular_ev_pronostico(market_process, distance_arr, diesel_arr)
 
-    # ── Entorno vectorizado (una sola instancia, reutilizada en cada update) ──
-    # Índice de mercado observado de los días de entrenamiento (194 nodos, recortado a N): lo ven los entornos
-    # de replay (el monitor greedy y el entrenamiento con días reales). Con proceso exógeno el entrenamiento
-    # usa el índice del mundo de cada episodio.
+    # ── Entornos (una sola instancia de cada uno, reutilizada en cada update) ──
+    # Entrenamiento: mundos simulados (market_process) o replay de los días reales de entrenamiento.
+    # Monitor greedy sin validación simulada: replay de los días de entrenamiento.
     if market_process is not None:
         mercado = market_process
     else:
         asegurar_parametros()
         mercado = MarketProcess(num_nodes)
-    indice_train = mercado.indice_historico(0, num_train_days)
     vec_env = VectorRoutingEnv(
-        time_matrix=time_matrix,
-        rate_stack=rate_stack,
-        loads_stack=loads_stack,
-        rm_pen_stack=rm_pen_stack,
-        num_nodes=num_nodes,
-        max_duration=MAX_DURATION,
-        market_process=market_process,
-        distance_arr=distance_arr,
-        diesel_arr=diesel_arr,
-        indice_stack=indice_train,
-        indice_std=mercado.indice_std,
+        time_matrix, num_nodes, distance_arr, diesel_arr, num_train_days, max_duration=MAX_DURATION,
+        market_process=market_process, mercado_replay=None if market_process is not None else mercado,
     )
-    # Entorno del monitor greedy: replay de los días de entrenamiento (market_process=None),
-    # aunque el entrenamiento use mundos simulados. Si ya hay rm_pen_stack se reutiliza.
     eval_env = VectorRoutingEnv(
-        time_matrix=time_matrix,
-        rate_stack=rate_stack,
-        loads_stack=loads_stack,
-        rm_pen_stack=rm_pen_stack if rm_pen_stack is not None else build_rm_pen_stack(
-            rate_stack[:num_train_days], loads_stack[:num_train_days],
-            distance_arr, diesel_arr,
-        ),
-        num_nodes=num_nodes,
-        max_duration=MAX_DURATION,
-        indice_stack=indice_train,
-        indice_std=mercado.indice_std,
+        time_matrix, num_nodes, distance_arr, diesel_arr, num_train_days, max_duration=MAX_DURATION,
+        mercado_replay=mercado, market_seed=SEED,
     )
     # Generador PROPIO de semillas de mundo (nunca el estado global de numpy): una
     # semilla por episodio y update, independiente de las decisiones del agente.
@@ -628,6 +579,8 @@ def run_am_training(
     if market_process is not None:
         print("Mercado: realizaciones diarias — cada episodio sortea una vez hub inicial, día real "
               "inicial y corrimiento de nivel δ.")
+    print("Cotización: la política elige (destino, nivel de precio); la carga se gana o se pierde "
+          "frente al mejor competidor.")
 
     # ── Set fijo de evaluación greedy (mismos episodios en cada chequeo) ──────
     # RandomState propio, separado del RNG global de numpy: así no perturba la
@@ -639,23 +592,19 @@ def run_am_training(
     # Niveles de K balanceados sobre el set fijo de evaluación — mismo eval_rng
     # dedicado (nunca np.random global), calculado una sola vez.
     eval_k_levels    = _balanced_k_assignment(n_eval_episodes, eval_rng)
+    eval_seeds       = eval_rng.randint(0, 2**31 - 1, size=n_eval_episodes).astype(np.int64)   # competidor fijo
 
     # ── Validación con episodios fijos (solo con proceso exógeno) ─────────────
     val = None
     if market_process is not None:
         val = ValidacionSimulada(
-            market_process, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
+            market_process, time_matrix, num_train_days, distance_arr, diesel_arr, num_nodes,
             time_matrix_arr, ltr_stack, reward_global_p95, avail_expected_arr,
             ev_esperado=ev_esperado,
         )
-        refs = " | ".join(
-            f"K={'libre' if K is None else K}: B3 {r['b3']:.0f}, UB-DP {r['ub_dp']:.0f}"
-            for K, r in val.ref.items()
-        )
         print(f"Validación: {val.M} episodios fijos (hub, día inicial y δ sorteados una vez, semilla "
               f"{MARKET_SEED_VAL}) "
-              f"× K∈{{{', '.join('libre' if K is None else str(K) for K in val.niveles)}}} "
-              f"| referencias (USD): {refs}")
+              f"× K∈{{{', '.join('libre' if K is None else str(K) for K in val.niveles)}}}")
     best_score = -np.inf
     # Selección por media móvil: pesos (CPU) y score de las últimas CKPT_WINDOW validaciones.
     ventana = deque(maxlen=CKPT_WINDOW)
@@ -677,6 +626,7 @@ def run_am_training(
         fases        = _Fases()
         progress     = update / max(1, n_updates - 1)
         entropy_coef = entropy_start + (entropy_end - entropy_start) * progress
+        entropy_coef_precio = entropy_precio_start + (entropy_precio_end - entropy_precio_start) * progress
 
         buffer = RolloutBuffer()
         update_ep_rewards = []
@@ -712,91 +662,30 @@ def run_am_training(
 
         # Un mundo (semilla) por episodio; el rollout greedy del self-critical reusa
         # las mismas semillas para ver la misma realización.
-        world_seeds = world_rng.integers(0, 2**31 - 1, size=B) if market_process is not None else None
+        world_seeds = world_rng.integers(0, 2**31 - 1, size=B)
 
         masks  = vec_env.reset(start_nodes_arr, start_day_idxs, k_max_arr=k_max_arr,
                                world_seeds=world_seeds)   # (B, N)
         active = np.ones(B, dtype=bool)
 
+        techo_pasos = vec_env.max_steps   # max_pasos_cotizacion
         with torch.no_grad():
-            for step_i in range(max_pasos(time_matrix_arr, MAX_DURATION)):   # defensive ceiling
+            for step_i in range(techo_pasos):   # defensive ceiling
                 if not active.any():
                     break
-
-                cur_nodes = vec_env.current_node     # (B,) int64
-                time_el   = vec_env.time_elapsed     # (B,) float32
-                step_cnt  = vec_env.step_count       # (B,) int64
-                day_idx   = vec_env.current_day_idx  # (B,) int64
-
-                # Feature construction — no Python loops over N or B
-                with fases("rollout_features"):
-                    node_feats = build_node_features_batch(
-                        cur_nodes, start_nodes_arr,
-                        rm_pen_stack, time_matrix_arr, distance_arr,
-                        day_idx, num_nodes, MAX_DURATION,
-                        reward_global_p95=reward_global_p95,
-                        avail_expected_arr=avail_expected_arr,
-                        reward_rows=vec_env.reward_rows,
-                        ev=ev_esperado, time_elapsed=time_el, dow0=vec_env.start_dow,
-                        market_index=vec_env.market_index, index_std=vec_env.index_std,
-                    )   # (B, N, N_NODE_FEATURES)
-                    temporal = build_temporal_features_batch(time_el, step_cnt, MAX_DURATION, num_nodes)   # (B, 3)
-                    market   = build_market_features_batch(cur_nodes, day_idx, ltr_stack) if ltr_stack is not None \
-                               else np.zeros((B, 1), dtype=np.float32)                                     # (B, 1)
-                    budget   = build_budget_features_batch(vec_env.k_remaining, vec_env.k_restricted)      # (B, 2)
-                    dow      = build_dow_features_batch(vec_env.current_dow)                               # (B, 7)
-
-                # Single forward pass over the full batch
-                with fases("rollout_gpu"):
-                    node_feats_t = torch.from_numpy(node_feats).to(DEVICE)
-                    temporal_t   = torch.from_numpy(temporal).to(DEVICE)
-                    market_t     = torch.from_numpy(market).to(DEVICE)
-                    budget_t     = torch.from_numpy(budget).to(DEVICE)
-                    dow_t        = torch.from_numpy(dow).to(DEVICE)
-                    cur_nodes_t  = torch.tensor(cur_nodes, dtype=torch.long, device=DEVICE)
-                    mask_t       = torch.from_numpy(masks).to(DEVICE)
-
-                    actions_t, log_probs_t, _, values_t = _forward(
-                        agent, critic, node_feats_t, temporal_t, cur_nodes_t, mask_t,
-                        market_feats_t=market_t, budget_feats_t=budget_t, dow_feats_t=dow_t,
-                    )
-                    actions   = actions_t.cpu().numpy()    # (B,) int64
-                    log_probs = log_probs_t.cpu().numpy()  # (B,)
-                    values    = values_t.cpu().numpy()     # (B,)
-
-                # Vectorized environment step
-                with fases("rollout_env"):
-                    rewards, terminated, next_masks = vec_env.step(actions)
-                    time_violation = vec_env.last_time_violation   # (B,) bool — instrumentación de diagnósticos de K
-
-                # Write transitions — only for rows active BEFORE this step
-                with fases("rollout_buffer"):
-                    for b in np.where(active)[0]:
-                        ep_bufs[b].append({
-                            "node_feats":   node_feats[b],        # (N, N_NODE_FEATURES)
-                            "temporal":     temporal[b],           # (3,)
-                            "market_feats": market[b],             # (1,)
-                            "budget_feats": budget[b],              # (2,)
-                            "dow_feats":    dow[b],                 # (7,)
-                            "current_node": int(cur_nodes[b]),
-                            "mask":         masks[b],              # (N,) int8
-                            "action":       int(actions[b]),
-                            "reward":       float(rewards[b]),
-                            "log_prob":     float(log_probs[b]),
-                            "value":        float(values[b]),
-                            "done":         bool(terminated[b]),
-                            "time_violation": bool(time_violation[b]),
-                        })
-
+                masks, terminated = _paso_rollout(
+                    agent, critic, vec_env, masks, start_nodes_arr, active, ep_bufs, fases,
+                    time_matrix_arr, distance_arr, ltr_stack, reward_global_p95, num_nodes,
+                    avail_expected_arr, ev_esperado,
+                )
                 active = active & ~terminated
-                masks  = next_masks
 
-        # max_pasos bastan para cerrar cualquier ciclo (cada arco consume al menos el menor tiempo de
-        # viaje y el que excede MAX_DURATION termina el episodio): un episodio activo aquí sería un bug.
+        # max_pasos_cotizacion bastan para cerrar cualquier ciclo (cada arco consume al menos el menor tiempo
+        # de viaje, cada visita admite a lo sumo COTIZACIONES_MAX_POR_NODO rechazos y el paso que excede
+        # MAX_DURATION termina el episodio): un episodio activo aquí sería un bug.
         if active.any():
             raise RuntimeError(
-                f"{int(active.sum())} episodios no terminaron dentro de max_pasos="
-                f"{max_pasos(time_matrix_arr, MAX_DURATION)} pasos"
+                f"{int(active.sum())} episodios no terminaron dentro del techo de {techo_pasos} pasos"
             )
 
         # ── Self-critical baseline: rollout greedy vectorizado ──────
@@ -825,6 +714,7 @@ def run_am_training(
             # Diagnósticos de K: longitud realizada y violación temporal en
             # retorno forzado, agrupadas por nivel de K asignado al episodio.
             k_diag = {lvl: {"lengths": [], "time_violations": 0} for lvl in K_TRAINING_LEVELS}
+            cot_diag = {"cotizaciones": 0, "ganadas": 0, "niveles": [], "episodios": 0}
             for b in range(B):
                 if not ep_bufs[b]:
                     continue
@@ -843,6 +733,9 @@ def run_am_training(
                         market_feats=trans["market_feats"],
                         budget_feats=trans["budget_feats"],
                         dow_feats=trans["dow_feats"],
+                        cot_feats=trans["cot_feats"],
+                        opciones=trans["opciones"],
+                        opcion=trans["opcion"],
                     )
                 ep_end = len(buffer)
                 buffer.episode_boundaries.append(
@@ -855,9 +748,14 @@ def run_am_training(
                     update_r_greedy.append(float(greedy_ep_rewards[b]))
 
                 k_lvl = k_max_arr[b]
-                k_diag[k_lvl]["lengths"].append(len(ep_bufs[b]))
+                # Longitud = arcos recorridos (un rechazo es un paso, pero no un arco ni consume K).
+                k_diag[k_lvl]["lengths"].append(sum(t["viajo"] for t in ep_bufs[b]))
                 if ep_bufs[b][-1]["time_violation"]:
                     k_diag[k_lvl]["time_violations"] += 1
+                cot_diag["cotizaciones"] += sum(t["cotizo"] for t in ep_bufs[b])
+                cot_diag["ganadas"] += sum(t["gano"] for t in ep_bufs[b])
+                cot_diag["niveles"] += [t["opcion"] for t in ep_bufs[b] if t["cotizo"]]
+                cot_diag["episodios"] += 1
 
             buffer.compute_gae_per_episode(gamma=gamma, gae_lambda=gae_lambda)
 
@@ -890,6 +788,7 @@ def run_am_training(
         batch_actor_losses  = []
         batch_value_losses  = []
         batch_entropies     = []
+        batch_entropies_precio = []
         batch_kl_divs       = []
         batch_clip_fracs    = []
         batch_sc_losses     = []
@@ -947,6 +846,10 @@ def run_am_training(
                             dtype=torch.float32,
                         ).to(DEVICE)                                       # (B,)
 
+                    op_b  = torch.from_numpy(np.stack([buffer.opciones[i] for i in idx_batch])).to(DEVICE)  # (B,N,K+1)
+                    opc_b = torch.tensor([buffer.opcion[i] for i in idx_batch], dtype=torch.long).to(DEVICE)
+                    ct_b  = torch.from_numpy(np.stack([buffer.cot_feats[i] for i in idx_batch])).to(DEVICE)
+
                 with fases("ppo_calculo", sync=True):
                     # Normalización por mini-batch: cada gradiente ve ventajas
                     # con media=0, std=1, independiente del resto del buffer.
@@ -967,9 +870,10 @@ def run_am_training(
 
                     try:
                         # Forward con gradientes
-                        _, new_lp, entropy, new_val = _forward(
-                            agent, critic, nf_b, tf_b, cn_b, mask_b,
-                            actions_t=act_b, market_feats_t=mf_b, budget_feats_t=bf_b, dow_feats_t=dw_b,
+                        feats_b = {"node_feats": nf_b, "temporal": tf_b, "market": mf_b, "budget": bf_b,
+                                   "dow": dw_b, "cot": ct_b}
+                        _, _, new_lp, entropy, entropy_precio, new_val = _forward(
+                            agent, critic, feats_b, cn_b, mask_b, op_b, actions_t=act_b, opcion_t=opc_b,
                         )
 
                         # ── Loss del actor (PPO-Clip) ────────────────────────────
@@ -986,7 +890,9 @@ def run_am_training(
                         # ── Bonus de entropía (exploración) ─────────────────────
                         entropy_loss = -entropy.mean()
 
-                        actor_loss_total = actor_loss + entropy_coef * entropy_loss
+                        # Entropía del destino y de la cabeza de precio, cada una con su coeficiente.
+                        actor_loss_total = (actor_loss + entropy_coef * entropy_loss
+                                            - entropy_coef_precio * entropy_precio.mean())
 
                         # ── Self-critical: término REINFORCE adicional ──
                         # No toca el critic — sc_loss depende solo de new_lp (actor).
@@ -1056,6 +962,7 @@ def run_am_training(
                 batch_actor_losses.append(actor_loss.item())
                 batch_value_losses.append(value_loss.item())
                 batch_entropies.append(entropy.mean().item())
+                batch_entropies_precio.append(entropy_precio.mean().item())
                 batch_kl_divs.append(approx_kl)
                 batch_clip_fracs.append(clip_frac)
                 if apply_self_critical:
@@ -1126,6 +1033,14 @@ def run_am_training(
             log_entry["r_greedy_avg"]      = r_greedy_avg
             log_entry["sc_advantage_mean"] = sc_adv_raw_mean
             log_entry["sc_loss_value"]     = avg_sc_loss
+        # Del rollout muestreado: cuántas cotizaciones se ganan, en qué nivel se cotiza y cuántas por episodio.
+        n_cot = cot_diag["cotizaciones"]
+        log_entry["entropy_precio"]      = float(np.mean(batch_entropies_precio)) if batch_entropies_precio else 0.0
+        log_entry["entropy_coef_precio"] = entropy_coef_precio
+        log_entry["tasa_aceptacion"]     = cot_diag["ganadas"] / n_cot if n_cot else float("nan")
+        log_entry["nivel_medio"]         = float(np.mean(cot_diag["niveles"])) if cot_diag["niveles"] else float("nan")
+        log_entry["cotizaciones_por_ep"] = n_cot / max(cot_diag["episodios"], 1)
+        log_entry["rechazos_por_ep"]     = (n_cot - cot_diag["ganadas"]) / max(cot_diag["episodios"], 1)
 
         stop_now = False
         log_freq = max(1, n_updates // 20)
@@ -1177,7 +1092,7 @@ def run_am_training(
                         reward_global_p95, num_nodes,
                         eval_k_levels=eval_k_levels,
                         avail_expected_arr=avail_expected_arr,
-                        ev_esperado=ev_esperado,
+                        ev_esperado=ev_esperado, world_seeds=eval_seeds,
                     )
                     log_entry["greedy_reward"]     = greedy_reward
                     log_entry["greedy_valid_rate"] = greedy_valid_rate
@@ -1196,11 +1111,10 @@ def run_am_training(
             if val is None:
                 print(f"    greedy={greedy_reward:.1f}usd")
             else:
-                val_linea = " ; ".join(
-                    f"val[K={'libre' if k == 'free' else k}] margen={d['margen']:.0f}usd "
-                    f"(vs_B3 {d['dif_b3']:+.1f}usd, gap_UBDP {d['gap_ub_dp_pct']:.1f}%, ref_B3={d['b3']:.0f}usd)"
-                    for k, d in v["por_k"].items()
-                )
+                def _linea_val(k, d):
+                    return (f"val[K={'libre' if k == 'free' else k}] margen={d['margen']:.0f}usd "
+                            f"acept={d['tasa_aceptacion']:.0%} nivel={d['nivel_medio']:.1f}")
+                val_linea = " ; ".join(_linea_val(k, d) for k, d in v["por_k"].items())
                 print(f"    {val_linea}")
                 if log_entry.get("val_ma") is not None:
                     ckpt = (f" *checkpoint guardado (mejor update={log_entry['ckpt_update']})"
@@ -1208,9 +1122,16 @@ def run_am_training(
                     print(f"    MA({CKPT_WINDOW} val)={log_entry['val_ma']:.0f}usd{ckpt}")
             print(
                 f"    validez={greedy_valid_rate:.0%} "
-                f"| entropia={avg_entropy:.3f} "
+                f"| entropía destino={avg_entropy:.3f} "
                 f"| KL={avg_kl:.4f} "
                 f"| var_explicada={explained_var:.3f}"
+            )
+            print(
+                f"    cotización (rollout): aceptación={log_entry['tasa_aceptacion']:.0%} "
+                f"| nivel medio={log_entry['nivel_medio']:.1f} "
+                f"| cotizaciones/ep={log_entry['cotizaciones_por_ep']:.2f} "
+                f"| rechazos/ep={log_entry['rechazos_por_ep']:.2f} "
+                f"| entropía precio={log_entry['entropy_precio']:.3f}"
             )
 
             # Resumen compacto de diagnósticos de K — conformidad debe ser

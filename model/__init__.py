@@ -1,1 +1,1 @@
-"""Paquete del modelo: encoder.py (AttentionEncoder/ContextNetwork), decoder.py (AttentionDecoder), critic_head.py (CriticHead/PostDecisionValueHead), agent.py (AMRoutingAgent, junta los tres) y debug_utils.py (check_tensor)."""
+"""Paquete del modelo: encoder.py (AttentionEncoder/ContextNetwork), decoder.py (AttentionDecoder), critic_head.py (CriticHead), agent.py (AMRoutingAgent, junta los tres) y debug_utils.py (check_tensor)."""

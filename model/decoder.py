@@ -4,26 +4,28 @@ attention_decoder.py
 Pointer decoder para el agente AM-Actor-Critic.
 
 Recibe el vector de contexto h_t (de ContextNetwork) y los embeddings de nodos
-(de AttentionEncoder) y produce una distribución de probabilidad sobre los nodos
-válidos, de la que se samplea o se toma el argmax para elegir el destino.
+(de AttentionEncoder) y produce la acción (destino j, opción de precio o), con
+o ∈ {nivel 0 … K−1, VACÍO} (especificacion_fase0_ruteo_pricing.md §5).
 
 Flujo interno
 -------------
 1. GlimpseAttention  — cross-attention (h_t → embeddings) → h_t refinado
 2. PointerAttention  — compatibilidad dot-product + tanh(C) → logits por nodo
-3. apply_mask        — logits de acciones inválidas → -inf
-4. Distribución      — softmax(logits) → π(a|s)
+3. apply_mask        — logits de destinos inválidos → -inf; softmax → π(j|s)
+4. PriceHead         — MLP sobre [h_t ; glimpse ; e_j], enmascarado con las opciones válidas de j → π(o|s, j)
 
-Modos de uso
-------------
-· Entrenamiento (PPO): act() retorna (acción, log_prob, entropía).
-  evaluate_action() recalcula log_prob y entropía para un batch de transiciones.
-· Evaluación (greedy): greedy_action() retorna el nodo con mayor logit válido.
+Orden autorregresivo: primero j (máscara = el destino tiene alguna opción válida), después o.
+    log π(j, o | s) = log π(j | s) + log π(o | s, j)
+Si para j solo hay una opción válida (p. ej. solo VACÍO), log π(o | s, j) = 0. La entropía se devuelve por
+separado (destino y precio) para poder ponderarlas distinto en el PPO. π(j | s) no depende de la cabeza de
+precio, así que la comparación B puede fijar el destino del DRL y cambiar solo la regla de precio.
+· Entrenamiento (PPO): act_cotizacion samplea; evaluate_cotizacion recalcula log π(j, o) y las entropías.
+· Evaluación (greedy): greedy_cotizacion (argmax de j y de o); greedy_precio para un destino dado.
 
 Compatibilidad
 --------------
-· La máscara de acción es la misma que produce RoutingEnv._get_action_mask():
-  np.int8 array con 1 = válido, 0 = inválido.
+· La máscara de destinos es la del entorno (routing_env.VectorRoutingEnv): np.int8, 1 = válido, 0 = inválido;
+  la de opciones es env.opciones_validas (bool, True = válida).
 · Sin dependencias de am_agent.py, am_training.py ni routing_env.py.
 """
 
@@ -33,6 +35,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from model.debug_utils import check_tensor
+from pricing import N_NIVELES
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,6 +138,39 @@ class PointerAttention(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Bloque 3: cabeza de precio (cotización conjunta)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PriceHead(nn.Module):
+    """
+    Logits de las opciones de precio (K niveles + VACÍO) para el destino ya elegido.
+
+    Entrada : h_t (batch, d_h), glimpse h_t' (batch, d_h), e_j (batch, d_h)
+    Salida  : logits sin enmascarar (batch, n_opciones)
+
+    El embedding e_j ya trae, por la atención del encoder, el contexto de todo el grafo (cargas, competencia,
+    índice de mercado, continuación esperada desde j); h_t trae el momento del ciclo (tiempo, K, rechazos).
+    """
+
+    _INIT_SEED = 20261124
+
+    def __init__(self, d_h: int, n_opciones: int):
+        super().__init__()
+        # RNG propio: crear la cabeza no consume el RNG global de torch, así que el resto del agente y el
+        # crítico se inicializan igual que antes de agregarla (mismo entrenamiento con la misma semilla).
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(self._INIT_SEED)
+            self.net = nn.Sequential(
+                nn.Linear(3 * d_h, d_h),
+                nn.ReLU(),
+                nn.Linear(d_h, n_opciones),
+            )
+
+    def forward(self, context: torch.Tensor, glimpse: torch.Tensor, e_j: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([context, glimpse, e_j], dim=-1))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Decoder principal
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -150,15 +186,15 @@ class AttentionDecoder(nn.Module):
 
     Uso en entrenamiento (PPO)
     --------------------------
-    action, log_prob, entropy = decoder.act(context, embeddings, mask)
+    destino, opcion, log_prob, H_destino, H_precio = decoder.act_cotizacion(context, embeddings, mask, opciones)
 
     Uso en evaluación (greedy)
     --------------------------
-    action = decoder.greedy_action(context, embeddings, mask)
+    destino, opcion = decoder.greedy_cotizacion(context, embeddings, mask, opciones)
 
     Recálculo para actualización PPO
     ---------------------------------
-    log_prob, entropy = decoder.evaluate_action(context, embeddings, mask, action)
+    log_prob, H_destino, H_precio = decoder.evaluate_cotizacion(context, embeddings, mask, opciones, destino, opcion)
     """
 
     def __init__(
@@ -166,27 +202,19 @@ class AttentionDecoder(nn.Module):
         d_h:             int,
         n_heads_glimpse: int   = 8,
         clip_C:          float = 10.0,
+        n_opciones:      int   = N_NIVELES + 1,
     ):
         super().__init__()
         self.glimpse = GlimpseAttention(d_h, n_heads_glimpse)
         self.pointer = PointerAttention(d_h, clip_C)
+        self.precio  = PriceHead(d_h, n_opciones)
+        self.n_opciones = n_opciones
 
-    # ── Auxiliar privado ──────────────────────────────────────────────────────
+    # ── Auxiliares privados ───────────────────────────────────────────────────
 
-    def _logits(
-        self,
-        context:    torch.Tensor,   # (batch, d_h)
-        embeddings: torch.Tensor,   # (batch, N, d_h)
-        mask:       torch.Tensor,   # (batch, N) bool — True = inválido
-    ) -> torch.Tensor:
-        """
-        Calcula los logits enmascarados (batch, N).
-
-        Pasos:
-          1. Glimpse: refina el contexto usando solo los nodos válidos.
-          2. Pointer: calcula scores de compatibilidad con clipping tanh.
-          3. Aplica la máscara: logits de nodos inválidos → -inf.
-        """
+    def _logits_y_glimpse(self, context, embeddings, mask) -> tuple:
+        """(logits enmascarados (batch, N), glimpse h_t'). mask (batch, N) bool, True = inválido. El glimpse
+        lo reusa la cabeza de precio."""
         h_refined = self.glimpse(context, embeddings, mask)    # (batch, d_h)
         logits    = self.pointer(h_refined, embeddings)         # (batch, N)
         check_tensor("decoder raw logits", logits)
@@ -194,95 +222,69 @@ class AttentionDecoder(nn.Module):
         # Verify no NaN crept in at valid positions after masking
         if torch.isnan(logits[~mask]).any():
             raise RuntimeError("decoder masked logits: NaN at valid positions after masking")
-        return logits
+        return logits, h_refined
+
+    @staticmethod
+    def _categorica(logits: torch.Tensor, tag: str) -> Categorical:
+        probs = F.softmax(logits, dim=-1)
+        check_tensor(tag, probs)
+        return Categorical(probs=torch.clamp(probs, min=1e-8))
+
+    def _dist_precio(self, context, glimpse, embeddings, destinos, opciones) -> Categorical:
+        """Distribución de la opción de precio para el destino `destinos` (batch,), con la máscara
+        opciones (batch, N, n_opciones) bool (True = válida) de ese destino."""
+        B = embeddings.shape[0]
+        filas = torch.arange(B, device=embeddings.device)
+        validas = opciones[filas, destinos]                                   # (batch, n_opciones)
+        if (~validas).all(dim=-1).any():
+            raise RuntimeError("cabeza de precio: destino sin opciones válidas")
+        logits = self.precio(context, glimpse, embeddings[filas, destinos])  # (batch, n_opciones)
+        check_tensor("price head raw logits", logits)
+        return self._categorica(logits.masked_fill(~validas, float("-inf")), "price head probs")
 
     @staticmethod
     def _bool_mask(action_mask: torch.Tensor) -> torch.Tensor:
         """Convierte la máscara Gymnasium (1=válido) a bool (True=inválido)."""
         return action_mask == 0
 
-    def _dist(
+    # ── API pública: acción (destino, opción de precio) ──────────────────────
+
+    def _dist_destino(self, context, embeddings, action_mask, tag) -> tuple:
+        mask = self._bool_mask(action_mask)
+        logits, glimpse = self._logits_y_glimpse(context, embeddings, mask)
+        return self._categorica(logits, tag), glimpse
+
+    def act_cotizacion(
         self,
         context:     torch.Tensor,   # (batch, d_h)
         embeddings:  torch.Tensor,   # (batch, N, d_h)
-        action_mask: torch.Tensor,   # (batch, N) int8: 1=válido, 0=inválido
-        tag:         str = "decoder softmax probs",
-    ) -> Categorical:
-        """logits → softmax → clamp → Categorical, compartido por act() y evaluate_action()."""
-        mask   = self._bool_mask(action_mask)
-        logits = self._logits(context, embeddings, mask)
-        probs  = F.softmax(logits, dim=-1)
-        check_tensor(tag, probs)
-        probs  = torch.clamp(probs, min=1e-8)
-        return Categorical(probs=probs)
-
-    # ── API pública ───────────────────────────────────────────────────────────
-
-    def act(
-        self,
-        context:     torch.Tensor,   # (batch, d_h)
-        embeddings:  torch.Tensor,   # (batch, N, d_h)
-        action_mask: torch.Tensor,   # (batch, N) int8: 1=válido, 0=inválido
+        action_mask: torch.Tensor,   # (batch, N) int8: 1 = el destino tiene alguna opción válida
+        opciones:    torch.Tensor,   # (batch, N, n_opciones) bool: True = opción válida
     ):
-        """
-        Samplea una acción durante el entrenamiento PPO.
+        """Samplea (destino, opción). Retorna destino, opción, log π(j, o), entropía del destino y del precio."""
+        dist_j, glimpse = self._dist_destino(context, embeddings, action_mask, "decoder softmax probs")
+        destino = dist_j.sample()
+        dist_o = self._dist_precio(context, glimpse, embeddings, destino, opciones)
+        opcion = dist_o.sample()
+        return destino, opcion, dist_j.log_prob(destino) + dist_o.log_prob(opcion), dist_j.entropy(), dist_o.entropy()
 
-        Retorna
-        -------
-        action   : Tensor (batch,) int64 — índice del nodo seleccionado.
-        log_prob : Tensor (batch,)        — log π(a|s).
-        entropy  : Tensor (batch,)        — entropía de la distribución.
-        """
-        dist   = self._dist(context, embeddings, action_mask)
-        action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy()
+    def greedy_cotizacion(self, context, embeddings, action_mask, opciones) -> tuple:
+        """Argmax del destino y, para ese destino, argmax de la opción de precio. Retorna (destino, opción)."""
+        if (action_mask.sum(dim=-1) == 0).any():
+            raise RuntimeError("AttentionDecoder.greedy_cotizacion: zero valid actions in mask")
+        logits, glimpse = self._logits_y_glimpse(context, embeddings, self._bool_mask(action_mask))
+        destino = logits.argmax(dim=-1)
+        return destino, self.greedy_precio(context, glimpse, embeddings, destino, opciones)
 
-    def greedy_action(
-        self,
-        context:     torch.Tensor,   # (batch, d_h)
-        embeddings:  torch.Tensor,   # (batch, N, d_h)
-        action_mask: torch.Tensor,   # (batch, N) int8
-    ) -> torch.Tensor:
-        """
-        Selecciona la acción greedy (argmax) para evaluación.
+    def greedy_precio(self, context, glimpse, embeddings, destino, opciones) -> torch.Tensor:
+        """Argmax de la opción de precio para un destino dado (lo usa también la comparación B)."""
+        B = embeddings.shape[0]
+        filas = torch.arange(B, device=embeddings.device)
+        logits = self.precio(context, glimpse, embeddings[filas, destino])
+        return logits.masked_fill(~opciones[filas, destino], float("-inf")).argmax(dim=-1)
 
-        Retorna
-        -------
-        Tensor (batch,) int64 — índice del nodo con mayor logit válido.
-        """
-        mask   = self._bool_mask(action_mask)
-        valid_actions = action_mask.sum(dim=-1)
-        if (valid_actions == 0).any():
-            raise RuntimeError("AttentionDecoder.greedy_action: zero valid actions in mask")
-        logits = self._logits(context, embeddings, mask)
-        return logits.argmax(dim=-1)
-
-    def evaluate_action(
-        self,
-        context:     torch.Tensor,   # (batch, d_h)
-        embeddings:  torch.Tensor,   # (batch, N, d_h)
-        action_mask: torch.Tensor,   # (batch, N) int8
-        action:      torch.Tensor,   # (batch,) int64
-    ):
-        """
-        Recalcula log_prob y entropía para un batch almacenado.
-        Usado en la fase de actualización del loop PPO.
-
-        Retorna
-        -------
-        log_prob : Tensor (batch,)
-        entropy  : Tensor (batch,)
-        """
-        dist = self._dist(context, embeddings, action_mask, tag="decoder softmax probs (eval)")
-        return dist.log_prob(action), dist.entropy()
-
-    def forward(
-        self,
-        context:     torch.Tensor,
-        embeddings:  torch.Tensor,
-        action_mask: torch.Tensor,
-    ):
-        """
-        Alias de act() para uso como nn.Module estándar en entrenamiento.
-        """
-        return self.act(context, embeddings, action_mask)
+    def evaluate_cotizacion(self, context, embeddings, action_mask, opciones, destino, opcion) -> tuple:
+        """Recalcula log π(j, o) y las dos entropías para un batch almacenado (actualización PPO)."""
+        dist_j, glimpse = self._dist_destino(context, embeddings, action_mask, "decoder softmax probs (eval)")
+        dist_o = self._dist_precio(context, glimpse, embeddings, destino, opciones)
+        return dist_j.log_prob(destino) + dist_o.log_prob(opcion), dist_j.entropy(), dist_o.entropy()

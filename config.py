@@ -70,27 +70,28 @@ PPO_WEIGHT_DECAY          = 6.093123878168306e-05  # Weight decay (AdamW) del ac
                                     # PPO-safe: no corrompe el ratio de importancia como el
                                     # dropout en el path de logits.
 
-# ── Precio de reserva (PRICING_PLAN.md) ───────────────────────
-# Valor post-decisión Ṽ(s, a): margen esperado desde la llegada a `a` hasta volver a casa siguiendo el actor
-# greedy. Dos cabezas A y B (estimador doble) sobre el estado congelado (h_t y embeddings con detach), entrenadas
-# DESPUÉS del PPO (post_training.py) con retornos reales del actor: no cambian la política ni el PPO.
-USE_POST_HEAD = True      # crea las cabezas post_value_a / post_value_b en el agente
-POST_HIDDEN   = AM_D_H    # tamaño oculto del MLP (igual al encoder)
-POST_SEED_A   = 20261021  # semillas de inicialización de las cabezas (distintas: si no nacerían idénticas)
-POST_SEED_B   = 20261023
-POST_N_EJEMPLOS = 200_000 # ejemplos de entrenamiento de Ṽ (mitad a A y mitad a B, repartidos por mundo)
-POST_N_VAL      = 40_000  # ejemplos de validación de Ṽ (mundos retenidos)
-POST_LR         = 1e-3    # Adam
-POST_BATCH      = 1024
-POST_EPOCHS     = 60      # tope de épocas (con parada temprana)
-POST_PACIENCIA  = 6       # épocas sin mejorar el error de validación antes de parar
-MARKET_SEED_POST_TRAIN = 20261031   # mundos de entrenamiento de Ṽ (≠ entrenamiento PPO, validación y evaluación)
-MARKET_SEED_POST_VAL   = 20261032   # mundos retenidos para el error de validación de Ṽ
-PRICING_VAL_SEED = 20261022   # semilla del muestreo de validate_pricing.py (estados del contrafactual, azar)
-N_EST_CONTRAFACTUAL = 2000    # estados de la prueba contrafactual (4b)
-N_MUNDOS_CONTRAFACTUAL = 1000 # mundos por bloque de validación (se añaden bloques hasta reunir los estados)
-BE_MARGEN       = 0.30        # USD/milla sobre el break-even que marca un p* "alto" (validación c)
-INDICE_DISPERSION_SEMANAL = (0.10, 0.12)   # USD/milla: dispersión semanal del índice de mercado (referencia del sesgo)
+# ── Pricing ───────────────────────────────────────────────────
+# (El precio de reserva con las cabezas Ṽ A/B y post_training.py se eliminó en la Fase 3 de
+# especificacion_fase0_ruteo_pricing.md: el precio ahora es una decisión de la política.)
+PRICING_VAL_SEED = 20261022   # semilla del muestreo de la validación del pricing (Fase 6)
+BE_MARGEN       = 0.30        # USD/milla sobre el break-even de la regla de precio fija "be_margen" (pricing.nivel_regla)
+
+# ── Ruteo y pricing conjunto (especificacion_fase0_ruteo_pricing.md) ──
+# En cada nodo la política elige (destino, nivel de precio). Los niveles son percentiles fijos, comunes a todas
+# las lanes, que se convierten en USD/milla con los cuantiles de cada lane y día (pricing.precios_niveles).
+U_NIVELES = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)   # nivel 0 = mínimo del mercado (gana siempre); 9 = p90
+COMPETENCIA_KAPPA = 1.0    # m = clip(1 + κ · LTR_REF / LTR, 1, M_MAX); sensibilidad κ ∈ {0.5, 2}
+COMPETENCIA_M_MAX = 20.0   # tope de competidores efectivos (con LTR ≈ 0.8, p5 del train, m sin tope sería ≈ 33)
+# LTR_REF no es constante: es la mediana del LTR por hub y día en los días de train (los 194 hubs, así no depende
+# de num_nodes) y la calcula MarketProcess al iniciar (≈ 25.5 con los datos jun-sep 2026).
+COTIZACION_HORAS = 0.25          # horas que se pierden por cada cotización rechazada (= una franja de la DP)
+COTIZACIONES_MAX_POR_NODO = 2    # rechazos por visita a un nodo; después solo quedan opciones sin cotizar
+REGLA_PRECIO_BASELINES = "miope" # regla fija de precio de B1-B3 ("mediana" | "be_margen" | "miope")
+# Entropía de la cabeza de precio (aparte de la del destino). Máximo = log(11) ≈ 2.4 con 10 niveles + VACÍO.
+# Valores iniciales razonables, sin ajustar por HPO todavía.
+PPO_ENTROPY_COEF_PRECIO_START = 0.05
+PPO_ENTROPY_COEF_PRECIO_END   = 0.01
+UBDP_TIEMPO_MAX_HORAS = 24.0     # si la tabla de UB-DP tarda más, ese tamaño se reporta "no tratable"
 
 # ── Self-critical baseline (híbrido sobre actor-critic) ────────────
 USE_SELF_CRITICAL            = True   # término self-critical sobre el argmax greedy
@@ -178,7 +179,7 @@ MARKET_VENTANA_VECINOS = 3            # días antes/después (sin el propio día
 MARKET_PARAMS_PATH   = "datos/market_params.npz"   # relativo a la raíz del proyecto
 VENTANA_LENTO_DIAS   = 21             # ventana (impar, centrada) del promedio que separa el estado lento del rápido del
                                       # índice de mercado; los días con la ventana completa son los "días de escenario"
-HORAS_DIA_MERCADO    = 14.0           # un día de mercado = 14 h (igual que RoutingEnv)
+HORAS_DIA_MERCADO    = 14.0           # un día de mercado = 14 h (igual que el entorno)
 MARKET_DIAS_EPISODIO = int(MAX_DURATION // HORAS_DIA_MERCADO) + 1   # días de mercado que puede tocar un episodio
                                       # (el de salida y los que caben en MAX_DURATION: 6 con 77 h)
 MARKET_SEED_TRAIN    = int(os.environ.get("MARKET_SEED_TRAIN", 20260))   # semilla de los mundos de entrenamiento
@@ -212,6 +213,8 @@ UBDP_DT_HORAS   = 0.25    # paso de tiempo de la DP (franjas de 15 min; tiempos 
                           # también lo usa B2
 UBPI_DT_HORAS   = 1.0 / 60.0   # paso de tiempo de la DP hacia atrás de UB-PI (franjas de 1 min; redondeo hacia abajo)
 UBDP_S          = 5000    # sorteos de filas por par (nodo, día de la semana)
+UBDP_MAX_NODOS  = 35      # por encima, UB-DP (y B3) no se calcula: se reporta "no tratable" sin gastar horas
+                          # (con los dos intentos de cotización el costo crece con N³ · S)
 UBDP_SEED       = 20261018   # semilla del Generator propio de la DP
 UBDP_TABLA_PATH = "datos/ubdp_tabla_{n}nodos.npz"   # relativo a la raíz del proyecto; {n} = nº de nodos
 REPLAY_MAX_CASOS = 300   # tope de casos (nodo, día) del replay por nivel de K; si hay más, se toma un subconjunto balanceado

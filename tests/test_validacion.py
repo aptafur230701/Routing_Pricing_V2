@@ -2,8 +2,8 @@
 test_validacion.py
 ==================
 Validación en mundos simulados durante el entrenamiento (am_training.ValidacionSimulada):
-mundos fijos y distintos de los de evaluación, resultados reproducibles, referencias B3 / UB-DP
-coherentes y guardado del mejor update.
+mundos fijos y distintos de los de evaluación, resultados reproducibles, métricas de cotización en rango
+y guardado del mejor update. La validación no depende de la tabla de UB-DP.
 """
 
 import os
@@ -36,7 +36,7 @@ def datos():
 
 def _val(d):
     return am_training.ValidacionSimulada(
-        d["market"], d["tm"], d["rate"], d["loads"], d["dist"], d["diesel"], N,
+        d["market"], d["tm"], d["rate"].shape[0], d["dist"], d["diesel"], N,
         np.asarray(d["tm"], dtype=float), d["ltr"], d["p95"], d["avail"],
         ev_esperado=calcular_ev_pronostico(d["market"], d["dist"], d["diesel"]),
     )
@@ -63,9 +63,8 @@ def test_validacion_estructura_y_reproducibilidad(datos):
     assert set(a["por_k"]) == {"free" if K is None else str(K) for K in K_TRAINING_LEVELS}
     for d in a["por_k"].values():
         assert d["valid_rate"] == 1.0
-        # B3 no supera a UB-DP salvo ruido de muestreo; el gap del agente es finito
-        assert d["b3"] <= d["ub_dp"] * 1.05
-        assert np.isfinite(d["gap_ub_dp_pct"])
+        assert 0 < d["tasa_aceptacion"] <= 1 and 0 <= d["nivel_medio"] <= 9
+        assert set(d) == {"margen", "valid_rate", "tasa_aceptacion", "nivel_medio"}      # sin B3 ni UB-DP
     assert a["score"] == pytest.approx(a["margen"] * a["valid_rate"])
 
 
@@ -95,14 +94,12 @@ def test_dow_del_entorno_y_one_hot(datos):
     from fit_market_process import dia_de_semana
     from routing_env import VectorRoutingEnv
     for offset in (0, TRAIN_DAYS):
-        env = VectorRoutingEnv(
-            time_matrix=datos["tm"], rate_stack=datos["rate"], loads_stack=datos["loads"], rm_pen_stack=None,
-            num_nodes=N, market_process=datos["market"], distance_arr=datos["dist"],
-            diesel_arr=datos["diesel"], day_offset=offset,
-        )
+        env = VectorRoutingEnv(datos["tm"], N, datos["dist"], datos["diesel"], datos["rate"].shape[0],
+                               market_process=datos["market"], day_offset=offset)
         env.reset(np.array([0, 1]), np.array([3, 10]), world_seeds=np.array([1, 2]))
         assert (env.current_dow == dia_de_semana(np.array([3, 10]) + offset)).all()
-        env.step(np.array([2, 3]))
+        par = [np.argwhere(o)[0] for o in env.opciones_validas]       # primera opción válida (nivel 0 si hay carga)
+        env.step(np.array([p[0] for p in par]), np.array([p[1] for p in par]))
         t = env.time_elapsed
         esperado = dia_de_semana(np.array([3, 10]) + offset + (t // 14).astype(int))
         assert (env.current_dow == esperado).all()

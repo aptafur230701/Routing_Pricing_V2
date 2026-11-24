@@ -4,8 +4,9 @@ __pycache__/
 logs/
 runs/
 .ipynb_checkpoints/
-# Tabla V de UB-DP: se regenera con main.py (dp_relajada.cargar_o_calcular_tabla)
-datos/ubdp_tabla_*.npz
+# Tabla V de UB-DP y marcadores "no tratable": se regeneran con main.py (dp_relajada.cargar_o_calcular_tabla)
+baselines/datos/ubdp_tabla_*.npz
+baselines/datos/ubdp_tabla_*.no_tratable.json
 
 # Caché de baselines y cotas de la evaluación (se regenera)
 datos/cache_eval/

@@ -5,15 +5,16 @@ Entry point for the AM-PPO pipeline.
 
   1. Load data          (problem_data.py)
   2. Training           (am_training.py)
-  3. Ṽ posterior al PPO (post_training.py: cabezas A/B del precio de reserva, actor congelado)
-  4. Evaluation         (evaluation.py: mundos simulados + replay; DRL, baselines B1-B3 y B2P, UB-PI, UB-DP)
-  5. Save results       (evaluation.py, excel_report.py, stats_analysis.py)
-  6. Validación del pricing (validate_pricing.py: contrafactual de p*, utilidad, plausibilidad)
+  3. Evaluation         (evaluation.py: mundos simulados + replay; DRL, baselines B1-B3 y B2P, UB-PI, UB-DP)
+  4. Save results       (evaluation.py, excel_report.py, stats_analysis.py)
+  5. Validación del precio (validate_pricing.py: results/<N>nodes/pricing_val/ y hojas del Excel)
+
+  La validación de la decisión de precio va aparte: python validate_pricing.py --num-nodes N.
 
 Uso
 ---
   Edita NODE_SIZES en main() (por defecto, la cadena completa de transfer_learning.NODE_SEQUENCE:
-  10 · 20 · 35 · 50 · 75 · 100). Luego ejecuta simplemente:
+  10 · 20 · 50 · 75 · 100). Luego ejecuta simplemente:
     python main.py
 
   Corre cada tamaño en orden: entrena, guarda checkpoint y resultados, y pasa al siguiente usando
@@ -21,7 +22,7 @@ Uso
   transfer_learning.get_source_checkpoint). Si un tamaño falla, se imprime el error y se continúa
   con el siguiente en vez de abortar toda la corrida.
 
-  Para correr un solo tamaño, deja NODE_SIZES con un único elemento, p. ej. NODE_SIZES = [35].
+  Para correr un solo tamaño, deja NODE_SIZES con un único elemento, p. ej. NODE_SIZES = [10].
 
 Checkpoints (transfer learning)
 --------------------------------
@@ -43,22 +44,20 @@ from config import (
     SEED, DEVICE, RUN_TAG, K_TRAINING_LEVELS, configurar_k, MARKET_SEED_EVAL, MARKET_SEED_EVAL_FINAL,
     HP_OVERRIDES, configurar_hp,
     get_episodes_per_node, TRAIN_DAYS, set_seeds,
-    AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, USE_POST_HEAD,
+    AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF,
 )
 from baselines.politicas import calcular_ev_pronostico
 from problem_data import load_matrices
 from baselines.dp_relajada import cargar_o_calcular_tabla
 from evaluation import (
-    evaluar_mundos_simulados, evaluar_replay, resumen_metodos,
+    evaluar_mundos_simulados, evaluar_replay, imprimir_resumen,
     save_results, plot_diagnostics, plot_ppo_diagnostics,
 )
 from market_process import MarketProcess, asegurar_parametros
-from stats_analysis import append_stats_sheets_to_excel, NOTA_REPLAY
+from stats_analysis import append_stats_sheets_to_excel, comparar_con_baselines, FAMILIAS, NOTA_REPLAY
 from transfer_learning import (
-    NODE_SEQUENCE, build_agent_for_training, checkpoint_tiene_post_head, load_checkpoint_compatible,
+    NODE_SEQUENCE, build_agent_for_training, load_checkpoint_compatible,
 )
-from post_training import entrenar_cabezas_post, ruta_checkpoint_pricing, pricing_vigente
-from validate_pricing import run_pricing_validation, append_pricing_sheet
 
 
 def _run_am(
@@ -164,7 +163,10 @@ def _evaluate_and_report(
     UB-DP. Replay: el mismo arnés sobre los días reales de evaluación (TRAIN_DAYS en adelante),
     fuera de muestra: ni el entrenamiento ni el ajuste del proceso exógeno usaron esos días.
     """
-    tabla = cargar_o_calcular_tabla(market_process, time_matrix, distance_arr, diesel_arr)
+    # La tabla solo calcula los K que se evalúan: con K libre (K_RESTRINGIDO = False) es un solo barrido
+    # (K = 0) en vez de K = 1…K_MAX más el libre.
+    k_tabla = max([k for k in K_TRAINING_LEVELS if k is not None], default=0)
+    tabla = cargar_o_calcular_tabla(market_process, time_matrix, distance_arr, diesel_arr, K=k_tabla)
     # B1, B2, B2P, B3, UB-PI y UB-DP no dependen del DRL: se calculan una vez por nº de nodos y se reusan
     # entre corridas (semillas, ablaciones) mientras no cambien el proceso, la tabla V ni el diseño.
     cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos", "cache_eval")
@@ -191,18 +193,17 @@ def _evaluate_and_report(
     print(f"  SUMMARY — {NUM_NODES} nodes  [{label}]")
     print(f"{'='*60}")
     for titulo, df in (("Mundos simulados", sim_df), (f"Replay ({NOTA_REPLAY})", replay_df)):
-        print(f"\n  {titulo}")
-        with pd.option_context("display.width", 220, "display.max_columns", None):
-            print(resumen_metodos(df).to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+        imprimir_resumen(df, titulo)
+    _imprimir_comparacion_b(sim_df, replay_df)
     print(f"\n  Entrenamiento del DRL        : {train_time:.1f} s")
-    print(f"  Tabla V de UB-DP             : {tabla.tiempo_calculo:.1f} s")
+    print(f"  Tabla V de UB-DP             : " + ("no tratable" if tabla is None else f"{tabla.tiempo_calculo:.1f} s"))
     print(f"{'='*60}")
 
     summary_rows.append({
         "Model":                  label,
         "Node Size":              NUM_NODES,
         "DRL Training Time (s)":  train_time,
-        "UB-DP Table Time (s)":   tabla.tiempo_calculo,
+        "UB-DP Table Time (s)":   float("nan") if tabla is None else tabla.tiempo_calculo,
     })
 
     excel_path = os.path.join(cwd, f"DRL_Routing_Summary_{label}.xlsx")
@@ -213,15 +214,37 @@ def _evaluate_and_report(
     if ep_rewards:
         plot_diagnostics(ep_rewards, ep_losses, sim_df, NUM_NODES, plot_path)
 
+    # Validación de la decisión de precio (nivel según el estado, comparación B, sensibilidad a κ):
+    # results/<N>nodes/pricing_val/ y hojas "Precio vs estado" y "Sensibilidad κ" del Excel.
+    from validate_pricing import validar_pricing
+    validar_pricing(agent, NUM_NODES, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
+                    ltr_stack, avail_expected_arr, reward_global_p95, market_process, cwd,
+                    excel_path=excel_path)
+
     return sim_df, replay_df
+
+
+def _imprimir_comparacion_b(sim_df, replay_df) -> None:
+    """Comparación B en consola: DRL − (destino del DRL + regla fija), con IC bootstrap y Holm."""
+    df = sim_df if replay_df is None or replay_df.empty else pd.concat([sim_df, replay_df], ignore_index=True)
+    b = comparar_con_baselines(df, familias={"precio": FAMILIAS["precio"]})
+    if b.empty:
+        return
+    sig = [c for c in b.columns if c.startswith("significativo")][0]
+    print("\n  Comparación B — lo que aporta la cabeza de precio (DRL − mismos destinos con regla fija):")
+    for _, r in b.iterrows():
+        modo = "replay" if str(r["modo"]).startswith("replay") else "simulado"
+        print(f"    {modo:<9} K={r['K']:<6} {r['comparacion']:<26} "
+              f"{r['dif_media_usd']:+9.1f} USD  IC95 [{r['ic95_inf']:+.1f}, {r['ic95_sup']:+.1f}]  "
+              f"p_Holm={r['p_holm']:.3g}{'  *' if r[sig] else ''}")
 
 
 def _run_one_size(
     NUM_NODES, cwd,
     EVAL_ONLY, USE_TRANSFER, EVAL_BEST_CHECKPOINT, USE_MARKET_PROCESS,
-    EVAL_SET, K_RESTRINGIDO, RUN_PRICING, RETRAIN_POST,
+    EVAL_SET, K_RESTRINGIDO,
 ):
-    """Pipeline completo (entrenamiento + Ṽ + evaluación + pricing) para un solo tamaño de grafo.
+    """Pipeline completo (entrenamiento + evaluación) para un solo tamaño de grafo.
 
     Aislado en su propia función para que main() pueda llamarlo en secuencia sobre varios
     NUM_NODES: cada llamada guarda su checkpoint y sus resultados antes de que empiece la
@@ -304,28 +327,7 @@ def _run_one_size(
         pd.DataFrame(training_log).to_excel(tlog_xlsx_path, index=False)
         print(f"training_log (Excel) guardado en: {tlog_xlsx_path}")
 
-    # ── Ṽ posterior al PPO: cabezas A/B con el actor congelado (checkpoint nuevo *_pricing.pt) ──
-    con_pricing = RUN_PRICING and USE_POST_HEAD
-    if con_pricing:
-        pricing_path = ruta_checkpoint_pricing(_checkpoint_path(checkpoint_dir, NUM_NODES, usar_best))
-        # Se reutiliza el checkpoint *_pricing.pt solo si sus cabezas se entrenaron contra ESTE actor (huella de pesos):
-        # tras reentrenar el PPO, o con otro checkpoint, se reentrenan.
-        if RETRAIN_POST or not pricing_vigente(pricing_path, agent_am):
-            datos = dict(
-                time_matrix=time_matrix, rate_stack=rate_stack, loads_stack=loads_stack, distance_arr=distance_arr,
-                diesel_arr=diesel_arr, ltr_stack=ltr_stack,
-                avail_expected_arr=avail_expected_arr, reward_global_p95=reward_global_p95, market=market_process,
-                ev_esperado=ev_esperado,
-            )
-            entrenar_cabezas_post(agent_am, critic, datos, NUM_NODES, pricing_path, output_dir=output_dir)
-        else:
-            agent_am, critic = load_checkpoint_compatible(
-                pricing_path, NUM_NODES, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, verbose=False)
-            agent_am.eval()
-            print(f"Cabezas Ṽ cargadas de {pricing_path}")
-
     label = "AM" if EVAL_SET == "dev" else "AM_final"
-    excel_path = os.path.join(output_dir, f"DRL_Routing_Summary_{label}.xlsx")
     _evaluate_and_report(
         agent_am, NUM_NODES, time_matrix, rate_stack, loads_stack,
         distance_arr, diesel_arr, ep_r, ep_l, t,
@@ -338,24 +340,15 @@ def _run_one_size(
         sufijo_cache="" if EVAL_SET == "dev" else "_final",
     )
 
-    if con_pricing and getattr(agent_am, "post_entrenadas", False):
-        # Pricing solo necesita el actor congelado: no reutiliza nada de la evaluación de ruteo de arriba.
-        tablas = run_pricing_validation(
-            agent_am, NUM_NODES, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-            ltr_stack, avail_expected_arr, reward_global_p95, market_process,
-            ev_esperado=ev_esperado, output_dir=output_dir,
-            semilla_eval=MARKET_SEED_EVAL if EVAL_SET == "dev" else MARKET_SEED_EVAL_FINAL,
-        )
-        append_pricing_sheet(excel_path, tablas)
-
     print(f"\nDone! Checkpoint guardado en: checkpoints/am_checkpoint_{NUM_NODES}nodes.pt")
 
 
 def main():
     # Tamaños a correr, en orden. Por defecto la cadena completa de transfer_learning.NODE_SEQUENCE
-    # (10 → 20 → 35 → 50 → 75 → 100): cada tamaño arranca con el checkpoint recién guardado del
-    # anterior. Para correr uno solo, deja aquí un único elemento, p. ej. NODE_SIZES = [35].
-    NODE_SIZES      = list(NODE_SEQUENCE)
+    # (10 → 20 → 50 → 75 → 100): cada tamaño arranca con el checkpoint recién guardado del
+    # anterior. Para correr uno solo, deja aquí un único elemento, p. ej. NODE_SIZES = [10].
+    # NODE_SIZES      = list(NODE_SEQUENCE)
+    NODE_SIZES      = [10]
     EVAL_ONLY       = os.environ.get("EVAL_ONLY", "0") == "1"   # True (EVAL_ONLY=1): carga checkpoint y salta entrenamiento
     USE_TRANSFER    = True   # True: inicializa los pesos desde el checkpoint del tamaño anterior. False: entrena desde pesos aleatorios con la
                               # arquitectura de config.py.
@@ -374,11 +367,6 @@ def main():
                                                     # la configuración congelada); escribe DRL_Routing_Summary_AM_final.xlsx.
     K_RESTRINGIDO = False      # True: entrena, valida y evalúa con K libre y K = K_MAX (5).
                                 # False: solo K libre (sin presupuesto de cardinalidad).
-    RUN_PRICING = True       # True (y USE_POST_HEAD activo): entrena las cabezas Ṽ A/B con el actor congelado (si
-                              # no hay un checkpoint *_pricing.pt vigente para este actor
-    RETRAIN_POST = False     # True: reentrena las cabezas Ṽ aunque ya exista un checkpoint *_pricing.pt válido
-                              # para este actor (pricing_vigente); con False, pricing_vigente decide y solo
-                              # reentrena cuando el actor cambió o el checkpoint no existe.
     # ──────────────────────────────────────────────────────────────────────────
 
     cwd = os.path.dirname(os.path.abspath(__file__))
@@ -389,7 +377,7 @@ def main():
             _run_one_size(
                 NUM_NODES, cwd,
                 EVAL_ONLY, USE_TRANSFER, EVAL_BEST_CHECKPOINT, USE_MARKET_PROCESS,
-                EVAL_SET, K_RESTRINGIDO, RUN_PRICING, RETRAIN_POST,
+                EVAL_SET, K_RESTRINGIDO,
             )
         except Exception:
             fallidos.append(NUM_NODES)

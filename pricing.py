@@ -1,36 +1,138 @@
 """
 pricing.py
 ==========
-Precio de reserva p*(i→j, s) en USD/milla (PRICING_PLAN.md §2): el costo de oportunidad por milla de ir a j,
-es decir, la tarifa a la que al camión le da igual aceptar la lane i→j o su mejor alternativa. Es una
-recomendación del lado del transportista, NO una probabilidad de aceptación del cliente.
+Cotización conjunta (especificacion_fase0_ruteo_pricing.md §3 y §6): niveles de precio por lane en
+escala de percentiles, número efectivo de competidores m(LTR), aceptación P(ganar | u_k) = (1 − u_k)^m
+y las reglas de precio fijas (mediana, break-even + margen, miope óptima). Solo numpy y config: lo
+usan market_process, el entorno, los baselines y las DP.
 
-    Q(s, a)   = r_obs(i→a)/S + Ṽ(s, a)                 valor de aceptar la lane i→a (Ṽ(s, casa) = 0)
-    Q_alt(s)  = max_{a ≠ j válida} Q(s, a)               mejor alternativa a j
-    p*(i→j)   = ( S · (Q_alt − Ṽ(s, j)) + costo(i→j) ) / dist(i→j)
-
-con r_obs(i→a) = tarifa · dist · 1[hay carga] − costo (sin redondear), S = REWARD_SCALE_FACTOR y Ṽ(s, a) el
-margen esperado desde la llegada a `a` hasta volver a casa siguiendo el actor greedy.
-
-Ṽ tiene dos cabezas, A y B (agent.post_value_a / post_value_b), entrenadas con mitades distintas de los datos:
-  · p*_AB elige la mejor alternativa con A y la evalúa (Q_alt y Ṽ(s, j)) con B; p*_BA al revés.
-  · p* = promedio de ambos; el rango es [mínimo, máximo] de los dos. El rango mide la variabilidad del
-    estimador (partición de datos y ruido de las etiquetas), NO es un intervalo de confianza: las dos cabezas
-    comparten encoder, contexto y actor.
-p* se calcula para el arco i→j que la política de ruteo (el actor) ya decidió tomar; j nunca se re-decide con Q
-— Q solo sirve aquí para valorar la MEJOR ALTERNATIVA a esa decisión (el costo de oportunidad).
-
-p* solo existe para lanes con carga; si j es el regreso al depot y trae carga, cotiza igual que cualquier otra
-lane (con Ṽ(s, depot) = 0, ya impuesto en q_values). Si j es la única acción factible no hay alternativa y p*
-tampoco está definido (`only_option`). En esos casos el resultado trae p* = NaN.
+El precio ya no se calcula después del ruteo: en cada nodo la política elige destino y nivel de precio
+(el precio de reserva p* con las cabezas Ṽ A/B se eliminó en la Fase 3).
 """
-
-from dataclasses import dataclass
 
 import numpy as np
 
-from config import MPG, MARGINAL_COST_SIN_DIESEL
+from config import (
+    MPG, MARGINAL_COST_SIN_DIESEL, U_NIVELES, COMPETENCIA_KAPPA, COMPETENCIA_M_MAX, BE_MARGEN,
+)
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Cotización conjunta
+# ═════════════════════════════════════════════════════════════════════════════
+
+PCT_CUANTILES = np.array([0.0, 0.25, 0.5, 0.75, 0.90, 1.0])   # percentiles de [min, q1, q2, q3, p90, max]
+U_NIVELES_ARR = np.asarray(U_NIVELES, dtype=np.float64)       # (K,) percentil de cada nivel de precio
+N_NIVELES = len(U_NIVELES_ARR)
+REGLAS_PRECIO = ("mediana", "be_margen", "miope")
+
+
+def interp_cuantiles(u: np.ndarray, cuantiles: np.ndarray) -> np.ndarray:
+    """Inversión de cuantiles por interpolación lineal (Paso 4b-2 de la metodología).
+
+    u : (...,) en [0, 1]. cuantiles : (..., 6) con los puntos [min, q1, q2, q3, p90, max], que se
+    interpolan en los percentiles `PCT_CUANTILES` = [0, .25, .5, .75, .90, 1]. Devuelve (...,).
+    Es la misma función que convierte en dólares el percentil sorteado de la tarifa
+    (market_process) y los percentiles fijos de los niveles de precio (`precios_niveles`).
+    """
+    seg = np.clip(np.searchsorted(PCT_CUANTILES, u, side="right") - 1, 0, len(PCT_CUANTILES) - 2)
+    p0, p1 = PCT_CUANTILES[seg], PCT_CUANTILES[seg + 1]
+    v0 = np.take_along_axis(cuantiles, seg[..., None], axis=-1)[..., 0]
+    v1 = np.take_along_axis(cuantiles, (seg + 1)[..., None], axis=-1)[..., 0]
+    t = np.where(p1 > p0, (u - p0) / np.maximum(p1 - p0, 1e-12), 0.0)
+    return v0 + t * (v1 - v0)
+
+
+def precios_niveles(cuantiles: np.ndarray, delta=0.0, u_niveles: np.ndarray = U_NIVELES_ARR) -> np.ndarray:
+    """USD/milla de cada nivel de precio: F⁻¹_{lane,día}(u_k) · e^δ.
+
+    cuantiles : (..., 6) de la lane y el día (ordenados de menor a mayor).
+    delta     : corrimiento nacional del episodio, escalar o broadcastable a cuantiles.shape[:-1].
+    Devuelve (..., K), no decreciente en K si los cuantiles están ordenados.
+    """
+    c = np.asarray(cuantiles, dtype=np.float64)
+    u = np.asarray(u_niveles, dtype=np.float64)
+    forma = c.shape[:-1] + u.shape
+    p = interp_cuantiles(np.broadcast_to(u, forma), np.broadcast_to(c[..., None, :], forma + (c.shape[-1],)))
+    return p * np.exp(np.asarray(delta, dtype=np.float64))[..., None]
+
+
+def competidores_efectivos(ltr, ltr_ref: float, kappa: float = COMPETENCIA_KAPPA,
+                           m_max: float = COMPETENCIA_M_MAX) -> np.ndarray:
+    """m = clip(1 + κ · LTR_REF / LTR, 1, M_MAX): competidores efectivos por carga en el nodo de origen.
+
+    LTR alto (más cargas que camiones) ⇒ m → 1. LTR bajo ⇒ m alto, con tope M_MAX. Un LTR ≤ 0 (hub
+    sin dato) queda en el tope.
+    """
+    ltr = np.asarray(ltr, dtype=np.float64)
+    m = 1.0 + kappa * ltr_ref / np.maximum(ltr, 1e-12)
+    return np.clip(m, 1.0, m_max)
+
+
+def prob_ganar(u_nivel, m) -> np.ndarray:
+    """P(ganar | u_k) = (1 − u_k)^m: probabilidad de que los m competidores coticen más caro."""
+    return np.power(1.0 - np.asarray(u_nivel, dtype=np.float64), np.asarray(m, dtype=np.float64))
+
+
+def percentil_competidor(U, m) -> np.ndarray:
+    """Percentil del mejor de m competidores uniformes a partir de un uniforme U: u_comp ~ Beta(1, m).
+
+    u_comp = 1 − (1 − U)^(1/m). Con m = 1, u_comp = U: el competidor cotiza la tarifa sorteada.
+    """
+    return 1.0 - np.power(1.0 - np.asarray(U, dtype=np.float64), 1.0 / np.asarray(m, dtype=np.float64))
+
+
+def gana(u_nivel, u_comp) -> np.ndarray:
+    """La cotización en el percentil u_nivel gana si queda por debajo del mejor competidor.
+
+    Se compara en percentiles (no en dólares) para evitar empates en lanes con cuantiles repetidos.
+    El nivel 0 (el mínimo del mercado) gana siempre.
+    """
+    u_nivel = np.asarray(u_nivel, dtype=np.float64)
+    return (u_nivel <= 0.0) | (u_nivel < np.asarray(u_comp, dtype=np.float64))
+
+
+def indice_nivel(u: float, u_niveles: np.ndarray = U_NIVELES_ARR) -> int:
+    """Índice en U_NIVELES del nivel con percentil `u` (p. ej. 0.5 → el nivel de la mediana)."""
+    idx = np.flatnonzero(np.isclose(u_niveles, u))
+    if idx.size == 0:
+        raise ValueError(f"U_NIVELES no tiene el percentil {u}")
+    return int(idx[0])
+
+
+def nivel_regla(regla: str, precios: np.ndarray, dist, costo, m,
+                u_niveles: np.ndarray = U_NIVELES_ARR, margen: float = BE_MARGEN) -> np.ndarray:
+    """Nivel (índice en U_NIVELES) que cotiza una regla fija de precio.
+
+    precios : (..., K) USD/milla por nivel (`precios_niveles`).
+    dist, costo, m : broadcastables a precios.shape[:-1].
+    regla :
+      · "mediana"   — u = 0.5.
+      · "be_margen" — el nivel más bajo con precio ≥ break-even + margen; si ninguno llega, el último.
+      · "miope"     — argmax_k (1 − u_k)^m · (p_k · dist − costo): optimiza contra el mercado solo el
+                      tramo actual, sin mirar el futuro.
+    Devuelve (...,) int64.
+    """
+    precios = np.asarray(precios, dtype=np.float64)
+    forma = precios.shape[:-1]
+    dist = np.broadcast_to(np.asarray(dist, dtype=np.float64), forma)
+    costo = np.broadcast_to(np.asarray(costo, dtype=np.float64), forma)
+    if regla == "mediana":
+        return np.full(forma, indice_nivel(0.5, u_niveles), dtype=np.int64)
+    if regla == "be_margen":
+        piso = costo / np.maximum(dist, 1e-12) + margen
+        ok = precios >= piso[..., None]
+        return np.where(ok.any(axis=-1), ok.argmax(axis=-1), precios.shape[-1] - 1).astype(np.int64)
+    if regla == "miope":
+        m = np.broadcast_to(np.asarray(m, dtype=np.float64), forma)
+        valor = prob_ganar(u_niveles, m[..., None]) * (precios * dist[..., None] - costo[..., None])
+        return valor.argmax(axis=-1).astype(np.int64)
+    raise ValueError(f"regla de precio desconocida: {regla!r} (opciones: {REGLAS_PRECIO})")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Utilidades compartidas
+# ═════════════════════════════════════════════════════════════════════════════
 
 def lane_cost_row(distance_row: np.ndarray, diesel_row: np.ndarray) -> np.ndarray:
     """Costo en USD de recorrer cada lane saliente (misma fórmula que problem_data.lane_reward); sirve con (N,) o (N, N)."""
@@ -49,83 +151,4 @@ def percentil_historico(valor: float, serie: np.ndarray, cargas: np.ndarray = No
         ok &= np.asarray(cargas) > 0
     serie = serie[ok]
     return float("nan") if serie.size == 0 else 100.0 * float(np.mean(serie <= valor))
-
-
-def r_obs(rate_row, loads_row, distance_row, cost_row):
-    """Margen de recorrer cada lane saliente sin redondear: ingreso solo si hay carga, menos el costo. Admite (N,) o (B, N)."""
-    rate, dist = np.asarray(rate_row, dtype=np.float64), np.asarray(distance_row, dtype=np.float64)
-    ingreso = rate * dist if loads_row is None else np.where(np.asarray(loads_row) > 0, rate * dist, 0.0)
-    return ingreso - np.asarray(cost_row, dtype=np.float64)
-
-
-def q_values(rate_row, loads_row, distance_row, cost_row, S: float, v, start_node) -> np.ndarray:
-    """Q(s, a) = r_obs(a)/S + Ṽ(s, a) con Ṽ(s, casa) = 0. v, rate_row, ...: (N,) con start_node int, o (B, N) con (B,)."""
-    v = np.array(v, dtype=np.float64)
-    if v.ndim == 1:
-        v[start_node] = 0.0
-    else:
-        v[np.arange(v.shape[0]), np.asarray(start_node)] = 0.0
-    return r_obs(rate_row, loads_row, distance_row, cost_row) / S + v
-
-
-@dataclass
-class PrecioReserva:
-    """Resultado de reservation_price para la lane current_node → j (USD/milla; NaN donde no está definido)."""
-    p: float                 # promedio de p*_AB y p*_BA
-    p_ab: float
-    p_ba: float
-    p_min: float
-    p_max: float
-    break_even: float        # costo / dist
-    has_load: bool           # hay carga en la lane (el retorno a casa cotiza igual si trae carga)
-    only_option: bool        # j es la única acción factible (no hay alternativa)
-    alt_a: int = -1          # mejor alternativa según A (usada en p*_AB); -1 si no hay
-    alt_b: int = -1          # mejor alternativa según B (usada en p*_BA)
-
-    @property
-    def definido(self) -> bool:
-        return bool(np.isfinite(self.p))
-
-
-def reservation_price(
-    v_a:           np.ndarray,      # (N,) Ṽ de la cabeza A (unidades escaladas por 1/S)
-    v_b:           np.ndarray,      # (N,) Ṽ de la cabeza B
-    action_mask:   np.ndarray,      # (N,) 1 = acción válida desde el nodo actual
-    current_node:  int,
-    j:             int,
-    rate_row_obs:  np.ndarray,      # (N,) tarifa USD/milla observada al llegar a current_node
-    distance_row:  np.ndarray,      # (N,) distancia current_node → a
-    cost_row:      np.ndarray,      # (N,) costo de current_node → a (lane_cost_row)
-    start_node:    int,
-    S:             float,           # REWARD_SCALE_FACTOR
-    loads_row:     np.ndarray = None,   # (N,) cargas observadas; ingreso solo donde > 0 (None ⇒ todas con carga)
-) -> PrecioReserva:
-    """Precio de reserva de la lane current_node→j con las dos cabezas (ver el docstring del módulo).
-
-    El ingreso de cada alternativa sigue el entorno: tarifa × distancia solo si hay carga en esa lane; si no,
-    la acción cuesta el costo sin ingreso. El retorno a casa (start_node) es una alternativa más, con Ṽ = 0.
-    """
-    break_even = float(cost_row[j] / distance_row[j])
-    tiene_carga = loads_row is None or loads_row[j] > 0
-    nan = float("nan")
-    valid = np.asarray(action_mask).astype(bool).copy()
-    valid[current_node] = False
-    valid[j] = False
-    if not tiene_carga or not valid.any():
-        return PrecioReserva(nan, nan, nan, nan, nan, break_even, bool(tiene_carga), bool(tiene_carga) and not valid.any())
-
-    qa = q_values(rate_row_obs, loads_row, distance_row, cost_row, S, v_a, start_node)
-    qb = q_values(rate_row_obs, loads_row, distance_row, cost_row, S, v_b, start_node)
-    va, vb = np.array(v_a, dtype=np.float64), np.array(v_b, dtype=np.float64)
-    va[start_node] = vb[start_node] = 0.0
-    idx = np.where(valid)[0]
-    alt_a = int(idx[np.argmax(qa[idx])])        # A elige la alternativa …
-    alt_b = int(idx[np.argmax(qb[idx])])
-    p_ab = (S * (qb[alt_a] - vb[j]) + cost_row[j]) / distance_row[j]    # … y B la evalúa (Q_alt y Ṽ(s, j))
-    p_ba = (S * (qa[alt_b] - va[j]) + cost_row[j]) / distance_row[j]
-    return PrecioReserva(
-        p=float((p_ab + p_ba) / 2), p_ab=float(p_ab), p_ba=float(p_ba), p_min=float(min(p_ab, p_ba)),
-        p_max=float(max(p_ab, p_ba)), break_even=break_even, has_load=True, only_option=False,
-        alt_a=alt_a, alt_b=alt_b,
-    )
 

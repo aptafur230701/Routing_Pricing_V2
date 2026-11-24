@@ -1,8 +1,7 @@
 """
 test_fase2.py
 =============
-Selección del checkpoint por media móvil, LR coseno, diferencia pareada contra B3 en validación,
-y caché de baselines/cotas entre corridas.
+Selección del checkpoint por media móvil, LR coseno y caché de baselines/cotas entre corridas.
 """
 
 import math
@@ -87,29 +86,9 @@ def test_sin_lr_coseno_el_lr_es_constante(datos, monkeypatch, tmp_path):
     assert {e["lr_actor"] for e in log} == {PPO_LR}
 
 
-def test_validacion_reporta_diferencia_pareada_contra_b3(datos):
-    torch.manual_seed(0)
-    agent = AMRoutingAgent(num_nodes=N, d_h=32, n_heads=4, n_layers=1, d_ff=64, device=DEVICE)
-    d = datos
-    val = am_training.ValidacionSimulada(
-        d["market"], d["tm"], d["rate"][:TRAIN_DAYS], d["loads"][:TRAIN_DAYS], d["dist"], d["diesel"], N,
-        np.asarray(d["tm"], dtype=float), d["ltr"], d["p95"], d["avail"],
-        ev_esperado=calcular_ev_pronostico(d["market"], d["dist"], d["diesel"]),
-    )
-    for K, arr in val.b3_mundos.items():
-        assert arr.shape == (val.M,)
-        assert arr.mean() == pytest.approx(val.ref[K]["b3"])
-    out = val.evaluar(agent)
-    for K in val.niveles:
-        k = "free" if K is None else str(K)
-        if out["por_k"][k]["valid_rate"] == 1.0:           # margen = promedio de todos los mundos
-            assert out["por_k"][k]["dif_b3"] == pytest.approx(out["por_k"][k]["margen"] - val.ref[K]["b3"])
-        assert np.isfinite(out["por_k"][k]["dif_b3"])
-
-
 def test_cache_de_baselines_reproduce_el_calculo_directo(datos, tmp_path):
     d = datos
-    tabla = calcular_tabla(d["market"], d["tm"], d["dist"], d["diesel"], K=K_MAX, S=100)
+    tabla = calcular_tabla(d["market"], d["tm"], d["dist"], d["diesel"], K=K_MAX, S=20)
     torch.manual_seed(0)
     a1 = AMRoutingAgent(num_nodes=N, d_h=32, n_heads=4, n_layers=1, d_ff=64, device=torch.device("cpu"))
     a2 = AMRoutingAgent(num_nodes=N, d_h=32, n_heads=4, n_layers=1, d_ff=64, device=torch.device("cpu"))
@@ -125,7 +104,7 @@ def test_cache_de_baselines_reproduce_el_calculo_directo(datos, tmp_path):
         assert len(df) == len(directo)
         assert list(df["metodo"]) == list(directo["metodo"]) and list(df["mundo"]) == list(directo["mundo"])
     np.testing.assert_allclose(primero["margen"], directo["margen"])
-    no_drl = directo["metodo"] != "DRL"
+    no_drl = ~directo["metodo"].str.startswith("DRL")
     np.testing.assert_allclose(segundo.loc[no_drl, "margen"], directo.loc[no_drl, "margen"])
     np.testing.assert_allclose(segundo["ub_pi"], directo["ub_pi"])
     np.testing.assert_allclose(segundo["ub_dp"], directo["ub_dp"], equal_nan=True)

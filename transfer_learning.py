@@ -3,7 +3,7 @@ transfer_learning.py
 ====================
 Transfer learning estandarizado para la cadena de escalado:
 
-    10 → 20 → 35 → 50 → 75 → 100 nodos
+    10 → 20 → 50 → 75 → 100 nodos
 
 Por qué el transfer es siempre 100% en este modelo
 ---------------------------------------------------
@@ -44,7 +44,7 @@ from config import DEVICE
 # Secuencia canónica de escalado
 # ─────────────────────────────────────────────────────────────────────────────
 
-NODE_SEQUENCE = [10, 20, 35, 50, 75, 100]
+NODE_SEQUENCE = [10, 20, 50, 75, 100]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,6 +115,16 @@ def _reconcile_state_dict(target_sd: dict, source_sd: dict) -> tuple:
     return merged, transferred, skipped
 
 
+def _tiene_cabeza_de_precio(checkpoint: dict) -> bool:
+    return any(k.startswith("decoder.precio.") for k in checkpoint["agent"])
+
+
+def es_checkpoint_con_cotizacion(checkpoint_path: str) -> bool:
+    """True si el .pt existe y trae la cabeza de precio (modelo con cotización conjunta)."""
+    return os.path.exists(checkpoint_path) and _tiene_cabeza_de_precio(
+        torch.load(checkpoint_path, map_location="cpu"))
+
+
 def _instanciar_y_transferir(
     checkpoint_path: str,
     num_nodes:       int,
@@ -135,6 +145,13 @@ def _instanciar_y_transferir(
         raise FileNotFoundError(f"Checkpoint no encontrado: {checkpoint_path}")
 
     checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+    if not _tiene_cabeza_de_precio(checkpoint):
+        # Checkpoint de antes de la cotización (sin PriceHead): cargarlo dejaría la cabeza de precio aleatoria
+        # y las features nuevas en cero sin aviso, y el transfer o la evaluación usarían un modelo viejo.
+        raise ValueError(
+            f"{checkpoint_path} es anterior a la cotización conjunta (no trae decoder.precio). "
+            f"Bórralo o vuelve a entrenar ese tamaño."
+        )
 
     agent  = AMRoutingAgent(
         num_nodes=num_nodes, d_h=d_h, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff,
@@ -173,9 +190,6 @@ def load_checkpoint_compatible(
     agent, critic, checkpoint, transferred, skipped = _instanciar_y_transferir(
         checkpoint_path, num_nodes, d_h, n_heads, n_layers, d_ff,
     )
-    # ¿las cabezas Ṽ del checkpoint están entrenadas? (si no, p* no tiene sentido)
-    agent.post_entrenadas = bool(agent.has_post_heads) and any(k.startswith("post_value_a.") for k in checkpoint["agent"]) \
-        and any(k.startswith("post_value_b.") for k in checkpoint["agent"])
 
     if verbose:
         total = len(transferred) + len(skipped)
@@ -185,20 +199,6 @@ def load_checkpoint_compatible(
         print(f" — omitidos: {skipped}" if skipped else " ✓")
 
     return agent, critic
-
-
-def checkpoint_tiene_post_head(checkpoint_path: str) -> bool:
-    """True si el checkpoint trae los pesos de las dos cabezas de valor post-decisión (post_value_a/b).
-
-    Los checkpoints del PPO no las traen: las agrega post_training.py en un checkpoint nuevo
-    (am_checkpoint_<N>nodes_pricing.pt). Al cargar uno sin ellas las cabezas arrancan sin entrenar
-    (_reconcile_state_dict omite lo que falta) y p* no tendría sentido.
-    """
-    if not os.path.exists(checkpoint_path):
-        return False
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    return (any(k.startswith("post_value_a.") for k in ckpt["agent"])
-            and any(k.startswith("post_value_b.") for k in ckpt["agent"]))
 
 
 def get_source_checkpoint(base_dir: str, target_num_nodes: int) -> str | None:

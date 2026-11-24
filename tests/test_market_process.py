@@ -5,13 +5,12 @@ Pruebas del generador de realizaciones diarias (metodologia_realizaciones_mercad
 del índice de mercado por nodo (proceso_exogeno_cargas_tarifas.md, conservado):
 
   · misma semilla y mismos parámetros ⇒ misma salida (cargas, tarifas, δ e índice)
-  · la salida no cambia con las acciones del agente
+  · la salida no cambia con las acciones del agente (el entorno ve el tablero puro de cada terna)
   · un mismo (nodo, día) da el mismo índice desde el entorno, sample_world e indice_mundo
   · tarifas dentro del rango de cuantiles del día usado (el propio o el día más cercano con cargas)
   · las cargas son las del generador actual (misma terna ⇒ mismas cargas)
   · formas, tipos y tarifa positiva en todas las lanes
-  · con market_process=None el entorno reproduce las recompensas de siempre
-  · la función de recompensa compartida coincide con rm_pen_stack
+  · la función de recompensa compartida es la fórmula de siempre
   · media y proporción de ceros simuladas ≈ histórico en cada grupo de volumen
   · con DIAS_EXCLUIDOS vacía el ajuste usa todos los días de la matriz
   · smoke de entrenamiento con market_process
@@ -30,9 +29,9 @@ from config import (
 )
 from fit_market_process import ajustar, dia_de_semana, params_path
 from market_process import MarketProcess, asegurar_parametros, _CLAVES_AJUSTE
-from problem_data import load_matrices, build_rm_pen_stack, build_day_matrices, lane_reward, cargar_dias_mercado
+from problem_data import load_matrices, lane_reward, cargar_dias_mercado
 import routing_env
-from routing_env import RoutingEnv, VectorRoutingEnv
+from routing_env import VectorRoutingEnv
 
 NUM_NODES = 10
 
@@ -55,22 +54,19 @@ def mp():
     return MarketProcess(NUM_NODES)
 
 
-def _scalar_env(data, market_process=None):
-    return RoutingEnv(
-        data["time_matrix"], data["rate_stack"], data["loads_stack"],
-        data["distance_arr"], data["diesel_arr"], NUM_NODES, MAX_DURATION,
-        market_process=market_process,
-    )
+def _vector_env(data, market_process):
+    return VectorRoutingEnv(data["time_matrix"], NUM_NODES, data["distance_arr"], data["diesel_arr"], TRAIN_DAYS,
+                            max_duration=MAX_DURATION, market_process=market_process)
 
 
-def _vector_env(data, market_process=None, rm_pen_stack=None):
-    return VectorRoutingEnv(
-        time_matrix=data["time_matrix"], rate_stack=data["rate_stack"],
-        loads_stack=data["loads_stack"], rm_pen_stack=rm_pen_stack,
-        num_nodes=NUM_NODES, max_duration=MAX_DURATION,
-        market_process=market_process,
-        distance_arr=data["distance_arr"], diesel_arr=data["diesel_arr"],
-    )
+def _azar(env, active, rng):
+    """(destino, opción) al azar entre las opciones válidas de cada fila activa (las inactivas: lo que sea)."""
+    B = len(active)
+    acts, opc = np.zeros(B, dtype=np.int64), np.zeros(B, dtype=np.int64)
+    for b in np.flatnonzero(active):
+        pares = np.argwhere(env.opciones_validas[b])
+        acts[b], opc[b] = pares[rng.randint(len(pares))]
+    return acts, opc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,28 +101,28 @@ def test_sorteo_por_mundo_no_depende_del_lote(mp):
 
 
 def _correr_politica(env, mp, seed_politica, world_seeds, starts, days):
-    """Corre una política aleatoria y devuelve {(b, nodo, día): (loads_row, rate_row)} observados."""
+    """Corre una política aleatoria y devuelve {(b, nodo, día): (loads_row, precios_row)} observados."""
     B = len(starts)
     rng = np.random.RandomState(seed_politica)
-    masks = env.reset(starts, days, world_seeds=world_seeds)
+    env.reset(starts, days, world_seeds=world_seeds)
     vistos = {}
     active = np.ones(B, dtype=bool)
 
-    def registrar():
-        for b in np.where(active)[0]:
+    def registrar(llegaron):
+        # Solo al llegar a un nodo: tras un rechazo el tablero es el del día de llegada, aunque la hora avance.
+        for b in np.where(active & llegaron)[0]:
             dia = int(env._start_day_idx[b]) + int(env.time_elapsed[b] // 14)
             vistos[(b, int(env.current_node[b]), dia)] = (
-                env.current_loads_row[b].copy(), env.current_rate_row[b].copy(),
+                env.current_loads_row[b].copy(), env.precios_row[b].copy(),
             )
 
-    registrar()
-    for _ in range(NUM_NODES):
+    registrar(np.ones(B, dtype=bool))
+    for _ in range(env.max_steps):
         if not active.any():
             break
-        actions = np.array([rng.choice(np.where(m == 1)[0]) for m in masks])
-        _, terminated, masks = env.step(actions)
+        _, terminated, _ = env.step(*_azar(env, active, rng))
         active &= ~terminated
-        registrar()
+        registrar(~(env.last_cotizo & ~env.last_gano))
     return vistos
 
 
@@ -141,7 +137,7 @@ def test_salida_no_cambia_con_las_acciones_del_agente(data, mp):
     vistos_b = _correr_politica(_vector_env(data, mp), mp, 2, seeds, starts, days)
 
     # Dos políticas distintas recorren rutas distintas, pero donde coinciden en
-    # (episodio, nodo, día) ven exactamente las mismas cargas y tarifas...
+    # (episodio, nodo, día) ven exactamente el mismo tablero...
     comunes = set(vistos_a) & set(vistos_b)
     assert len(comunes) >= B   # al menos el nodo de inicio de cada episodio
     for k in comunes:
@@ -149,18 +145,19 @@ def test_salida_no_cambia_con_las_acciones_del_agente(data, mp):
         assert np.array_equal(vistos_a[k][1], vistos_b[k][1])
     assert set(vistos_a) != set(vistos_b)   # (y sí tomaron decisiones distintas)
 
-    # ... y todo lo observado es el sorteo puro del proceso para esa terna.
-    for (b, nodo, dia), (l, r) in {**vistos_a, **vistos_b}.items():
-        l_ref, r_ref = mp.sample_arrivals_por_mundo([nodo], [dia], [seeds[b]])
-        assert np.array_equal(l, l_ref[0]) and np.array_equal(r, r_ref[0])
+    # ... y todo lo observado es el tablero puro del proceso para esa terna (el día recortado a train).
+    for (b, nodo, dia), (l, p) in {**vistos_a, **vistos_b}.items():
+        t = mp.tablero_por_mundo([nodo], [min(dia, TRAIN_DAYS - 1)], [seeds[b]])
+        assert np.array_equal(l, t.loads[0]) and np.array_equal(p, t.precios[0])
 
 
-def test_entorno_ve_el_mismo_mundo_que_sample_world(data, mp):
-    w_loads, w_rate = mp.sample_world(99, 8, dia_inicial=3)
-    env = _scalar_env(data, mp)
-    env.reset(seed=0, options={"start_node": 2, "start_day_idx": 3, "world_seed": 99})
-    assert np.array_equal(env.current_loads_row, w_loads[0, 2])
-    assert np.allclose(env.current_rate_row, w_rate[0, 2])
+def test_entorno_ve_el_mismo_mundo_que_mundo_cotizacion(data, mp):
+    t = mp.mundo_cotizacion(99, 8, dia_inicial=3)
+    env = _vector_env(data, mp)
+    env.reset(np.array([2]), np.array([3]), world_seeds=np.array([99]))
+    assert np.array_equal(env.current_loads_row[0], t.loads[0, 2])
+    assert np.allclose(env.precios_row[0], t.precios[0, 2])
+    assert np.allclose(env.u_comp_row[0], t.u_comp[0, 2])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,150 +211,27 @@ def test_dia_de_semana_desde_fecha_inicio():
     assert np.array_equal(dia_de_semana(dias, FECHA_INICIO), esperado)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entorno: market_process=None reproduce lo de siempre
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Recompensas capturadas con los datos actuales (jun-oct 2026, datos/datos_finales_jun_oct_2026) y los
-# tiempos de viaje de datos/duration.csv, con la política fija indicada y NUM_NODES = 10:
-# (start_node, start_day_idx, k_max, acciones, recompensas). Si los CSV diarios o duration.csv cambian,
-# hay que recapturarlas con ese entorno.
-RUTAS_REFERENCIA = [
-    (3, 7,  None, [4, 3],       [3.14, 9.286158821570913]),
-    (0, 0,  5,    [1, 0],       [-2.38, 15.605254567221621]),
-    (8, 40, None, [1, 8],       [-18.36, 8.192876498008625]),
-    (5, 89, 5,    [3, 5],       [-2.07, 15.662161752486055]),
-]
-
-
-@pytest.fixture
-def con_shaping(monkeypatch):
-    """Las referencias de arriba se capturaron con el bono de retorno (USE_REWARD_SHAPING = True)."""
-    monkeypatch.setattr(routing_env, "USE_REWARD_SHAPING", True)
-
-
-@pytest.mark.parametrize("start,day,k,acciones,esperadas", RUTAS_REFERENCIA)
-def test_market_none_reproduce_recompensas_de_antes(con_shaping, data, start, day, k, acciones, esperadas):
-    env = _scalar_env(data, market_process=None)
-    env.reset(seed=0, options={"start_node": start, "start_day_idx": day, "k_max": k})
-    rewards = [env.step(a)[1] for a in acciones]
-    assert rewards == pytest.approx(esperadas, abs=1e-9)
-
-
-@pytest.mark.parametrize("start,day,k,acciones,esperadas", RUTAS_REFERENCIA)
-def test_vector_env_market_none_coincide_con_referencia(con_shaping, data, start, day, k, acciones, esperadas):
-    rm_pen = build_rm_pen_stack(data["rate_stack"], data["loads_stack"],
-                                data["distance_arr"], data["diesel_arr"])
-    env = _vector_env(data, None, rm_pen)
-    env.reset(np.array([start]), np.array([day]), k_max_arr=[k])
-    rewards = [float(env.step(np.array([a]))[0][0]) for a in acciones]
-    assert rewards == pytest.approx(esperadas, abs=1e-5)   # float32
-
-
-@pytest.mark.parametrize("start,day,k,acciones,esperadas", RUTAS_REFERENCIA)
-def test_sin_shaping_el_retorno_exitoso_es_solo_margen(monkeypatch, data, start, day, k, acciones, esperadas):
-    """USE_REWARD_SHAPING = False: el último paso (retorno a casa, a tiempo) no suma bono alguno:
-    recompensa = lane / REWARD_SCALE_FACTOR, tanto en RoutingEnv como en VectorRoutingEnv."""
-    rm_pen = build_rm_pen_stack(data["rate_stack"], data["loads_stack"],
-                                data["distance_arr"], data["diesel_arr"])
-    monkeypatch.setattr(routing_env, "USE_REWARD_SHAPING", False)
-    env = _scalar_env(data, market_process=None)
-    env.reset(seed=0, options={"start_node": start, "start_day_idx": day, "k_max": k})
-    venv = _vector_env(data, None, rm_pen)
-    venv.reset(np.array([start]), np.array([day]), k_max_arr=[k])
-    for a in acciones:
-        i, d = env.current_node, env.current_day_idx
-        r_lane = float(rm_pen[d, i, a]) / REWARD_SCALE_FACTOR
-        r = env.step(a)[1]
-        rv = float(venv.step(np.array([a]))[0][0])
-        assert r == pytest.approx(r_lane, abs=1e-9)
-        assert rv == pytest.approx(r_lane, abs=1e-5)
-
-
-def test_lane_reward_coincide_con_rm_pen_stack(data):
-    rm_pen = build_rm_pen_stack(data["rate_stack"], data["loads_stack"],
-                                data["distance_arr"], data["diesel_arr"])
-    for d in (0, 17, 89):
-        for i in (0, 4, 9):
-            fila = lane_reward(
-                data["rate_stack"][d, i], data["loads_stack"][d, i],
-                data["distance_arr"][i], data["diesel_arr"][i],
-            ).astype(np.float32)
-            fila[i] = BIG_M_PENALTY
-            assert np.array_equal(fila, rm_pen[d, i])
-    # y build_day_matrices (que ahora la llama) sigue dando lo mismo que la fórmula original
-    d = 5
-    rev = data["rate_stack"][d] * data["distance_arr"]
-    rev[data["loads_stack"][d] <= 0] = 0
+def test_lane_reward_es_la_formula_de_siempre(data):
     from config import MPG, MARGINAL_COST_SIN_DIESEL
-    cost = data["distance_arr"] * (data["diesel_arr"] / MPG) + data["distance_arr"] * MARGINAL_COST_SIN_DIESEL
-    assert np.array_equal(build_day_matrices(
-        data["rate_stack"][d], data["loads_stack"][d], data["distance_arr"], data["diesel_arr"])[0],
-        np.round(rev - cost, 0))
+    for d in (0, 5, 89):
+        rev = data["rate_stack"][d] * data["distance_arr"]
+        rev[data["loads_stack"][d] <= 0] = 0
+        cost = data["distance_arr"] * (data["diesel_arr"] / MPG) + data["distance_arr"] * MARGINAL_COST_SIN_DIESEL
+        assert np.array_equal(
+            lane_reward(data["rate_stack"][d], data["loads_stack"][d], data["distance_arr"], data["diesel_arr"]),
+            np.round(rev - cost, 0))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entorno con market_process
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_mascara_y_recompensa_usan_las_filas_sorteadas(data, mp):
-    env = _scalar_env(data, mp)
-    _, info = env.reset(seed=0, options={"start_node": 1, "start_day_idx": 10, "world_seed": 5})
-    rng = np.random.RandomState(0)
-    for _ in range(30):
-        mask = info["action_mask"]
-        nodo_actual = env.current_node
-        loads, rates = env.current_loads_row, env.current_rate_row
-        if nodo_actual != env.start_node:
-            # lanes sin carga ⇒ fuera de la máscara (salvo el retorno al depot)
-            sin_carga = (loads == 0)
-            sin_carga[env.start_node] = False
-            assert np.all(mask[sin_carga] == 0)
-        accion = int(rng.choice(np.where(mask == 1)[0]))
-        esperado = lane_reward(
-            rates[accion], loads[accion],
-            data["distance_arr"][nodo_actual, accion], data["diesel_arr"][nodo_actual, accion],
-        ) / REWARD_SCALE_FACTOR
-        _, r, term, _, info = env.step(accion)
-        if not term:
-            assert r == pytest.approx(float(esperado), abs=1e-6)   # sin bono/penalización terminal
-        else:
-            break
-
-
-def test_escalar_y_vectorial_coinciden_con_el_mismo_mundo(data, mp):
-    starts = np.array([0, 3, 7]); days = np.array([4, 50, 88]); seeds = np.array([11, 22, 33])
-    venv = _vector_env(data, mp)
-    masks = venv.reset(starts, days, world_seeds=seeds)
-    senvs = []
-    for b in range(3):
-        e = _scalar_env(data, mp)
-        e.reset(seed=0, options={"start_node": int(starts[b]), "start_day_idx": int(days[b]),
-                                 "world_seed": int(seeds[b])})
-        senvs.append(e)
-    activos = [True] * 3
-    rng = np.random.RandomState(3)
-    for _ in range(NUM_NODES):
-        acts = np.array([rng.choice(np.where(m == 1)[0]) for m in masks])
-        rewards, term, masks = venv.step(acts)
-        for b in range(3):
-            if not activos[b]:
-                continue
-            _, r, t, _, info = senvs[b].step(int(acts[b]))
-            assert r == pytest.approx(float(rewards[b]), abs=1e-5)
-            assert t == bool(term[b])
-            if t:
-                activos[b] = False
-        if not any(activos):
-            break
-
-
-def test_rewards_row_vectorial_es_la_fila_observada(data, mp):
+def test_rewards_row_vectorial_es_el_margen_a_la_mediana(data, mp):
     venv = _vector_env(data, mp)
     venv.reset(np.array([2, 6]), np.array([0, 30]), world_seeds=np.array([1, 2]))
     for b, nodo in enumerate((2, 6)):
         esperado = lane_reward(
-            venv.current_rate_row[b], venv.current_loads_row[b],
+            venv.rate_row_obs[b], venv.current_loads_row[b],
             data["distance_arr"][nodo], data["diesel_arr"][nodo],
         ).astype(np.float32)
         esperado[nodo] = BIG_M_PENALTY
@@ -447,25 +321,19 @@ def test_indice_coincide_entre_entorno_sample_world_e_indice_mundo(data, mp):
     _, _, ind_w = mp.sample_world(semilla, 8, dia_inicial=dia0, devolver_indice=True)      # (8, N)
     for d in range(8):
         assert np.array_equal(ind_w[d], mp.indice_mundo(semilla, dia0 + d))
-    # entorno escalar y vectorial: mismo índice en el día de salida y en los días siguientes
-    senv = _scalar_env(data, mp)
-    senv.reset(seed=0, options={"start_node": 2, "start_day_idx": dia0, "world_seed": semilla})
     venv = _vector_env(data, mp)
     venv.reset(np.array([2]), np.array([dia0]), world_seeds=np.array([semilla]))
-    assert np.array_equal(senv.market_index, ind_w[0]) and np.array_equal(venv.market_index[0], ind_w[0])
-    assert senv.index_std == venv.index_std == mp.indice_std
+    assert np.array_equal(venv.market_index[0], ind_w[0])
+    assert venv.index_std == mp.indice_std
     # y tras avanzar el tiempo (días de mercado de 14 h), con acciones válidas hasta que termine el episodio
     rng = np.random.RandomState(0)
-    mask = senv._get_action_mask()
-    for _ in range(NUM_NODES):
-        destino = int(rng.choice(np.where(mask == 1)[0]))
-        _, _, terminado, _, info = senv.step(destino)
-        _, _, masks = venv.step(np.array([destino]))
-        if terminado:
+    activo = np.ones(1, dtype=bool)
+    for _ in range(venv.max_steps):
+        _, term, _ = venv.step(*_azar(venv, activo, rng))
+        if term[0]:
             break
-        d = int(senv.time_elapsed // 14)
-        assert np.array_equal(senv.market_index, ind_w[d]) and np.array_equal(venv.market_index[0], ind_w[d])
-        mask = info["action_mask"]
+        d = int(venv.time_elapsed[0] // 14)
+        assert np.array_equal(venv.market_index[0], ind_w[d])
 
 
 def test_indice_del_entorno_no_depende_de_las_acciones(data, mp):
@@ -476,17 +344,16 @@ def test_indice_del_entorno_no_depende_de_las_acciones(data, mp):
     seeds = rng.randint(0, 2**31 - 1, B)
     for politica in (1, 2):
         env = _vector_env(data, mp)
-        masks = env.reset(starts, days, world_seeds=seeds)
+        env.reset(starts, days, world_seeds=seeds)
         r = np.random.RandomState(politica)
         activos = np.ones(B, dtype=bool)
-        for _ in range(NUM_NODES):
+        for _ in range(env.max_steps):
             if not activos.any():
                 break
             for b in np.where(activos)[0]:
-                dia = int(env._start_day_idx[b]) + int(env.time_elapsed[b] // 14)
+                dia = min(int(env._start_day_idx[b]) + int(env.time_elapsed[b] // 14), TRAIN_DAYS - 1)
                 assert np.array_equal(env.market_index[b], mp.indice_mundo(int(seeds[b]), dia))
-            acts = np.array([r.choice(np.where(m == 1)[0]) for m in masks])
-            _, term, masks = env.step(acts)
+            _, term, _ = env.step(*_azar(env, activos, r))
             activos &= ~term
 
 

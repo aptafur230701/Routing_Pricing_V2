@@ -3,10 +3,10 @@ test_revisit.py
 ===============
 El camión puede volver a pasar por un nodo intermedio dentro del tour. Pruebas de lo que cambia:
 
-  · La máscara permite un intermedio ya recorrido, con el mismo resultado en RoutingEnv y en
-    VectorRoutingEnv; el self-loop, el retorno y el retorno forzado por K siguen igual.
-  · max_pasos acota la longitud de los episodios (reales y sintéticos) y hay episodios más largos
-    que N (se revisita).
+  · La máscara del entorno con cotización permite un intermedio ya recorrido; el self-loop, el
+    retorno y el retorno forzado por K siguen igual.
+  · max_pasos acota los arcos de los episodios (reales y sintéticos), max_pasos_cotizacion los pasos
+    (rechazos incluidos), y hay episodios con más arcos que N (se revisita).
   · UB-PI (DP hacia atrás) coincide con una enumeración por fuerza bruta de todas las rutas,
     con revisitas, en mundos pequeños (N = 5 o 6, K = 4 y caso libre), y es cota del valor de
     cada ruta evaluada con tiempos exactos y el día real de cada salida.
@@ -16,15 +16,17 @@ El camión puede volver a pasar por un nodo intermedio dentro del tour. Pruebas 
 import numpy as np
 import pytest
 
-from baselines.politicas import Observacion, PoliticaB2
+from baselines.politicas import Observacion, PoliticaB2, valor_inmediato
 from config import MAX_DURATION
 from market_process import MarketProcess, asegurar_parametros
-from problem_data import build_rm_pen_stack, lane_reward, load_matrices
-from routing_env import RoutingEnv, VectorRoutingEnv, max_pasos
+from pricing import N_NIVELES, U_NIVELES_ARR
+from problem_data import lane_reward, load_matrices
+from routing_env import OPCION_VACIO, VectorRoutingEnv, max_pasos, max_pasos_cotizacion
 from baselines.ub_pi import solve_ub_pi
+from mercado_sintetico import MercadoSintetico
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Máscara con revisitas: RoutingEnv == VectorRoutingEnv
+# Máscara con revisitas
 # ─────────────────────────────────────────────────────────────────────────────
 
 N = 5
@@ -38,66 +40,64 @@ def sintetico():
     dist = np.full((N, N), 100.0)
     np.fill_diagonal(dist, 0.0)
     diesel = np.full((N, N), 3.0)
-    rate = np.full((3, N, N), 3.0)
-    loads = np.full((3, N, N), 5.0)
-    return dict(T=T, dist=dist, diesel=diesel, rate=rate, loads=loads,
-                rm=build_rm_pen_stack(rate, loads, dist, diesel))
+    loads = np.full((N, N), 5)
+    np.fill_diagonal(loads, 0)
+    return dict(T=T, dist=dist, diesel=diesel, mercado=MercadoSintetico(loads, np.full((N, N), 3.0)))
 
 
-def _envs(d, k_max=None):
-    esc = RoutingEnv(d["T"], d["rate"], d["loads"], d["dist"], d["diesel"], N, max_duration=MAX_SYN)
-    _, info = esc.reset(options={"start_node": 0, "start_day_idx": 0, "k_max": k_max})
-    vec = VectorRoutingEnv(d["T"], d["rate"], d["loads"], d["rm"], N, max_duration=MAX_SYN)
-    masks = vec.reset(np.array([0]), np.array([0]), k_max_arr=[k_max])
-    return esc, info["action_mask"], vec, masks[0]
+def _env(d):
+    return VectorRoutingEnv(d["T"], N, d["dist"], d["diesel"], 3, max_duration=MAX_SYN, market_process=d["mercado"])
 
 
-def test_mascara_permite_un_intermedio_ya_visitado_en_ambos_entornos(sintetico):
-    esc, m_esc, vec, m_vec = _envs(sintetico)
-    assert (m_esc == m_vec).all() and m_esc[0] == 0               # primer paso: self-loop en casa enmascarado
+def _paso(env, a):
+    """Viaja a `a` cotizando el nivel 0 (gana siempre)."""
+    return env.step(np.array([a]), np.array([0]))
+
+
+def test_mascara_permite_un_intermedio_ya_visitado(sintetico):
+    env = _env(sintetico)
+    m = env.reset(np.array([0]), np.array([0]), world_seeds=np.array([1]))[0]
+    assert m[0] == 0                                               # primer paso: self-loop en casa enmascarado
     for a in (1, 2, 1, 3):                                         # 1 se recorre dos veces
-        _, r_esc, term_esc, _, info = esc.step(a)
-        r_vec, term_vec, m = vec.step(np.array([a]))
-        m_esc, m_vec = info["action_mask"], m[0]
-        assert (m_esc == m_vec).all()
-        assert r_esc == pytest.approx(float(r_vec[0]))
-        assert not term_esc and not term_vec[0]
-        assert m_esc[a] == 0                                       # self-loop siempre enmascarado
-        assert m_esc[0] == 1                                       # el retorno a casa siempre disponible
+        r, term, masks = _paso(env, a)
+        m = masks[0]
+        assert not term[0] and env.last_gano[0]
+        assert m[a] == 0                                           # self-loop siempre enmascarado
+        assert m[0] == 1                                           # el retorno a casa siempre disponible
         if a == 2:
-            assert m_esc[1] == 1                                   # 1 ya fue recorrido y sigue disponible
-    _, _, term, _, _ = esc.step(0)                                 # volver a casa termina el episodio
-    _, term_vec, _ = vec.step(np.array([0]))
-    assert term and term_vec[0]
+            assert m[1] == 1                                       # 1 ya fue recorrido y sigue disponible
+    _, term, _ = _paso(env, 0)                                     # volver a casa termina el episodio
+    assert term[0]
 
 
 def test_retorno_forzado_por_k_con_revisita(sintetico):
-    esc, m_esc, vec, m_vec = _envs(sintetico, k_max=4)
+    env = _env(sintetico)
+    env.reset(np.array([0]), np.array([0]), k_max_arr=[4], world_seeds=np.array([1]))
     for a in (1, 2, 1):                                            # 0→1→2→1: queda un arco
-        _, _, _, _, info = esc.step(a)
-        _, _, m = vec.step(np.array([a]))
-    assert (info["action_mask"] == m[0]).all()
-    assert info["action_mask"].tolist() == [1, 0, 0, 0, 0]         # solo el retorno
-    assert esc.k_remaining == 1 and vec.k_remaining[0] == 1
+        _, _, m = _paso(env, a)
+    assert m[0].tolist() == [1, 0, 0, 0, 0]                        # solo el retorno
+    assert env.k_remaining[0] == 1
 
 
 def test_max_pasos_acota_los_episodios_y_hay_episodios_con_mas_de_n_pasos(sintetico):
     d = sintetico
     B = 400
-    vec = VectorRoutingEnv(d["T"], d["rate"], d["loads"], d["rm"], N, max_duration=MAX_SYN)
-    assert vec.max_steps == max_pasos(d["T"], MAX_SYN) == 31
+    env = _env(d)
+    assert max_pasos(d["T"], MAX_SYN) == 31
+    assert env.max_steps == max_pasos_cotizacion(d["T"], MAX_SYN) == 31 * 3
     rng = np.random.default_rng(0)
-    masks = vec.reset(rng.integers(0, N, size=B), np.zeros(B, dtype=np.int64))
+    env.reset(rng.integers(0, N, size=B), np.zeros(B, dtype=np.int64), world_seeds=np.arange(B))
     active = np.ones(B, dtype=bool)
-    for _ in range(vec.max_steps):
+    for _ in range(env.max_steps):
         if not active.any():
             break
-        acc = np.array([rng.choice(np.flatnonzero(m)) for m in masks])
-        _, term, masks = vec.step(acc)
+        pares = [np.argwhere(o) for o in env.opciones_validas]
+        acc = np.array([p[rng.integers(len(p))] if len(p) else (0, OPCION_VACIO) for p in pares])
+        _, term, _ = env.step(acc[:, 0], acc[:, 1])
         active &= ~term
     assert not active.any()
-    assert vec.step_count.max() > N                                # solo es posible si se revisitan nodos
-    assert vec.step_count.max() <= vec.max_steps
+    assert env.step_count.max() > N                                # solo es posible si se revisitan nodos
+    assert env.step_count.max() <= max_pasos(d["T"], MAX_SYN)
 
 
 def test_max_pasos_con_datos_reales():
@@ -329,9 +329,15 @@ def test_b2_elige_el_primer_arco_de_la_enumeracion_ingenua(b2_chico):
         mascara[i] = 0
         loads_row = rng.integers(0, 4, size=n).astype(float)
         rate_row = rng.uniform(1.5, 3.0, size=n)
+        opciones = np.zeros((n, N_NIVELES + 1), dtype=bool)
+        opciones[:, :N_NIVELES] = (loads_row > 0)[:, None]
+        opciones[:, OPCION_VACIO] = loads_row == 0
+        opciones[i] = False
         obs = Observacion(nodo=i, casa=h, tiempo=t, k_restante=k, mascara=mascara,
-                          loads_row=loads_row, rate_row=rate_row, dia_semana_salida=dow0)
-        r = lane_reward(rate_row, loads_row, b2_chico["dist"][i], b2_chico["diesel"][i])
+                          loads_row=loads_row, rate_row=rate_row,
+                          precios=rate_row[:, None] * (0.8 + 0.5 * U_NIVELES_ARR), m=float(rng.uniform(1, 5)),
+                          opciones=opciones, dia_semana_salida=dow0)
+        r = valor_inmediato(obs, b2_chico["dist"], b2_chico["diesel"])
         mejor, mejor_a = -np.inf, -1
         for a in np.flatnonzero(mascara):
             if a == h:

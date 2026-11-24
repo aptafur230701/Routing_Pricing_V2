@@ -10,7 +10,8 @@ Cada episodio recorre días reales consecutivos (por ejemplo 15 → 16 → 17). 
 | --- | --- | --- |
 | Orden de los días | Real y cronológico | No varía |
 | Número de cargas (load availability) | Binomial negativa con media igual a las cargas esperadas ese día (media de los días vecinos), en vez de `count_loads` del día real | Dispersión observada en los datos |
-| Precio de cada oferta | Sorteado dentro de los cuantiles de ese día y esa lane | Distribución real de precios del día |
+| Precios de la lane | Cuantiles reales de ese día y esa lane (los niveles que puede cotizar el agente) | Distribución real de precios del día |
+| Mejor competidor | Percentil sorteado con la competencia del hub de origen (Paso 4b, punto 4) | L/T del hub: menos camiones por carga, menos competencia |
 | Load to truck ratio | Recalculado por hub de origen con las cargas sorteadas y los camiones del día real | Sigue a las cargas |
 | Nivel nacional de precios | Corrimiento δ, fijo durante el episodio | Variación diaria real del mercado |
 
@@ -198,6 +199,27 @@ Ejemplo: un hub tuvo 1,200 cargas en sus lanes de salida y L/T = 30, es decir, 4
 - **Por qué así.** Si el L/T quedara fijo mientras las cargas cambian, el agente vería señales contradictorias, por ejemplo muchas cargas con un mercado igual de holgado. Recalcularlo mantiene la relación real entre cargas y camiones sin agregar parámetros: toda la aleatoriedad del lado de la oferta sigue viniendo de la binomial negativa.
 - **Por qué no se usa la columna `trucks`.** Esa columna es `count_loads` / `load_to_truck_ratio` lane por lane, es decir, un reparto del L/T del hub, no un conteo independiente. La fórmula de proporción da el mismo resultado sin depender de ella y funciona aunque `trucks` esté vacía.
 
+**4. Competencia: el mejor competidor de cada lane.**
+
+El agente no acepta un precio dado: cotiza uno de 10 niveles comunes a todas las lanes, en escala de percentiles (u = 0, 0.1, …, 0.9). El precio de cada nivel sale de la misma interpolación del punto 2, F⁻¹(u) · e^δ, con los cuantiles de ese día y esa lane. El agente gana la carga si su percentil queda por debajo del de su mejor competidor, u_comp:
+
+$$
+u_{comp} = 1 - (1 - U)^{1/m_c}, \qquad P(\text{ganar con el nivel } u) = (1 - u)^{m_c}
+$$
+
+U es el mismo número uniforme del punto 2, y m_c es el número de competidores efectivos del hub de origen:
+
+$$
+m_c = \text{clip}\left(1 + \kappa \, \frac{LTR_{ref}}{LTR_{d,o}}, \; 1, \; M_{max}\right)
+$$
+
+LTR_ref es la mediana del L/T por hub y día en los días de entrenamiento, y κ = 1.
+
+- **Por qué así.** El mejor de m_c competidores que cotizan al azar dentro de la distribución del día tiene percentil Beta(1, m_c), y la inversa de esa distribución es la fórmula de u_comp. Un hub con L/T bajo (pocas cargas por camión) tiene más competencia, y un hub tensionado (L/T alto) tiene menos.
+- **Por qué con el mismo U.** Con m_c = 1 el competidor cotiza exactamente la tarifa sorteada del punto 2, así que el mercado sin competencia adicional es el de siempre.
+- **Supuesto que se declara.** No hay datos de cargas ganadas y perdidas, así que la aceptación es un modelo: κ fija cuánto pesa el L/T. Por eso la tesis reporta la sensibilidad a κ ∈ {0.5, 1, 2}.
+- **Mismo competidor para todos los métodos.** u_comp se sortea con la semilla del episodio, así que el DRL y los baselines enfrentan el mismo competidor en cada lane y cada día (números aleatorios comunes).
+
 ### Pseudocódigo del generador
 
 ```python
@@ -217,9 +239,11 @@ def realizacion(dia, hub, delta):
             k = r_de(lane)                          # r global o del grupo de volumen
             n = np.random.negative_binomial(k, k / (k + mu))
         d_p = dia_con_cargas_mas_cercano(dia, lane) # cuantiles reales, no imputados
-        u = np.random.rand(n)
-        precios = interp_cuantiles(cuantiles[d_p, lane], u) * np.exp(delta)
-        ofertas += [(lane, p) for p in precios]
+        U = np.random.rand()
+        tarifa = interp_cuantiles(cuantiles[d_p, lane], U) * np.exp(delta)
+        u_comp = 1 - (1 - U) ** (1 / m_comp(LT[dia, hub]))      # mejor competidor (punto 4)
+        precios_niveles = interp_cuantiles(cuantiles[d_p, lane], U_NIVELES) * np.exp(delta)
+        ofertas += [(lane, n, tarifa, precios_niveles, u_comp)]
         n_hub, c_hub = n_hub + n, c_hub + count_loads[dia, lane]
     lt = LT[dia, hub] * n_hub / c_hub if c_hub > 0 else LT[dia, hub]
     return ofertas, lt
@@ -227,29 +251,30 @@ def realizacion(dia, hub, delta):
 
 ## Paso 5. Integración con el MDP
 
-El generador es la parte exógena del MDP: describe cómo está el mercado cada día, y el agente no lo controla. Ubicación del camión, decisiones y recompensas siguen las reglas del MDP de aceptación de cargas.
+El generador es la parte exógena del MDP: describe cómo está el mercado cada día, y el agente no lo controla. Ubicación del camión, decisiones y recompensas siguen las reglas del MDP de ruteo con cotización.
 
 Cada episodio sigue este ciclo, que se repite cada día real hasta completar H días:
 
 1. **Inicio del episodio:** hub al azar, día real al azar y δ fijo.
-2. **Realización del día d:** cargas con binomial negativa, precios desde los cuantiles, L/T recalculado.
-3. **Decisión del agente:** aceptar, rechazar o esperar.
-4. **Avance:** recompensa y camión al nuevo hub; se pasa al día real siguiente (d + 1) y se vuelve al punto 2.
+2. **Realización del día d:** cargas con binomial negativa, precios por nivel desde los cuantiles, mejor competidor, L/T recalculado.
+3. **Decisión del agente:** un destino y un nivel de precio para la carga de esa lane, o reposicionar vacío.
+4. **Resultado:** si el nivel queda por debajo del competidor, gana la carga, cobra ese precio y viaja. Si pierde, se queda en el hub, pierde 15 minutos, no ve un tablero nuevo y vuelve a decidir sin esa lane (a lo sumo 2 cotizaciones por visita).
+5. **Avance:** al llegar al nuevo hub se toma la realización del día real en que llega y se vuelve al punto 3.
 
 El orden de los días siempre es el real; lo único que se sortea en cada vuelta es la realización del día.
 
 - **`reset()`** ejecuta el Paso 4a: hub inicial, día inicial y δ.
-- **`step(acción)`** genera la realización del día real actual en el hub del camión (Paso 4b). Luego aplica la decisión del agente (aceptar una oferta, rechazar o esperar), calcula la recompensa y avanza el tiempo y la ubicación. El día siguiente del episodio es siempre el día real siguiente.
-- **Observación del agente:** las ofertas sorteadas en las lanes que salen de su hub y el L/T* de ese hub; si el MDP lo usa, también información de los hubs destino y de los días recientes ya vistos en el episodio.
+- **`step(destino, nivel)`** resuelve la cotización contra u_comp, calcula la recompensa (precio · distancia − costo si gana, −costo si viaja vacío) y avanza el tiempo y, si viaja, la ubicación. Al llegar a un hub genera la realización del día real de llegada (Paso 4b).
+- **Observación del agente:** las cargas sorteadas en las lanes que salen de su hub, los precios de cada nivel, la mediana de la lane, el número de competidores efectivos m_c y el L/T* de ese hub, más información de los hubs destino. El agente nunca ve u_comp.
 - **La fecha no forma parte de la observación.** Todos los episodios recorren la misma historia de fondo. Si el agente viera "día 15", podría aprender el calendario ("en julio suben los precios") en vez de aprender a leer el mercado. Sin la fecha, decide solo con lo que vería un despachador. El día de la semana sí se puede incluir: tiene solo 7 valores, se repite igual en octubre y refleja un patrón real del mercado (menos cargas el fin de semana).
 
 **Ejemplo.** El episodio 1,050 sortea hub 20, día real 15 y δ = +1.5%.
 
-1. **Día real 15, hub 20.** En la lane 20→47 salen 11 ofertas, con precios sorteados de los cuantiles del día 15 y multiplicados por e^0.015. En la lane 20→63 no hay ofertas en esta realización. El agente acepta una oferta 20→47 y llega a 47 al día siguiente.
-2. **Día real 16, hub 47.** Las ofertas salen de los cuantiles del día 16, con el mismo δ = +1.5%. El agente decide otra vez.
+1. **Día real 15, hub 20.** En la lane 20→47 salen 11 cargas; los niveles de precio salen de los cuantiles del día 15, multiplicados por e^0.015. En la lane 20→63 no hay cargas en esta realización. El agente cotiza 20→47 en el nivel u = 0.6. El competidor sorteado está en u_comp = 0.45, así que pierde: se queda en el hub 20, pierde 15 minutos y cotiza otra lane. Gana la segunda cotización y viaja.
+2. **Día real 16, hub de llegada.** Los precios salen de los cuantiles del día 16, con el mismo δ = +1.5%. El agente decide otra vez.
 3. **Días reales 17, 18, …** continúan igual hasta completar el horizonte H.
 
-El episodio 31,077 también arranca en el hub 20 y el día real 15, pero sortea δ = −0.8%. En la lane 20→47 salen ahora 14 ofertas con otros precios. La secuencia de días es la misma; los números que ve el agente, no.
+El episodio 31,077 también arranca en el hub 20 y el día real 15, pero sortea δ = −0.8%. En la lane 20→47 salen ahora 14 cargas, con otros precios y otro competidor. La secuencia de días es la misma; los números que ve el agente, no.
 
 ## Paso 6. Validar el generador antes de entrenar
 

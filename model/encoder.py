@@ -15,7 +15,6 @@ Componentes:
 El vector de contexto h_t es compartido por:
   · AttentionDecoder  (decisión de ruteo)
   · CriticHead        (función de valor V(s))
-  · PricingHead       (precio de reserva p*)
 
 Features por nodo j (desde la posición actual del camión):
   [0] reward_norm   — ganancia neta del arco actual→j (día actual), normalizada
@@ -42,11 +41,18 @@ t = tiempo transcurrido, ev = calcular_ev_pronostico(...) de baselines/politicas
   h = días de mercado entre hoy y esa salida (q[h] = b_h · P(N ≥ 1) · dist, b_h = f + (1 − f) ρ^h). Con
   índice cero valen exactamente lo de siempre (ev sin índice).
 
-Índice de mercado (siempre la ÚLTIMA columna: [10] con continuación, [6] sin ella; así los checkpoints
-anteriores se cargan con esa columna en cero, ver transfer_learning.py):
+Índice de mercado (columna INDEX_COL: [10] con continuación, [6] sin ella):
   [10] market_index — índice(j, día actual) / desviación del índice histórico (una sola para todos los
                       nodos, calculada en el ajuste). Estado del mercado de salida del nodo j neto del
                       nivel nacional, en desviaciones estándar (market_process.py).
+
+Cotización conjunta (especificacion_fase0_ruteo_pricing.md §4.4; las ÚLTIMAS N_COT_FEATURES columnas, en cero
+fuera del modo cotización). Van al final para que los checkpoints anteriores se carguen con esas columnas en
+cero (transfer_learning._reconcile_state_dict copia las columnas viejas en las primeras posiciones):
+  [11] dispersion   — (p_0.8 − p_0.2) / p_0.5 de la lane i→j, recortada a [0, 1]
+  [12] break_even   — costo / (dist · p_0.5): qué tan cerca está el mínimo rentable de la mediana, en [0, 2] / 2
+  [13] cotizable    — 1 si la lane i→j se puede cotizar ahora (carga, no rechazada, quedan cotizaciones)
+  Las features [0] y [5] ya son, en ese modo, el margen si se cobrara la mediana (env.reward_rows).
 
 Condicionamiento en presupuesto de cardinalidad K:
   ContextNetwork recibe, además del bloque temporal y de mercado, un bloque
@@ -64,13 +70,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import LTR_CLIP, LOADS_EXPECTED_CLIP, K_NORM, USE_CONTINUATION_FEATURES
+from config import (
+    LTR_CLIP, LOADS_EXPECTED_CLIP, K_NORM, USE_CONTINUATION_FEATURES, COMPETENCIA_M_MAX, COTIZACIONES_MAX_POR_NODO,
+)
+from pricing import N_NIVELES, indice_nivel
 
 # Número de features por nodo — debe coincidir con build_node_features()
 N_BASE_NODE_FEATURES  = 6
 N_CONT_FEATURES       = 4
-N_INDEX_FEATURES      = 1   # índice de mercado: siempre la última columna
-N_NODE_FEATURES = N_BASE_NODE_FEATURES + (N_CONT_FEATURES if USE_CONTINUATION_FEATURES else 0) + N_INDEX_FEATURES
+N_INDEX_FEATURES      = 1   # índice de mercado (columna INDEX_COL)
+N_COT_FEATURES        = 3   # cotización conjunta: las últimas columnas
+INDEX_COL = N_BASE_NODE_FEATURES + (N_CONT_FEATURES if USE_CONTINUATION_FEATURES else 0)
+COT_COLS  = slice(INDEX_COL + N_INDEX_FEATURES, INDEX_COL + N_INDEX_FEATURES + N_COT_FEATURES)
+N_NODE_FEATURES = INDEX_COL + N_INDEX_FEATURES + N_COT_FEATURES
+
+# Features de contexto de la cotización (último bloque de ContextNetwork): log(m) / log(M_MAX) del nodo actual y
+# rechazos en esta visita / COTIZACIONES_MAX_POR_NODO. En cero fuera del modo cotización.
+N_COT_CONTEXT = 2
+_U_20, _U_50, _U_80 = indice_nivel(0.2), indice_nivel(0.5), indice_nivel(0.8)
 
 # Número de features de presupuesto de cardinalidad K — debe coincidir con
 # build_budget_features_batch().
@@ -257,8 +274,8 @@ def build_node_features(
             max_duration, reward_global_p95, np.asarray(market_index, dtype=np.float64)[None],
         )[0]
 
-    # Última columna: índice de mercado normalizado por la desviación del índice histórico
-    feats[:, -1] = np.asarray(market_index, dtype=np.float64) / max(float(index_std), 1e-12)
+    # Índice de mercado normalizado por la desviación del índice histórico (las de cotización quedan en cero)
+    feats[:, INDEX_COL] = np.asarray(market_index, dtype=np.float64) / max(float(index_std), 1e-12)
 
     if np.isnan(feats).any():
         bad = np.argwhere(np.isnan(feats)).tolist()
@@ -422,7 +439,7 @@ class AttentionEncoder(nn.Module):
 
 class ContextNetwork(nn.Module):
     """
-    Construye el vector de contexto h_t usado por decoder, critic y pricing.
+    Construye el vector de contexto h_t usado por el decoder (destino y precio) y el critic.
 
     Combina:
       · graph_embedding   (d_h)       — estado global del grafo
@@ -439,7 +456,11 @@ class ContextNetwork(nn.Module):
                                         número de arcos, no el tiempo) — no se
                                         amplía n_temporal para incorporarlo.
 
-    Entrada total: 2·d_h + 3 + n_market + n_budget + n_dow  →  MLP  →  d_h
+      · cot_features      (n_cot)     — cotización conjunta: competencia del nodo actual y rechazos en esta
+                                        visita (build_cotizacion_context_batch). Último bloque, en cero fuera
+                                        de ese modo, para que los checkpoints anteriores carguen.
+
+    Entrada total: 2·d_h + 3 + n_market + n_budget + n_dow + n_cot  →  MLP  →  d_h
 
     Parámetros
     ----------
@@ -448,13 +469,16 @@ class ContextNetwork(nn.Module):
     n_budget : int — número de features de presupuesto K (default 2, ver
                build_budget_features_batch()).
     n_dow    : int — one-hot del día de la semana (default N_DOW_FEATURES = 7).
+    n_cot    : int — features de contexto de la cotización (default N_COT_CONTEXT = 2).
     """
 
-    def __init__(self, d_h: int, n_market: int = 1, n_budget: int = 2, n_dow: int = N_DOW_FEATURES):
+    def __init__(self, d_h: int, n_market: int = 1, n_budget: int = 2, n_dow: int = N_DOW_FEATURES,
+                 n_cot: int = N_COT_CONTEXT):
         super().__init__()
         self.n_dow = n_dow
+        self.n_cot = n_cot
         n_temporal = 3          # time_norm, remaining_steps_norm, progress_norm
-        d_in = 2 * d_h + n_temporal + n_market + n_budget + n_dow
+        d_in = 2 * d_h + n_temporal + n_market + n_budget + n_dow + n_cot
         self.proj = nn.Sequential(
             nn.Linear(d_in, d_h),
             nn.ReLU(),
@@ -470,6 +494,7 @@ class ContextNetwork(nn.Module):
         market_feats:     torch.Tensor = None,  # (batch, n_market) | None
         budget_feats:     torch.Tensor = None,  # (batch, n_budget) | None
         dow_feats:        torch.Tensor = None,  # (batch, n_dow) | None (None ⇒ ceros)
+        cot_feats:        torch.Tensor = None,  # (batch, n_cot) | None (None ⇒ ceros)
     ) -> torch.Tensor:
         """
         Retorna el vector de contexto h_t de forma (batch, d_h).
@@ -482,6 +507,9 @@ class ContextNetwork(nn.Module):
         if self.n_dow:
             parts.append(dow_feats if dow_feats is not None
                          else torch.zeros(graph_emb.shape[0], self.n_dow, device=graph_emb.device))
+        if self.n_cot:
+            parts.append(cot_feats if cot_feats is not None
+                         else torch.zeros(graph_emb.shape[0], self.n_cot, device=graph_emb.device))
         h = torch.cat(parts, dim=-1)
         return self.proj(h)
 
@@ -513,7 +541,6 @@ def build_budget_features_batch(
 def build_node_features_batch(
     current_node:      np.ndarray,   # (B,) int64
     start_node:        np.ndarray,   # (B,) int64
-    rm_pen_stack:      np.ndarray,   # (num_train_days, N, N)
     time_matrix_arr:   np.ndarray,   # (N, N)
     distance_arr:      np.ndarray,   # (N, N)
     day_idx:           np.ndarray,   # (B,) int64
@@ -521,15 +548,16 @@ def build_node_features_batch(
     max_duration:      float,
     reward_global_p95: float      = 1.0,
     avail_expected_arr: np.ndarray = None,  # (N, N) — E[loads] histórico (train), usado en feature [4]
-    reward_rows:       np.ndarray = None,   # (B, N) — recompensa de las lanes salientes ya observada
-                                            # al llegar al nodo actual (modo market_process). Si se
-                                            # pasa, reemplaza la lectura de rm_pen_stack (que puede ser None).
+    reward_rows:       np.ndarray = None,   # (B, N) — env.reward_rows: margen de las lanes salientes a la
+                                            # mediana del mercado (obligatorio)
     ev                         = None,      # EvEsperado (baselines.calcular_ev_pronostico) — features de continuación [6-9]
     time_elapsed:      np.ndarray = None,   # (B,) horas transcurridas — idem
     dow0:              np.ndarray = None,   # (B,) día de la semana (lunes = 0) de salida — idem
     market_index:      np.ndarray = None,   # (B, N) índice de mercado de todos los nodos en el día actual
                                             # (env.market_index) — última feature
     index_std:         float      = None,   # desviación del índice histórico (env.index_std)
+    cotizacion_feats:  np.ndarray = None,   # (B, N, N_COT_FEATURES) — build_cotizacion_node_features_batch;
+                                            # None ⇒ esas columnas en cero (solo tests de features)
 ) -> np.ndarray:                            # (B, N, N_NODE_FEATURES) float32
     """
     Batched version of build_node_features.
@@ -543,15 +571,12 @@ def build_node_features_batch(
         raise ValueError("USE_CONTINUATION_FEATURES requiere ev, time_elapsed y dow0")
     if market_index is None or index_std is None:
         raise ValueError("build_node_features_batch requiere market_index e index_std (índice de mercado)")
+    if reward_rows is None:
+        raise ValueError("build_node_features_batch requiere reward_rows (env.reward_rows)")
     feats = np.zeros((B, N, N_NODE_FEATURES), dtype=np.float32)
 
-    # ── f0: reward from rm_pen_stack ──────────────────────────────────────────
-    # rm_pen_stack[day_idx[b], current_node[b], j] for all j → (B, N)
-    # (con market_process, la fila sorteada al llegar al nodo actual)
-    if reward_rows is not None:
-        feats[:, :, 0] = reward_rows
-    else:
-        feats[:, :, 0] = rm_pen_stack[day_idx, current_node, :]   # fancy: (B, N)
+    # ── f0: margen de cada lane saliente a la mediana del mercado (env.reward_rows) ──
+    feats[:, :, 0] = reward_rows
 
     # ── f1: travel time from current node to each j ───────────────────────────
     feats[:, :, 1] = time_matrix_arr[current_node, :]          # (B, N)
@@ -600,11 +625,50 @@ def build_node_features_batch(
             time_matrix_arr, ev, max_duration, reward_global_p95, market_index,
         )
 
-    # ── última columna: índice de mercado / desviación del índice histórico ──
-    feats[:, :, -1] = np.asarray(market_index, dtype=np.float64) / max(float(index_std), 1e-12)
+    # ── índice de mercado / desviación del índice histórico ──
+    feats[:, :, INDEX_COL] = np.asarray(market_index, dtype=np.float64) / max(float(index_std), 1e-12)
+
+    # ── cotización conjunta (últimas columnas; en cero fuera de ese modo) ──
+    if cotizacion_feats is not None:
+        feats[:, :, COT_COLS] = cotizacion_feats
 
     _check_node_features(feats, B, N)
     return feats
+
+
+def build_cotizacion_node_features_batch(
+    current_node: np.ndarray,   # (B,) int64
+    precios:      np.ndarray,   # (B, N, K) USD/milla de cada nivel (env.precios_row)
+    opciones:     np.ndarray,   # (B, N, K+1) bool (env.opciones_validas)
+    dist_rows:    np.ndarray,   # (B, N) distancia i→j
+    cost_rows:    np.ndarray,   # (B, N) costo i→j (pricing.lane_cost_row)
+) -> np.ndarray:                # (B, N, N_COT_FEATURES) float32
+    """Features de cotización por lane i→j (ver docstring del módulo): dispersión del precio, break-even
+    relativo a la mediana y si se puede cotizar. El self-loop (j = i) queda en cero."""
+    precios = np.asarray(precios, dtype=np.float64)
+    B, N = precios.shape[:2]
+    p_med = precios[..., _U_50]
+    ok = p_med > 1e-9
+    seguro = np.where(ok, p_med, 1.0)
+    dispersion = np.where(ok, (precios[..., _U_80] - precios[..., _U_20]) / seguro, 0.0)
+    break_even = np.where(ok, np.asarray(cost_rows, dtype=np.float64)
+                          / (np.maximum(np.asarray(dist_rows, dtype=np.float64), 1e-9) * seguro), 2.0)
+    out = np.stack([
+        np.clip(dispersion, 0.0, 1.0),
+        np.clip(break_even, 0.0, 2.0) / 2.0,
+        np.asarray(opciones)[..., :N_NIVELES].any(axis=-1).astype(np.float64),
+    ], axis=-1).astype(np.float32)
+    out[np.arange(B), np.asarray(current_node, dtype=np.int64)] = 0.0
+    return out
+
+
+def build_cotizacion_context_batch(m: np.ndarray, n_rechazos: np.ndarray) -> np.ndarray:   # (B,), (B,) → (B, 2)
+    """log(m) / log(M_MAX) (competencia en el nodo actual, en [0, 1]) y rechazos / COTIZACIONES_MAX_POR_NODO."""
+    m = np.asarray(m, dtype=np.float64)
+    out = np.empty((len(m), N_COT_CONTEXT), dtype=np.float32)
+    out[:, 0] = np.clip(np.log(np.maximum(m, 1.0)) / np.log(max(COMPETENCIA_M_MAX, 1.0 + 1e-9)), 0.0, 1.0)
+    out[:, 1] = np.asarray(n_rechazos, dtype=np.float64) / max(COTIZACIONES_MAX_POR_NODO, 1)
+    return out
 
 
 def build_dow_features_batch(dow: np.ndarray) -> np.ndarray:   # (B,) int → (B, 7) float32

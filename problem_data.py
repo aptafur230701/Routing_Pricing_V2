@@ -7,8 +7,8 @@ load_matrices(num_nodes)
     → time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
       ltr_stack, avail_expected_arr, reward_global_p95
 
-build_day_matrices(rate_day, loads_day, distance_arr, diesel_arr, num_nodes)
-    → reward_matrix, reward_matrix_penalized
+lane_reward(rate, loads, distance, diesel)
+    → margen de recorrer cada lane (la única fórmula de reward del paso)
 
 rate_stack  y loads_stack son arreglos numpy (num_days, num_nodes, num_nodes), uno por día real
 jun-oct 2026 (ver metodologia_realizaciones_mercado_reefer.md, Paso 2). Se leen una sola vez de los
@@ -206,9 +206,8 @@ def lane_reward(
 ) -> np.ndarray:
     """Recompensa de recorrer una lane (sin penalizar la diagonal ni escalar).
 
-    Es la ÚNICA fórmula de recompensa del paso: la usan build_day_matrices (modo
-    real, días del histórico) y el entorno con market_process (filas sorteadas
-    al llegar al nodo), para que ambos modos no diverjan.
+    Es la ÚNICA fórmula de recompensa del paso: la usan el entorno (con el precio cotizado), los
+    baselines, UB-PI y la DP.
 
         ingreso = tarifa por milla × distancia, solo si hay carga (loads > 0)
         costo   = distancia × (diesel / MPG) + distancia × MARGINAL_COST_SIN_DIESEL
@@ -220,88 +219,6 @@ def lane_reward(
     revenue = np.where(loads > 0, rate * distance, 0.0)
     cost    = distance * (diesel / MPG) + distance * MARGINAL_COST_SIN_DIESEL
     return np.round(revenue - cost, 0)
-
-
-def build_day_matrices(
-    rate_day:     np.ndarray,
-    loads_day:    np.ndarray,
-    distance_arr: np.ndarray,
-    diesel_arr:   np.ndarray,
-) -> tuple:
-    """Build reward matrix and its penalized version for a single day snapshot.
-
-    Parameters
-    ----------
-    rate_day      : np.ndarray (num_nodes × num_nodes) — spot rates for one day.
-    loads_day     : np.ndarray (num_nodes × num_nodes) — available loads for one day.
-    distance_arr  : np.ndarray (num_nodes × num_nodes) — inter-node distances.
-    diesel_arr    : np.ndarray (num_nodes × num_nodes) — fuel prices.
-
-    Returns
-    -------
-    reward_matrix            : np.ndarray (num_nodes × num_nodes)
-    reward_matrix_penalized  : np.ndarray (diagonal = BIG_M_PENALTY)
-
-    Nota (existencia): esta función excluye un arco solo si el registro
-    histórico de ESE día puntual no muestra ninguna carga (`loads_day <= 0`).
-    `draw_lane_availability` aplica el mismo criterio sobre `loads_stack` para
-    la máscara de acciones de los modos con filtrado de lanes, de modo que
-    máscara y reward quedan consistentes. El umbral es `<= 0` (antes `<= 1`,
-    sin justificación documentada — excluía también el caso `loads_day == 1`).
-    La fórmula vive en `lane_reward` (compartida con el modo market_process).
-    """
-    reward_arr = lane_reward(rate_day, loads_day, distance_arr, diesel_arr)
-
-    penalized_arr = reward_arr.copy()
-    np.fill_diagonal(penalized_arr, BIG_M_PENALTY)
-
-    return reward_arr, penalized_arr
-
-
-def draw_lane_availability(
-    node:        int,
-    arrival_day: int,
-    loads_stack: np.ndarray,
-) -> np.ndarray:
-    """Lane availability for outgoing lanes FROM node on arrival_day.
-
-    Lee el registro histórico de ESE día: la lane existe sii hubo carga
-    (`loads_stack[arrival_day, node, j] > 0`). Es el mismo criterio con que
-    build_day_matrices pone ingreso cero, así que máscara de acciones y reward
-    quedan consistentes: nunca se bloquea una lane que tuvo carga ni se deja
-    abierta (con reward = -costo) una que no la tuvo.
-
-    Es determinista dado (node, arrival_day), así que dos rutas que llegan al
-    mismo nodo el mismo día ven la misma realización.
-
-    Parameters
-    ----------
-    node         : node at which the truck just arrived.
-    arrival_day  : min(start_day_idx + int(time_elapsed // 14), max_day).
-    loads_stack  : [num_days, num_nodes, num_nodes] — historical loads.
-
-    Returns
-    -------
-    np.ndarray of shape (num_nodes,) int8 — 1 = lane exists, 0 = lane absent.
-    """
-    return (loads_stack[arrival_day, node] > 0).astype(np.int8)
-
-
-def build_rm_pen_stack(
-    rate_stack:   np.ndarray,   # (num_days, N, N)
-    loads_stack:  np.ndarray,   # (num_days, N, N)
-    distance_arr: np.ndarray,   # (N, N)
-    diesel_arr:   np.ndarray,   # (N, N)
-) -> np.ndarray:                # (num_days, N, N) float32
-    """Precompute the full stack of penalized reward matrices for all training days.
-
-    Returns shape (num_days, N, N) float32 — one penalized reward matrix per day.
-    Diagonal of each slice is BIG_M_PENALTY. Used by VectorRoutingEnv.
-    """
-    return np.stack([
-        build_day_matrices(rate_stack[d], loads_stack[d], distance_arr, diesel_arr)[1]
-        for d in range(len(rate_stack))
-    ]).astype(np.float32)
 
 
 def load_matrices(num_nodes: int) -> tuple:

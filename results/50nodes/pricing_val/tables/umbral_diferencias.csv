@@ -1,5 +1,0 @@
-conjunto,comparacion,dif_media_usd,dif_ic95_inf,dif_ic95_sup,n_mundos
-simulado K=libre,p* − break-even,1402.676,1311.661625,1495.6032500000001,1000
-simulado K=libre,p* − break-even + 0.30,1332.866,1244.682075,1423.8914750000001,1000
-replay K=libre,p* − break-even,1328.94,1203.3218333333332,1457.3995,300
-replay K=libre,p* − break-even + 0.30,1252.6733333333334,1124.0065833333333,1382.0182499999999,300

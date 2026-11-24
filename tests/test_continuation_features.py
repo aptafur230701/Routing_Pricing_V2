@@ -4,7 +4,7 @@ test_continuation_features.py
 Features de continuación por nodo (f6–f9, USE_CONTINUATION_FEATURES), índice de mercado (f10),
 calcular_ev_esperado y la expansión del checkpoint a más columnas de entrada.
 
-  · (B, N, 11), sin NaN/Inf; f6–f9 coinciden con una referencia escalar con loops.
+  · (B, N, 14), sin NaN/Inf; f6–f9 coinciden con una referencia escalar con loops.
   · f10 = índice de mercado del nodo en el día actual / desviación del índice histórico.
   · f6–f9 usan el valor esperado AJUSTADO por el índice (el de B2P): ev + índice(origen) · q[h, dow];
     con índice cero dan EXACTAMENTE lo de antes (copia congelada de la función anterior).
@@ -60,15 +60,16 @@ def _estados(d, B=60, pasos=2, semilla=0):
     masks = env.reset(starts, dias, k_max_arr=[5] * B, world_seeds=rng.integers(0, 2**31 - 1, size=B))
     activo = np.ones(B, dtype=bool)
     for _ in range(pasos):
-        acc = np.array([rng.choice(np.flatnonzero(m)) if m.any() else 0 for m in masks])
-        _, term, masks = env.step(acc)
+        pares = [np.argwhere(o) for o in env.opciones_validas]
+        acc = np.array([p[rng.integers(len(p))] if len(p) else (0, 0) for p in pares])
+        _, term, masks = env.step(acc[:, 0], acc[:, 1])
         activo &= ~term
     return env, np.flatnonzero(activo), starts
 
 
 def _features(d, env, starts):
     return build_node_features_batch(
-        env.current_node, starts, None, d["T"], d["dist"], env.current_day_idx, N,
+        env.current_node, starts, d["T"], d["dist"], env.current_day_idx, N,
         MAX_DURATION, reward_global_p95=d["p95"],
         avail_expected_arr=d["avail"], reward_rows=env.reward_rows,
         ev=d["ev"], time_elapsed=env.time_elapsed, dow0=env.start_dow,
@@ -110,29 +111,46 @@ def _referencia(d, env, starts, b):
     return out
 
 
-def test_n_node_features_es_11():
-    assert N_NODE_FEATURES == 11
+def test_n_node_features_es_14():
+    assert N_NODE_FEATURES == 14   # 6 base + 4 continuación + índice + 3 de cotización (en cero fuera de ese modo)
 
 
-def test_ev_esperado_identico_al_de_b2(datos):
-    """ev es el promedio empírico sobre los días de entrenamiento reales (ya no el modelo paramétrico
-    mu/s/phi/media_lane): ver baselines.politicas._promedios_empiricos_por_dow."""
-    from baselines.politicas import _promedios_empiricos_por_dow
+def test_ev_esperado_identico_al_de_b2_y_con_la_cotizacion_miope(datos):
+    """ev es el valor de cotizar con la regla miope sobre los cuantiles medios del día de la semana
+    (baselines.politicas._valor_cotizado_por_dow), el mismo para B2 y para las features de continuación."""
     d = datos
-    ev_bruto, _ = _promedios_empiricos_por_dow(d["market"], d["dist"])
-    costo = d["dist"] * (d["diesel"] / MPG) + d["dist"] * MARGINAL_COST_SIN_DIESEL
-    ev_original = ev_bruto - costo[None]
     assert d["ev"].ev.shape == (7, N, N)
-    assert np.array_equal(d["ev"].ev, ev_original)
-
     b2 = PoliticaB2(d["market"], d["T"], d["dist"], d["diesel"])
-    assert np.array_equal(b2._ev, ev_original)
+    assert np.array_equal(b2._ev, d["ev"].ev)
+    for dow in (0, 4):
+        ev, _ = _ev_referencia(d["market"], d["dist"], d["diesel"], dow)
+        np.testing.assert_allclose(d["ev"].ev[dow], ev, rtol=1e-6, atol=1e-4)   # cuantiles en float32 (1e-4 USD)
+
+def _ev_referencia(market, dist, diesel, dow):
+    """ev y pendiente de un día de la semana con loops de Python (definición literal de _valor_cotizado_por_dow)."""
+    from pricing import U_NIVELES_ARR, precios_niveles, lane_cost_row
+    N = market.num_nodes
+    dias = [d for d in range(TRAIN_DAYS) if market.dia_semana(d) == dow]
+    costo = lane_cost_row(dist, diesel)
+    ev, pend = np.zeros((N, N)), np.zeros((N, N))
+    for j in range(N):
+        P = np.mean([(1 - U_NIVELES_ARR) ** float(market.competidores([j], [d])[0]) for d in dias], axis=0)
+        for l in range(N):
+            prob = np.mean([market.count_loads[d, j, l] > 0 for d in dias])
+            q = np.mean([market.cuantiles_dia(d)[j, l] for d in dias], axis=0)
+            p = precios_niveles(q)
+            v = P * (p * dist[j, l] - costo[j, l])
+            k = int(np.argmax(v))
+            ev[j, l] = prob * v[k] - (1 - prob) * costo[j, l]
+            pend[j, l] = prob * P[k] * dist[j, l]
+    return ev, pend
+
 
 
 def test_forma_y_finitud(datos):
     env, activas, starts = _estados(datos)
     feats = _features(datos, env, starts)
-    assert feats.shape == (len(starts), N, 11) and feats.dtype == np.float32
+    assert feats.shape == (len(starts), N, 14) and feats.dtype == np.float32
     assert np.isfinite(feats).all()
     cont = feats[:, :, 6:10]
     assert cont[:, :, 0].min() >= 0                       # f6 = T[j, h] / MAX no se recorta (puede pasar de 1)
@@ -168,7 +186,9 @@ def test_f8_coincide_con_el_ev_ajustado_de_b2p_en_5_estados_al_azar(datos):
 def test_casos_especiales_self_loop_y_casa(datos):
     env, activas, starts = _estados(datos, pasos=1, semilla=3)
     feats = _features(datos, env, starts)
-    for b in activas:
+    fuera = [b for b in activas if env.current_node[b] != starts[b]]   # tras un rechazo en casa sigue en casa
+    assert fuera
+    for b in fuera:
         i, h = int(env.current_node[b]), int(starts[b])
         assert (feats[b, i, 6:10] == 0).all()
         assert feats[b, h, 6] == 0 and feats[b, h, 8] == 0 and feats[b, h, 9] == 0
@@ -199,7 +219,7 @@ def test_version_escalar_coincide_con_la_batcheada(datos):
             ev=datos["ev"], time_elapsed=float(env.time_elapsed[b]), dow0=int(env.start_dow[b]),
             market_index=env.market_index[b], index_std=env.index_std,
         )
-        assert esc.shape == (N, 11)
+        assert esc.shape == (N, 14)
         np.testing.assert_allclose(esc[:, 6:], feats[b, :, 6:], atol=1e-6)
 
 
@@ -217,7 +237,7 @@ def test_f10_es_el_indice_de_mercado_normalizado(datos):
 
 
 def test_replay_features_forma_sin_nan_e_indice_del_dia_real(datos):
-    """Replay de días reales de evaluación: (B, N, 11) sin NaN; f10 es el índice observado del día."""
+    """Replay de días reales de evaluación: (B, N, 14) sin NaN; f10 es el índice observado del día."""
     d = datos
     tm, rate, loads, dist, diesel, *_ = load_matrices(N)
     ev_dias = rate[TRAIN_DAYS:]
@@ -226,14 +246,14 @@ def test_replay_features_forma_sin_nan_e_indice_del_dia_real(datos):
     rng = np.random.default_rng(0)
     starts = rng.integers(0, N, size=B)
     dias = rng.integers(0, ev_dias.shape[0], size=B)
-    env.reset(starts, dias, k_max_arr=[None] * B)
+    env.reset(starts, dias, k_max_arr=[None] * B, world_seeds=np.arange(B))
     feats = build_node_features_batch(
-        env.current_node, starts, None, d["T"], dist, env.current_day_idx, N, MAX_DURATION,
+        env.current_node, starts, d["T"], dist, env.current_day_idx, N, MAX_DURATION,
         reward_global_p95=d["p95"], avail_expected_arr=d["avail"],
         reward_rows=env.reward_rows, ev=d["ev"], time_elapsed=env.time_elapsed, dow0=env.start_dow,
         market_index=env.market_index, index_std=env.index_std,
     )
-    assert feats.shape == (B, N, 11) and np.isfinite(feats).all()
+    assert feats.shape == (B, N, 14) and np.isfinite(feats).all()
     esperado = d["market"].indice_historico(TRAIN_DAYS, None)[dias] / d["market"].indice_std
     np.testing.assert_allclose(feats[:, :, 10], esperado, atol=1e-6)
 
@@ -244,7 +264,8 @@ def test_start_dow_del_entorno(datos):
                            datos["market"])
         env._day_offset = offset
         env.reset(np.array([0, 1, 2]), np.array([3, 10, 50]), world_seeds=np.array([1, 2, 3]))
-        env.step(np.array([4, 5, 6]))                      # el tiempo avanza; start_dow no cambia
+        par = [np.argwhere(o)[0] for o in env.opciones_validas]       # primera opción válida de cada fila
+        env.step(np.array([p[0] for p in par]), np.array([p[1] for p in par]))   # el tiempo avanza; start_dow no cambia
         assert (env.start_dow == dia_de_semana(np.array([3, 10, 50]) + offset)).all()
 
 

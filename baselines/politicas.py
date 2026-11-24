@@ -4,11 +4,17 @@ baselines/politicas.py
 Políticas baseline no anticipativas: B1, B2, B2P (B2 con pronósticos del índice de mercado) y B3
 (política de un paso sobre la tabla V de UB-DP, baselines_drl_ruteo_estocastico.md).
 
-Todas se ejecutan paso a paso en el entorno con la misma interfaz que el DRL: en cada
-nodo reciben una `Observacion` con la máscara, la fila observada de cargas y tarifas, el
-nodo actual, la hora y k restante. Los parámetros del proceso (mu, s_d,
-phi y la tarifa media por lane) se pasan al construir la política. Ninguna recibe la
-semilla del mundo evaluado ni llama a `sample_world`.
+Todas se ejecutan paso a paso en el entorno con cotización, con la misma interfaz que el DRL: en
+cada nodo reciben una `Observacion` (máscara, tablero observado: cargas, precios por nivel y
+competencia m, nodo actual, hora y k restante) y `actuar` devuelve el DESTINO. El precio lo pone
+una regla fija (`cotizar`, por defecto REGLA_PRECIO_BASELINES = R_MIOPE;
+especificacion_fase0_ruteo_pricing.md §6-7). Si la carga se pierde, la política vuelve a decidir
+en el mismo nodo con la lane enmascarada.
+
+El valor inmediato de un arco es el esperado con la cotización miope, max_k P_k·(p_k·d − c) con
+P_k = (1 − u_k)^m (`valor_inmediato`); −c si la lane solo se puede recorrer VACÍA. Los parámetros
+del proceso (mu, s_d, phi y la tarifa media por lane) se pasan al construir la política. Ninguna
+recibe la semilla del mundo evaluado ni ve el competidor.
 """
 
 from dataclasses import dataclass
@@ -16,12 +22,15 @@ from dataclasses import dataclass
 import numpy as np
 
 from config import (
-    MAX_DURATION, MPG, MARGINAL_COST_SIN_DIESEL, UBDP_DT_HORAS, MARKET_DIAS_EPISODIO, TRAIN_DAYS,
+    MAX_DURATION, UBDP_DT_HORAS, MARKET_DIAS_EPISODIO, TRAIN_DAYS,
+    REGLA_PRECIO_BASELINES, COTIZACION_HORAS, COTIZACIONES_MAX_POR_NODO,
 )
+from pricing import N_NIVELES, U_NIVELES_ARR, nivel_regla, prob_ganar, lane_cost_row, precios_niveles
 from problem_data import lane_reward
 from baselines.dp_relajada import TablaDP
 
-_DIA_HORAS = 14.0   # un día de mercado = 14 h (igual que RoutingEnv)
+_DIA_HORAS = 14.0   # un día de mercado = 14 h (igual que el entorno)
+_VACIO = N_NIVELES  # índice de la opción VACÍO (= routing_env.OPCION_VACIO)
 
 
 @dataclass
@@ -31,9 +40,15 @@ class Observacion:
     nodo, casa        : nodo actual y nodo de inicio (donde se cierra el ciclo).
     tiempo            : horas transcurridas desde la salida.
     k_restante        : arcos restantes incluido el retorno (None = caso libre).
-    mascara           : (N,) int8, acciones válidas del entorno.
-    loads_row, rate_row : (N,) cargas y tarifa por milla observadas al llegar al nodo.
+    mascara           : (N,) int8, destinos válidos del entorno.
+    loads_row         : (N,) cargas del tablero del nodo.
+    rate_row          : (N,) precio en la mediana del mercado de cada lane (USD/milla).
+    precios           : (N, K) USD/milla de cada nivel de precio.
+    m                 : competidores efectivos del nodo.
+    opciones          : (N, K+1) bool, opciones válidas por destino (niveles y VACÍO).
     dia_semana_salida : día de la semana (lunes = 0) del día de salida.
+    indice            : (N,) índice de mercado de hoy (solo B2P).
+    n_rechazos        : cotizaciones ya perdidas en esta visita al nodo (B3).
     """
     nodo: int
     casa: int
@@ -42,47 +57,84 @@ class Observacion:
     mascara: np.ndarray
     loads_row: np.ndarray
     rate_row: np.ndarray
+    precios: np.ndarray
+    m: float
+    opciones: np.ndarray
     dia_semana_salida: int
     indice: np.ndarray = None
+    n_rechazos: int = 0
 
 
-def _promedios_empiricos_por_dow(market, distance_arr) -> tuple:
-    """(ev, prob), cada uno (7, N, N): promedio empírico sobre los días de ENTRENAMIENTO reales,
-    agrupados por día de la semana de llegada.
+def valor_inmediato(obs: Observacion, distance_arr, diesel_arr) -> np.ndarray:
+    """(N,) valor esperado de salir por cada lane: max_k P_k·(p_k·d − c) sobre los niveles válidos, o −c si
+    la lane solo se puede recorrer VACÍA; −inf donde no hay ninguna opción válida."""
+    i = obs.nodo
+    d, c = distance_arr[i], lane_cost_row(distance_arr[i], diesel_arr[i])
+    v = prob_ganar(U_NIVELES_ARR, obs.m) * (obs.precios * d[:, None] - c[:, None])        # (N, K)
+    v = np.where(obs.opciones[:, :N_NIVELES], v, -np.inf).max(axis=1)
+    return np.where(obs.opciones[:, _VACIO], np.maximum(v, -c), v)
 
-        prob[dow, j, l] = fracción de días de train con ese dow en que la lane j→l tuvo carga
-        ev[dow, j, l]   = promedio de (1[carga] · tarifa_media_del_día · distancia) en esos días
 
-    Reemplaza el modelo paramétrico global (mu_jl · s_d, media_lane fija) de la versión anterior:
-    ya no hay una tasa ni una tarifa media única por lane, los días reales varían (ver
-    metodologia_realizaciones_mercado_reefer.md). `ev` todavía no resta el costo (lo hace
-    `calcular_ev_esperado`), para que `calcular_ev_pronostico` pueda reusar `prob` sin recalcularlo.
+def cotizar_regla(obs: Observacion, j: int, distance_arr, diesel_arr, regla: str = REGLA_PRECIO_BASELINES) -> int:
+    """Opción para el destino j: el nivel de la regla fija si la lane se puede cotizar; si no, VACÍO."""
+    if not obs.opciones[j, :N_NIVELES].any():
+        if not obs.opciones[j, _VACIO]:
+            raise ValueError(f"el destino {j} no tiene ninguna opción válida")
+        return _VACIO
+    i = obs.nodo
+    costo = lane_cost_row(distance_arr[i, j], diesel_arr[i, j])
+    return int(nivel_regla(regla, obs.precios[j], distance_arr[i, j], costo, obs.m))
+
+
+class _Cotiza:
+    """Mezcla: precio con una regla fija (REGLA_PRECIO_BASELINES salvo que se pase otra)."""
+    regla = REGLA_PRECIO_BASELINES
+
+    def cotizar(self, obs: Observacion, j: int) -> int:
+        return cotizar_regla(obs, j, self._dist, self._diesel, self.regla)
+
+
+def _valor_cotizado_por_dow(market, distance_arr, diesel_arr) -> tuple:
+    """(ev, pendiente), cada uno (7, N, N): valor esperado de un arco futuro cotizando con la regla miope sobre
+    los cuantiles medios del día de la semana (especificacion_fase0_ruteo_pricing.md §7, B2 / B2P).
+
+    Con los días de ENTRENAMIENTO reales de ese día de la semana:
+        prob[dow, j, l]  = fracción de días en que la lane tuvo carga
+        p̄_k[dow, j, l]  = precio del nivel k con los cuantiles medios de la lane (media de los días)
+        P̄_k[dow, j]     = media de los días de (1 − u_k)^m_j
+        k*              = argmax_k P̄_k · (p̄_k · d − c)            (la regla miope con esos valores)
+        ev              = prob · P̄_k* · (p̄_k* · d − c) − (1 − prob) · c
+    Con P̄ = 1 y un solo precio (la tarifa media) se recupera el valor de antes, prob · q̄ · d − c: sin carga
+    el arco se recorre vacío (−c); con carga se gana con P̄_k* y, si se pierde, el tramo no se cobra.
+    pendiente = prob · P̄_k* · d es la derivada de ev respecto de un corrimiento del precio (la usa B2P para
+    el pronóstico del índice).
     """
-    dow = market.dia_semana(np.arange(TRAIN_DAYS))                      # (TRAIN_DAYS,)
-    con_carga = market.count_loads[:TRAIN_DAYS] > 0                     # (TRAIN_DAYS, N, N)
-    ingreso = np.where(con_carga, market.mean_rate[:TRAIN_DAYS] * distance_arr[None], 0.0)
     N = market.num_nodes
+    dist = np.asarray(distance_arr, dtype=float)
+    costo = lane_cost_row(dist, np.asarray(diesel_arr, dtype=float))
+    dow_train = market.dia_semana(np.arange(TRAIN_DAYS))
+    con_carga = market.count_loads[:TRAIN_DAYS] > 0
     ev = np.zeros((7, N, N))
-    prob = np.zeros((7, N, N))
+    pendiente = np.zeros((7, N, N))
     for k in range(7):
-        sel = dow == k
-        ev[k] = ingreso[sel].mean(axis=0)
-        prob[k] = con_carga[sel].mean(axis=0)
-    return ev, prob
+        dias = np.flatnonzero(dow_train == k)
+        prob = con_carga[dias].mean(axis=0)                                             # (N, N)
+        q_medio = np.mean([market.cuantiles_dia(int(d)) for d in dias], axis=0)         # (N, N, 6)
+        p = precios_niveles(q_medio)                                                     # (N, N, K)
+        P = np.mean([prob_ganar(U_NIVELES_ARR[None, :], market.competidores(np.arange(N), np.full(N, int(d)))[:, None])
+                     for d in dias], axis=0)                                             # (N, K)
+        v = P[:, None, :] * (p * dist[..., None] - costo[..., None])                    # (N, N, K)
+        k_star = v.argmax(axis=-1)[..., None]
+        ev[k] = prob * np.take_along_axis(v, k_star, axis=-1)[..., 0] - (1.0 - prob) * costo
+        pendiente[k] = prob * np.take_along_axis(np.broadcast_to(P[:, None, :], v.shape), k_star, axis=-1)[..., 0] * dist
+    return ev, pendiente
 
 
 def calcular_ev_esperado(market, distance_arr, diesel_arr) -> np.ndarray:
-    """Recompensa esperada por lane y día de la semana, (7, N, N), empírica sobre los días de
-    entrenamiento reales (ver `_promedios_empiricos_por_dow`):
-
-        ev[dow, j, l] = promedio_{d train, dow(d)=dow} (1[carga] · tarifa_media_d · dist_l) − costo_l
-
-    Es el valor que usa B2 para los arcos futuros y el que alimenta las features de continuación
-    del DRL; se calcula una vez por número de nodos.
-    """
-    costo = distance_arr * (diesel_arr / MPG) + distance_arr * MARGINAL_COST_SIN_DIESEL
-    ev, _ = _promedios_empiricos_por_dow(market, distance_arr)
-    return ev - costo[None]                                            # (7, N, N)
+    """Valor esperado por lane y día de la semana, (7, N, N), con la cotización miope (ver
+    `_valor_cotizado_por_dow`). Es el valor que usa B2 para los arcos futuros y el que alimenta las
+    features de continuación del DRL; se calcula una vez por número de nodos."""
+    return _valor_cotizado_por_dow(market, distance_arr, diesel_arr)[0]
 
 
 @dataclass(frozen=True)
@@ -93,8 +145,8 @@ class EvEsperado:
 
         ev_ajustado(h, dow)[j, l] = ev[dow, j, l] + índice(j, hoy) · q[h, dow, j, l]
 
-    ev (7, N, N)      : calcular_ev_esperado (tarifa media de la lane; el valor con índice cero)
-    q  (H+1, 7, N, N) : b_h · P(N_jl ≥ 1) · dist_jl, con b_h = f + (1 − f) · ρ^h
+    ev (7, N, N)      : calcular_ev_esperado (cotización miope sobre los cuantiles medios; índice cero)
+    q  (H+1, 7, N, N) : b_h · P(N_jl ≥ 1) · P̄_k* · dist_jl, con b_h = f + (1 − f) · ρ^h
     b  (H+1,)         : los coeficientes b_h (f = fracción de varianza lenta del índice, ρ = persistencia del rápido)
     """
     ev: np.ndarray
@@ -108,16 +160,14 @@ class EvEsperado:
 
 def calcular_ev_pronostico(market, distance_arr, diesel_arr) -> EvEsperado:
     """Tabla de valores esperados por lane con pronóstico del índice (ver EvEsperado); una vez por nº de nodos."""
-    costo = distance_arr * (diesel_arr / MPG) + distance_arr * MARGINAL_COST_SIN_DIESEL
-    ev_bruto, prob = _promedios_empiricos_por_dow(market, distance_arr)   # (7,N,N) cada uno
-    ev = ev_bruto - costo[None]
+    ev, pendiente = _valor_cotizado_por_dow(market, distance_arr, diesel_arr)   # (7,N,N) cada uno
     b = market.frac_var_lento + (1.0 - market.frac_var_lento) * market.rho ** np.arange(MARKET_DIAS_EPISODIO)  # h = 0 … H
-    q = b[:, None, None, None] * (prob * distance_arr[None])[None]        # (H+1, 7, N, N)
+    q = b[:, None, None, None] * pendiente[None]                          # (H+1, 7, N, N)
     return EvEsperado(ev=ev, q=q, b=b)
 
 
-class PoliticaB1:
-    """B1, greedy miope (PFA): arco válido de mayor `lane_reward` según la fila observada.
+class PoliticaB1(_Cotiza):
+    """B1, greedy miope (PFA): arco válido de mayor valor inmediato esperado (`valor_inmediato`).
 
     Empates por el índice menor.
     """
@@ -129,11 +179,11 @@ class PoliticaB1:
     def actuar(self, obs: Observacion) -> int:
         i = obs.nodo
         acts = np.flatnonzero(obs.mascara)
-        r = lane_reward(obs.rate_row[acts], obs.loads_row[acts], self._dist[i, acts], self._diesel[i, acts])
+        r = valor_inmediato(obs, self._dist, self._diesel)[acts]
         return int(acts[int(np.argmax(r))])      # argmax devuelve el primero ⇒ índice menor
 
 
-class PoliticaB2:
+class PoliticaB2(_Cotiza):
     """B2, reoptimización determinista con valores esperados (CFA); con K = 5 y con K libre.
 
     En cada nodo resuelve de forma exacta la mejor ruta restante y ejecuta solo el primer
@@ -172,7 +222,7 @@ class PoliticaB2:
     def actuar(self, obs: Observacion) -> int:
         i, h, dow0 = obs.nodo, obs.casa, obs.dia_semana_salida
         acts = np.flatnonzero(obs.mascara)
-        r = lane_reward(obs.rate_row[acts], obs.loads_row[acts], self._dist[i, acts], self._diesel[i, acts])
+        r = valor_inmediato(obs, self._dist, self._diesel)[acts]
         memo = self._memo.setdefault((h, dow0), {})
         k_sig = None if obs.k_restante is None else obs.k_restante - 1
         mejor, mejor_a = -np.inf, -1
@@ -298,7 +348,7 @@ class PoliticaB2P(PoliticaB2):
             raise ValueError("B2P necesita Observacion.indice (el índice de mercado de hoy)")
         i, h, dow0 = obs.nodo, obs.casa, obs.dia_semana_salida
         acts = np.flatnonzero(obs.mascara)
-        r = lane_reward(obs.rate_row[acts], obs.loads_row[acts], self._dist[i, acts], self._diesel[i, acts])
+        r = valor_inmediato(obs, self._dist, self._diesel)[acts]
         k_sig = None if obs.k_restante is None else obs.k_restante - 1
         s_a = np.minimum(np.floor((obs.tiempo + self._T[i, acts]) / self._dt + 1e-9).astype(np.int64), self._smax)
         sigue = acts != h
@@ -313,13 +363,19 @@ class PoliticaB2P(PoliticaB2):
         return mejor_a
 
 
-class PoliticaB3:
-    """B3: política de un paso sobre la tabla V de UB-DP (VFA de tabla, Simao et al. 2009).
+class PoliticaB3(_Cotiza):
+    """B3: un paso sobre la tabla V de UB-DP con los dos intentos (especificacion_fase0_ruteo_pricing.md §7.3).
 
-        a = argmax_{j ∈ acciones válidas de la máscara}  r_ij + V(j, t + τ_ij, k − 1)
+    Con el tablero observado del nodo i (precios por nivel, m, opciones) y G_jk = r_jk + V(j, t + τ_ij, k − 1)
+    (V(casa) = 0), P_k = (1 − u_k)^m:
 
-    Para el retorno a casa se usa solo r_ij. Empates por el índice menor. La tabla V (`TablaDP`)
-    se calcula en baselines/dp_relajada.py.
+        destino = argmax_j  max_k [ P_k G_jk(t) + (1 − P_k) W_j ]       (lanes cotizables)
+                            R0_j + V(j, t + τ_ij, k − 1)                  (lanes que solo se recorren VACÍAS)
+        W_j     = max( E(t'), max_{j' ≠ j} max_k [ P_k G_j'k(t') + (1 − P_k) E(t') ] ),  t' = t + COTIZACION_HORAS
+        E(t)    = volver a casa vacío (en la primera salida desde casa: el mejor VACÍO a cualquier destino)
+
+    Si ya se perdió una cotización en esta visita, queda un solo intento: W_j = E(t'). El precio lo pone la
+    regla fija (REGLA_PRECIO_BASELINES = R_MIOPE, igual que los demás baselines). Empates por el índice menor.
     """
     nombre = "B3"
 
@@ -327,13 +383,38 @@ class PoliticaB3:
         self.tabla = tabla
         self._dist, self._diesel = distance_arr, diesel_arr
 
+    def _cont(self, obs, acts, t, k_sig):
+        """V(j, t + τ_ij, k − 1) de los destinos `acts` (0 para casa)."""
+        if k_sig == 0:
+            return np.zeros(len(acts))
+        cont = self.tabla.valor_continuacion(obs.dia_semana_salida, obs.casa, acts,
+                                             t + self.tabla.T[obs.nodo, acts], k_sig)
+        return np.where(acts == obs.casa, 0.0, cont)
+
     def actuar(self, obs: Observacion) -> int:
         i, h = obs.nodo, obs.casa
         acts = np.flatnonzero(obs.mascara)
-        r = lane_reward(obs.rate_row[acts], obs.loads_row[acts], self._dist[i, acts], self._diesel[i, acts])
         k_sig = None if obs.k_restante is None else obs.k_restante - 1
-        cont = self.tabla.valor_continuacion(
-            obs.dia_semana_salida, h, acts, obs.tiempo + self.tabla.T[i, acts], k_sig,
-        )
-        cont = np.where(acts == h, 0.0, cont)
-        return int(acts[int(np.argmax(r + cont))])     # argmax devuelve el primero ⇒ índice menor
+        r_k = lane_reward(obs.precios[acts], 1, self._dist[i, acts, None], self._diesel[i, acts, None])   # (A, K)
+        r0 = lane_reward(0.0, 0, self._dist[i, acts], self._diesel[i, acts])                             # (A,)
+        P = prob_ganar(U_NIVELES_ARR, obs.m)                                                              # (K,)
+        cotiza = obs.opciones[acts, :N_NIVELES].any(axis=1)
+        t, t2 = obs.tiempo, obs.tiempo + COTIZACION_HORAS
+        c1, c2 = self._cont(obs, acts, t, k_sig), self._cont(obs, acts, t2, k_sig)
+
+        def vacio(c):
+            if i == h:                                     # primera salida: VACÍO a cualquier destino factible
+                return float(np.max(r0 + c))
+            casa = np.flatnonzero(acts == h)
+            return float(r0[casa[0]] + c[casa[0]]) if len(casa) else float(lane_reward(0.0, 0, self._dist[i, h],
+                                                                                         self._diesel[i, h]))
+        E2 = vacio(c2)
+        if obs.n_rechazos + 1 >= COTIZACIONES_MAX_POR_NODO:
+            W = np.full(len(acts), E2)                     # este es el último intento
+        else:
+            A2 = np.where(cotiza, (P * (r_k + c2[:, None]) + (1 - P) * E2).max(axis=1), -np.inf)
+            orden = np.argsort(-A2, kind="stable")
+            mejor, segundo = A2[orden[0]], (A2[orden[1]] if len(acts) > 1 else -np.inf)
+            W = np.maximum(np.where(np.arange(len(acts)) == orden[0], segundo, mejor), E2)
+        valor = np.where(cotiza, (P * (r_k + c1[:, None]) + (1 - P) * W[:, None]).max(axis=1), r0 + c1)
+        return int(acts[int(np.argmax(valor))])        # argmax devuelve el primero ⇒ índice menor

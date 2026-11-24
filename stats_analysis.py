@@ -1,14 +1,18 @@
 """
 stats_analysis.py
 =================
-Comparación estadística pareada del DRL contra los baselines B1, B2, B2P y B3, mundo a mundo
-(baselines_drl_ruteo_estocastico.md, sección Pruebas estadísticas).
+Comparación estadística pareada del DRL, mundo a mundo (baselines_drl_ruteo_estocastico.md, sección Pruebas
+estadísticas; especificacion_fase0_ruteo_pricing.md §8). Dos familias de comparaciones, cada una con su Holm:
+  · "ruteo"  : DRL − B1, B2, B2P, B3 (el baseline elige destino y cotiza con REGLA_PRECIO_BASELINES).
+  · "precio" (comparación B): DRL − DRL-dest+mediana, DRL-dest+be_margen, DRL-dest+miope. Mismos destinos
+    del DRL con una regla fija de precio: la diferencia mide lo que aporta la cabeza de precio.
 
-Unidad de análisis: la diferencia de margen (USD) DRL − baseline en un mismo mundo.
+Unidad de análisis: la diferencia de margen (USD) DRL − método en un mismo mundo.
   · Diferencia media pareada con intervalo del 95 % por bootstrap sobre mundos
     (BOOTSTRAP_B remuestreos, semilla fija; Agarwal et al., 2021).
-  · Wilcoxon de rangos con signo, pareado y de una cola (H1: DRL > baseline), con
-    corrección de Holm por las comparaciones de cada (modo, K) (Accorsi, Lodi y Vigo).
+  · Wilcoxon de rangos con signo, pareado y de una cola (H1: DRL > método), con
+    corrección de Holm por las comparaciones de cada (modo, K, familia) (Accorsi, Lodi y Vigo).
+  · Si UB-DP es "no tratable" a ese tamaño, B3 no está en los datos y simplemente no se compara.
   · B2 se compara en todos los niveles de K, incluido el libre.
   · Gap de cada método contra UB-DP y contra UB-PI: (ref − método) / |ref| · 100 sobre los
     promedios de los mismos mundos, con intervalo bootstrap. UB-PI es cota; UB-DP es el valor de la
@@ -29,6 +33,8 @@ from config import BOOTSTRAP_B, BOOTSTRAP_SEED, FECHA_INICIO, TRAIN_DAYS
 
 REFERENCIA = "DRL"
 BASELINES = ("B1", "B2", "B2P", "B3")
+REGLAS_PRECIO = ("DRL-dest+mediana", "DRL-dest+be_margen", "DRL-dest+miope")
+FAMILIAS = {"ruteo": BASELINES, "precio": REGLAS_PRECIO}
 _FECHA_INICIO_REPLAY = (
     datetime.date.fromisoformat(FECHA_INICIO) + datetime.timedelta(days=TRAIN_DAYS)
 ).isoformat()
@@ -40,7 +46,8 @@ def etiqueta_modo(modo: str) -> str:
     return NOTA_REPLAY if modo == "replay" else modo
 
 
-NOTA_UB_DP = ("UB-DP es el valor de la política que ignora el mercado (supone la distribución de las tarifas, "
+NOTA_UB_DP = ("UB-DP es el valor de la política que ignora el mercado, con dos intentos de cotización por visita "
+              "(supone la distribución de las tarifas, "
               "no su estado): NO es una cota, y un método que observa el índice de mercado puede superarla. "
               "UB-PI (información perfecta) sí es cota.")
 NOTA_UB_DP_FLOJA = "UB-DP floja (> UB-PI)"
@@ -130,12 +137,13 @@ def _wilcoxon_mayor(dif: np.ndarray) -> tuple:
         return float("nan"), float("nan")
 
 
-def comparar_con_baselines(df: pd.DataFrame, referencia: str = REFERENCIA, baselines=BASELINES,
+def comparar_con_baselines(df: pd.DataFrame, referencia: str = REFERENCIA, familias=FAMILIAS,
                            B: int = BOOTSTRAP_B, semilla: int = BOOTSTRAP_SEED,
                            alpha: float = 0.05) -> pd.DataFrame:
-    """Diferencia media pareada (referencia − baseline) con IC bootstrap y Wilcoxon + Holm.
+    """Diferencia media pareada (referencia − método) con IC bootstrap y Wilcoxon + Holm por familia.
 
-    df : DataFrame largo de evaluation (columnas modo, K, mundo, metodo, margen).
+    df       : DataFrame largo de evaluation (columnas modo, K, mundo, metodo, margen).
+    familias : {nombre: métodos}; Holm se aplica dentro de cada (modo, K, familia).
     """
     rng = np.random.Generator(np.random.PCG64(semilla))
     filas = []
@@ -143,31 +151,37 @@ def comparar_con_baselines(df: pd.DataFrame, referencia: str = REFERENCIA, basel
         ancho = g.pivot(index="mundo", columns="metodo", values="margen")
         if referencia not in ancho:
             continue
-        bloque = []
-        for b in baselines:
-            if b not in ancho:
-                continue
-            par = ancho[[referencia, b]].dropna()
-            dif = (par[referencia] - par[b]).to_numpy()
-            n = len(dif)
-            if n == 0:
-                continue
-            medias = dif[_indices_bootstrap(n, B, rng)].mean(axis=1)
-            stat, p = _wilcoxon_mayor(dif)
-            bloque.append({
-                "modo": etiqueta_modo(modo), "K": K, "comparacion": f"{referencia} − {b}", "n_mundos": n,
-                "dif_media_usd": float(dif.mean()),
-                "ic95_inf": float(np.percentile(medias, 2.5)),
-                "ic95_sup": float(np.percentile(medias, 97.5)),
-                "wilcoxon_stat": stat, "p_una_cola": p,
-            })
-        if bloque:
-            p_holm = holm(np.array([f["p_una_cola"] for f in bloque]))
-            for f, ph in zip(bloque, p_holm):
-                f["p_holm"] = float(ph)
-                f[f"significativo (Holm, α={alpha})"] = bool(ph < alpha)
-            filas.extend(bloque)
+        for familia, metodos in familias.items():
+            filas.extend(_bloque_pareado(ancho, modo, K, familia, metodos, referencia, B, rng, alpha))
     return pd.DataFrame(filas)
+
+
+def _bloque_pareado(ancho, modo, K, familia, metodos, referencia, B, rng, alpha) -> list:
+    bloque = []
+    for b in metodos:
+        if b not in ancho:
+            continue
+        par = ancho[[referencia, b]].dropna()
+        dif = (par[referencia] - par[b]).to_numpy()
+        n = len(dif)
+        if n == 0:
+            continue
+        medias = dif[_indices_bootstrap(n, B, rng)].mean(axis=1)
+        stat, p = _wilcoxon_mayor(dif)
+        bloque.append({
+            "modo": etiqueta_modo(modo), "K": K, "familia": familia,
+            "comparacion": f"{referencia} − {b}", "n_mundos": n,
+            "dif_media_usd": float(dif.mean()),
+            "ic95_inf": float(np.percentile(medias, 2.5)),
+            "ic95_sup": float(np.percentile(medias, 97.5)),
+            "wilcoxon_stat": stat, "p_una_cola": p,
+        })
+    if bloque:
+        p_holm = holm(np.array([f["p_una_cola"] for f in bloque]))
+        for f, ph in zip(bloque, p_holm):
+            f["p_holm"] = float(ph)
+            f[f"significativo (Holm, α={alpha})"] = bool(ph < alpha)
+    return bloque
 
 
 def gaps_contra_cotas(df: pd.DataFrame, B: int = BOOTSTRAP_B, semilla: int = BOOTSTRAP_SEED) -> pd.DataFrame:
@@ -195,11 +209,16 @@ def gaps_contra_cotas(df: pd.DataFrame, B: int = BOOTSTRAP_B, semilla: int = BOO
 
 
 def append_stats_sheets_to_excel(excel_path: str, sim_df: pd.DataFrame, replay_df: pd.DataFrame = None) -> None:
-    """Agrega 'Comparación pareada' y 'Gaps vs cotas' al Excel existente sin tocar las hojas previas."""
+    """Agrega al Excel existente, sin tocar las hojas previas:
+      · 'Comparación ruteo'      — DRL − B1, B2, B2P, B3 (familia "ruteo" de Holm)
+      · 'Comparación precio (B)' — DRL − DRL-dest+regla (familia "precio": lo que aporta la cabeza de precio)
+      · 'Gaps vs cotas'"""
     df = sim_df if replay_df is None or replay_df.empty else pd.concat([sim_df, replay_df], ignore_index=True)
     pareada = comparar_con_baselines(df)
     gaps = gaps_contra_cotas(df)
     with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-        pareada.to_excel(writer, sheet_name="Comparación pareada", index=False)
+        for familia, hoja in (("ruteo", "Comparación ruteo"), ("precio", "Comparación precio (B)")):
+            parte = pareada[pareada["familia"] == familia] if len(pareada) else pareada
+            parte.to_excel(writer, sheet_name=hoja, index=False)
         gaps.to_excel(writer, sheet_name="Gaps vs cotas", index=False)
     print(f"Hojas estadísticas agregadas → {excel_path}")

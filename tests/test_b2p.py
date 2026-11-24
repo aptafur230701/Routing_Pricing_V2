@@ -40,20 +40,21 @@ def test_b_h_es_la_mejor_prediccion_lineal(d):
     assert (np.diff(b) < 0).all() and b[-1] > f
 
 
-def test_tabla_por_h_es_media_lane_mas_b_h_por_indice(d):
-    """ev_dia(h, dow, dia, índice) = ev_empírico[dow] + b_h · prob_empírico[dow] · dist − el ev_empírico ya
-    resta el costo (ver baselines.politicas._promedios_empiricos_por_dow / calcular_ev_pronostico)."""
-    from baselines.politicas import _promedios_empiricos_por_dow
+def test_tabla_por_h_es_ev_miope_mas_b_h_por_indice(d):
+    """ev_dia(h, dow, dia, índice) = ev[dow] + b_h · pendiente[dow] · índice, con ev y pendiente de la cotización
+    miope sobre los cuantiles medios (baselines.politicas._valor_cotizado_por_dow)."""
+    from baselines.politicas import _valor_cotizado_por_dow
     mp, pol = d["mp"], d["b2p"]
-    ev_bruto, prob = _promedios_empiricos_por_dow(mp, d["dist"])
-    costo = d["dist"] * (d["diesel"] / MPG) + d["dist"] * MARGINAL_COST_SIN_DIESEL
+    ev, pendiente = _valor_cotizado_por_dow(mp, d["dist"], d["diesel"])
     rng = np.random.default_rng(0)
     idx = rng.normal(0, 0.1, N)
     for dia_hoy, dia in ((0, 0), (2, 5), (3, 3)):
         h = dia - dia_hoy
         dow = (4 + dia) % 7
-        esperado = ev_bruto[dow] - costo + pol.b[h] * prob[dow] * d["dist"] * idx[:, None]
+        esperado = ev[dow] + pol.b[h] * pendiente[dow] * idx[:, None]
         np.testing.assert_allclose(pol._ev_dia({}, 4, dia_hoy, dia, idx), esperado, rtol=1e-12, atol=1e-9)
+    # Con P̄ = 1 y sin dispersión de precios la pendiente sería prob · dist (la de antes): acá es menor o igual.
+    assert (pendiente <= d["dist"][None] + 1e-9).all()
 
 
 def _estados(d, B=60, pasos=1, seed=0):
@@ -66,15 +67,17 @@ def _estados(d, B=60, pasos=1, seed=0):
     masks = env.reset(starts, dias, k_max_arr=k, world_seeds=rng.integers(0, 2**31 - 1, B))
     activo = np.ones(B, bool)
     for _ in range(pasos):
-        acc = np.array([rng.choice(np.flatnonzero(m)) for m in masks])
-        _, term, masks = env.step(acc)
+        pares = [np.argwhere(o) for o in env.opciones_validas]
+        acc = np.array([p[rng.integers(len(p))] if len(p) else (0, 0) for p in pares])
+        _, term, masks = env.step(acc[:, 0], acc[:, 1])
         activo &= ~term
     obs = []
     for b in np.flatnonzero(activo):
         obs.append(Observacion(
             nodo=int(env.current_node[b]), casa=int(starts[b]), tiempo=float(env.time_elapsed[b]),
             k_restante=int(env.k_remaining[b]) if env.k_restricted[b] else None, mascara=masks[b].copy(),
-            loads_row=env.current_loads_row[b], rate_row=env.current_rate_row[b],
+            loads_row=env.current_loads_row[b], rate_row=env.rate_row_obs[b],
+            precios=env.precios_row[b].copy(), m=float(env.competencia[b]), opciones=env.opciones_validas[b].copy(),
             dia_semana_salida=int(env.start_dow[b]), indice=env.market_index[b].copy()))
     return obs
 
@@ -128,6 +131,5 @@ def test_b2p_corre_en_el_arnes_simulado_y_replay(d, K):
     ev = make_replay_env(d["tm"], d["rate"][TRAIN_DAYS:], d["loads"][TRAIN_DAYS:], d["dist"], d["diesel"], N,
                          day_offset=TRAIN_DAYS, market=d["mp"])
     for m in range(4):
-        r = ejecutar_politica(d["b2p"], ev, m, m, K, None, d["dist"], d["diesel"], d["mp"].dia_semana(TRAIN_DAYS + m),
-                              d["loads"][TRAIN_DAYS:], d["rate"][TRAIN_DAYS:])
+        r = ejecutar_politica(d["b2p"], ev, m, m, K, 50 + m, d["dist"], d["diesel"], d["mp"].dia_semana(TRAIN_DAYS + m))
         assert not r["violacion"] and np.isfinite(r["margen"])
