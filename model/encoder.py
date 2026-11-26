@@ -31,11 +31,14 @@ Features de continuación (solo con USE_CONTINUATION_FEATURES; i = nodo actual, 
 t = tiempo transcurrido, ev = calcular_ev_pronostico(...) de baselines/politicas.py, la misma tabla de B2P):
   [6]  home_time    — T[j, h] / MAX_DURATION (tiempo de j a casa)
   [7]  slack_after  — clip((MAX − (t + T[i,j]) − T[j,h]) / MAX, 0, 1) (holgura después de j)
-  [8]  ev_home      — clip(ev[dow_j, j, h] / p95, −1, 1): valor esperado de volver a casa desde j
-  [9]  ev_2hop      — clip(max(ev[dow_j,j,h], max_l ev[dow_j,j,l] + ev[dow_l,l,h]) / p95, −1, 1):
+  [8]  ev_home      — clip(ev_casa[dow_j, j, h] / p95, −1, 1): valor esperado de volver a casa desde j (si se
+                      pierde la carga se vuelve vacío: EvEsperado.ev_casa)
+  [9]  ev_2hop      — clip(max(ev_casa[dow_j,j,h], max_l ev[dow_j,j,l] + ev_casa[dow_l,l,h]) / p95, −1, 1):
                       continuación esperada a 2 saltos, l ∉ {i, j, h} y con retorno factible
-  Con dow_j = (dow0 + (t + T[i,j]) // 14) % 7. Para j == i las cuatro valen 0; para j == h,
-  f6 = f8 = f9 = 0 y f7 es la holgura del retorno directo.
+  Con dow_j = (dow0 + (t + T[i,j]) // 14) % 7. Para j == h, f6 = f8 = f9 = 0 y f7 es la holgura del retorno
+  directo. La fila j == i es la ESPERA (routing_env): su "arco" termina en fin_espera(t), el siguiente día de
+  mercado, así que [1] son las horas de espera y [6-9] la continuación desde i mañana (en casa antes de salir,
+  [7] es la holgura después de esperar y [6], [8], [9] valen 0). Su reward [0] es 0.
   Los valores esperados son los AJUSTADOS por el estado del mercado (los mismos de B2P): para un arco
   o→d que sale el día de mercado `dia`, ev_aj = ev[dow, o, d] + índice(o, hoy) · q[h, dow, o, d], con
   h = días de mercado entre hoy y esa salida (q[h] = b_h · P(N ≥ 1) · dist, b_h = f + (1 − f) ρ^h). Con
@@ -51,7 +54,14 @@ fuera del modo cotización). Van al final para que los checkpoints anteriores se
 cero (transfer_learning._reconcile_state_dict copia las columnas viejas en las primeras posiciones):
   [11] dispersion   — (p_0.8 − p_0.2) / p_0.5 de la lane i→j, recortada a [0, 1]
   [12] break_even   — costo / (dist · p_0.5): qué tan cerca está el mínimo rentable de la mediana, en [0, 2] / 2
-  [13] cotizable    — 1 si la lane i→j se puede cotizar ahora (carga, no rechazada, quedan cotizaciones)
+  [13] intentos     — cargas de la lane i→j que se pueden cotizar todavía en esta visita / COTIZACIONES_MAX_POR_NODO
+                      (> 0 si y solo si se puede cotizar)
+  [14 … 13+K]       — v_k = P_k·(p_k·d − c) / p95: valor esperado de cotizar cada nivel, recortado a [−1, 1]
+  [14+K … 13+2K]    — P_k = (1 − u_k)^m: probabilidad de ganar con cada nivel
+  [14+2K]           — valor de la lane con todos sus intentos (pricing.valor_reintentos) si perderlos vale 0, / p95
+  [15+2K]           — lo mismo si perderlos es recorrer la lane vacía (la vuelta): base −c
+  Las de [14] en adelante son 0 si la lane no se puede cotizar. Las columnas de cotización entran también a la
+  cabeza de precio (model/decoder.PriceHead), que así ve el valor de cada nivel y no solo el embedding.
   Las features [0] y [5] ya son, en ese modo, el margen si se cobrara la mediana (env.reward_rows).
 
 Condicionamiento en presupuesto de cardinalidad K:
@@ -73,13 +83,16 @@ import torch.nn.functional as F
 from config import (
     LTR_CLIP, LOADS_EXPECTED_CLIP, K_NORM, USE_CONTINUATION_FEATURES, COMPETENCIA_M_MAX, COTIZACIONES_MAX_POR_NODO,
 )
-from pricing import N_NIVELES, indice_nivel
+from pricing import N_NIVELES, U_NIVELES_ARR, indice_nivel, prob_ganar, valor_reintentos
+from routing_env import fin_espera
 
 # Número de features por nodo — debe coincidir con build_node_features()
 N_BASE_NODE_FEATURES  = 6
 N_CONT_FEATURES       = 4
 N_INDEX_FEATURES      = 1   # índice de mercado (columna INDEX_COL)
-N_COT_FEATURES        = 3   # cotización conjunta: las últimas columnas
+N_COT_FEATURES        = 3 + 2 * N_NIVELES + 2   # cotización conjunta: las últimas columnas
+COT_V = slice(3, 3 + N_NIVELES)                              # dentro de las de cotización: v_k
+COT_P = slice(3 + N_NIVELES, 3 + 2 * N_NIVELES)              # … y P_k
 INDEX_COL = N_BASE_NODE_FEATURES + (N_CONT_FEATURES if USE_CONTINUATION_FEATURES else 0)
 COT_COLS  = slice(INDEX_COL + N_INDEX_FEATURES, INDEX_COL + N_INDEX_FEATURES + N_COT_FEATURES)
 N_NODE_FEATURES = INDEX_COL + N_INDEX_FEATURES + N_COT_FEATURES
@@ -137,10 +150,11 @@ def build_continuation_features_batch(
     jj   = np.arange(N)
     hoy  = (t // 14.0).astype(np.int64)                                      # (B,) día de mercado actual
 
-    t_j  = t[:, None] + T[i, :]                                              # (B, N) llegada a j
-    T_jh = T[:, h].T                                                         # (B, N) tiempo de j a casa
     is_h = jj[None, :] == h[:, None]                                         # (B, N)
     is_i = jj[None, :] == i[:, None]                                         # (B, N)
+    # j = i es la espera: el "arco" i→i termina al siguiente día de mercado (fin_espera).
+    t_j  = np.where(is_i, fin_espera(t)[:, None], t[:, None] + T[i, :])     # (B, N) llegada a j
+    T_jh = T[:, h].T                                                         # (B, N) tiempo de j a casa
     T_jh = np.where(is_h, 0.0, T_jh)                                         # casa → casa: sin tiempo
 
     f7 = T_jh / MAX
@@ -149,8 +163,8 @@ def build_continuation_features_batch(
     dia_j = (t_j // 14.0).astype(np.int64)                                   # (B, N) día de salida desde j
     dow_j = (dow0[:, None] + dia_j) % 7                                      # (B, N)
     h_j   = np.clip(dia_j - hoy[:, None], 0, ev.h_max)                       # (B, N) días desde hoy hasta salir de j
-    ev_jh = (ev.ev[dow_j, jj[None, :], h[:, None]]
-             + idx * ev.q[h_j, dow_j, jj[None, :], h[:, None]])              # (B, N) arco j→casa
+    ev_jh = (ev.ev_casa[dow_j, jj[None, :], h[:, None]]
+             + idx * ev.q_casa[h_j, dow_j, jj[None, :], h[:, None]])              # (B, N) arco j→casa
     f9 = np.clip(ev_jh / p95, -1.0, 1.0)
 
     # Continuación a 2 saltos: j → l → casa, con l ∉ {i, j, h} y retorno factible.
@@ -167,18 +181,16 @@ def build_continuation_features_batch(
     h_l   = np.clip(dia_l - hoy[:, None, None], 0, ev.h_max)
     dj, hj, jx, lx = dow_j[:, :, None], h_j[:, :, None], jj[None, :, None], jj[None, None, :]
     ev_jl = ev.ev[dj, jx, lx] + idx[:, :, None] * ev.q[hj, dj, jx, lx]       # (B, N, N) arco j→l (origen j)
-    ev_lh = (ev.ev[dow_l, lx, h[:, None, None]]
-             + idx[:, None, :] * ev.q[h_l, dow_l, lx, h[:, None, None]])     # (B, N, N) arco l→casa (origen l)
+    ev_lh = (ev.ev_casa[dow_l, lx, h[:, None, None]]
+             + idx[:, None, :] * ev.q_casa[h_l, dow_l, lx, h[:, None, None]])     # (B, N, N) arco l→casa (origen l)
     dos   = np.where(valid, ev_jl + ev_lh, -np.inf).max(axis=2)              # (B, N); -inf si no hay l
     f10 = np.clip(np.maximum(ev_jh, dos) / p95, -1.0, 1.0)
 
-    # Casos especiales: j == h → f7 = f9 = f10 = 0 (f8 = holgura del retorno directo);
-    # j == i (self-loop) → las cuatro en 0 (tiene precedencia si i == h).
+    # Casos especiales: j == h → f7 = f9 = f10 = 0 (f8 = holgura del retorno directo; en casa antes de salir,
+    # la holgura después de esperar). j == i (fuera de casa) es la espera: la continuación desde i mañana.
     f7[is_h] = 0.0
     f9[is_h] = 0.0
     f10[is_h] = 0.0
-    for f in (f7, f8, f9, f10):
-        f[is_i] = 0.0
 
     return np.stack([f7, f8, f9, f10], axis=-1).astype(np.float32)
 
@@ -609,6 +621,13 @@ def build_node_features_batch(
         )
         feats[~safe, :, col] = 0.0
 
+    # ── Fila propia (j = i) = la espera: f1 son las horas hasta el siguiente día de mercado y f2 = 0 (la
+    # diagonal de distancias trae una distancia intra-hub, pero esperar no recorre nada) ──
+    feats[np.arange(B), current_node, 2] = 0.0
+    if time_elapsed is not None:
+        t = np.asarray(time_elapsed, dtype=np.float64)
+        feats[np.arange(B), current_node, 1] = fin_espera(t) - t
+
     # ── Absolute normalization for f1 (time) ─────────────────────────────────
     feats[:, :, 1] = np.clip(feats[:, :, 1] / max(max_duration, 1e-6), 0.0, 1.0)
 
@@ -642,9 +661,13 @@ def build_cotizacion_node_features_batch(
     opciones:     np.ndarray,   # (B, N, K+1) bool (env.opciones_validas)
     dist_rows:    np.ndarray,   # (B, N) distancia i→j
     cost_rows:    np.ndarray,   # (B, N) costo i→j (pricing.lane_cost_row)
+    m:            np.ndarray,   # (B,) competidores efectivos del nodo actual (env.competencia)
+    intentos:     np.ndarray,   # (B, N) cargas cotizables que quedan por lane (env.intentos)
+    reward_global_p95: float,
 ) -> np.ndarray:                # (B, N, N_COT_FEATURES) float32
     """Features de cotización por lane i→j (ver docstring del módulo): dispersión del precio, break-even
-    relativo a la mediana y si se puede cotizar. El self-loop (j = i) queda en cero."""
+    relativo a la mediana, si se puede cotizar y, por nivel, el valor esperado de cotizarlo y P(ganar). El
+    self-loop (j = i) queda en cero."""
     precios = np.asarray(precios, dtype=np.float64)
     B, N = precios.shape[:2]
     p_med = precios[..., _U_50]
@@ -653,10 +676,24 @@ def build_cotizacion_node_features_batch(
     dispersion = np.where(ok, (precios[..., _U_80] - precios[..., _U_20]) / seguro, 0.0)
     break_even = np.where(ok, np.asarray(cost_rows, dtype=np.float64)
                           / (np.maximum(np.asarray(dist_rows, dtype=np.float64), 1e-9) * seguro), 2.0)
-    out = np.stack([
-        np.clip(dispersion, 0.0, 1.0),
-        np.clip(break_even, 0.0, 2.0) / 2.0,
-        np.asarray(opciones)[..., :N_NIVELES].any(axis=-1).astype(np.float64),
+    cotizable = np.asarray(opciones)[..., :N_NIVELES].any(axis=-1)                         # (B, N)
+    d = np.asarray(dist_rows, dtype=np.float64)[..., None]                                # (B, N, 1)
+    c = np.asarray(cost_rows, dtype=np.float64)[..., None]
+    P = prob_ganar(U_NIVELES_ARR[None, :], np.asarray(m, dtype=np.float64)[:, None])[:, None, :]      # (B, 1, K)
+    p95 = max(float(reward_global_p95), 1e-6)
+    v = P * (precios * d - c) / p95                                                       # (B, N, K)
+    A = COTIZACIONES_MAX_POR_NODO
+    n = np.clip(np.asarray(intentos, dtype=np.int64), 0, A)[None]                         # (1, B, N)
+    abierto, cierre = (np.take_along_axis(valor_reintentos(P, precios * d - c, base, A)[0], n, axis=0)[0][..., None] / p95
+                       for base in (np.zeros_like(c[..., 0]), -c[..., 0]))                # (B, N, 1)
+    por_nivel = np.concatenate([
+        np.clip(v, -1.0, 1.0), np.broadcast_to(P, v.shape),
+        np.clip(abierto, -1.0, 1.0), np.clip(cierre, -1.0, 1.0),
+    ], axis=-1)
+    out = np.concatenate([
+        np.stack([np.clip(dispersion, 0.0, 1.0), np.clip(break_even, 0.0, 2.0) / 2.0,
+                  np.where(cotizable, n[0] / A, 0.0)], axis=-1),
+        np.where(cotizable[..., None], por_nivel, 0.0),
     ], axis=-1).astype(np.float32)
     out[np.arange(B), np.asarray(current_node, dtype=np.int64)] = 0.0
     return out

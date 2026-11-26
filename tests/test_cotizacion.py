@@ -6,7 +6,7 @@ Fase 1 de especificacion_fase0_ruteo_pricing.md: modelo de mercado de la cotizac
   · m(LTR): valores en el LTR de referencia, en los extremos y monotonía (§3.3)
   · con m = 1 el competidor cotiza exactamente la tarifa sorteada del modelo anterior (test 1)
   · la frecuencia de ganar en el nivel k converge a (1 − u_k)^m (test 2)
-  · el nivel 0 gana siempre y los niveles son monótonos en precio (test 3)
+  · ningún nivel gana siempre (el más bajo es p10) y los niveles son monótonos en precio (test 3)
   · determinismo por (semilla, nodo, día), sin importar el lote ni el orden (test 4)
   · el tablero no cambia las cargas ni la tarifa de los métodos actuales
   · reglas de precio fijas: mediana, break-even + margen y miope óptima (§6)
@@ -15,10 +15,10 @@ Fase 1 de especificacion_fase0_ruteo_pricing.md: modelo de mercado de la cotizac
 import numpy as np
 import pytest
 
-from config import U_NIVELES, COMPETENCIA_KAPPA, COMPETENCIA_M_MAX, BE_MARGEN, TRAIN_DAYS
+from config import U_NIVELES, COMPETENCIA_KAPPA, COMPETENCIA_M_MAX, BE_MARGEN, TRAIN_DAYS, COTIZACIONES_MAX_POR_NODO
 from market_process import MarketProcess, Tablero, asegurar_parametros
 from pricing import (
-    N_NIVELES, U_NIVELES_ARR, competidores_efectivos, gana, interp_cuantiles, nivel_regla,
+    N_NIVELES, U_NIVELES_ARR, competidores_efectivos, gana, interp_cuantiles, nivel_regla, valor_reintentos,
     percentil_competidor, precios_niveles, prob_ganar,
 )
 
@@ -63,15 +63,18 @@ def test_frecuencia_de_ganar_converge_a_la_formula(m):
         assert gana(u, u_comp).mean() == pytest.approx(float(prob_ganar(u, m)), abs=3e-3)
 
 
-def test_nivel_cero_gana_siempre():
-    assert gana(0.0, np.array([0.0, 1e-12, 0.5, 0.999])).all()
+def test_ningun_nivel_gana_siempre():
+    assert U_NIVELES_ARR[0] == pytest.approx(0.1)                       # el más bajo es p10
+    assert not gana(U_NIVELES_ARR[0], np.array([0.0, 0.05, 0.1])).any()   # competidor por debajo de p10: pierde
+    assert gana(U_NIVELES_ARR[0], np.array([0.11, 0.5, 0.999])).all()
     u_comp = percentil_competidor(np.random.default_rng(2).random(100_000), COMPETENCIA_M_MAX)
-    assert gana(U_NIVELES_ARR[0], u_comp).all()
+    frac = gana(U_NIVELES_ARR[0], u_comp).mean()                         # con m = M_MAX, p10 gana 0.9^20 ≈ 12 %
+    assert 0.0 < frac < 1.0 and frac == pytest.approx(0.9 ** COMPETENCIA_M_MAX, abs=0.01)
 
 
 def test_prob_ganar_baja_con_el_nivel_y_con_la_competencia():
     p = prob_ganar(U_NIVELES_ARR, 3.0)
-    assert p[0] == 1.0 and np.all(np.diff(p) < 0)
+    assert p[0] == pytest.approx(0.9 ** 3) and np.all(np.diff(p) < 0)
     assert prob_ganar(0.5, 1.0) > prob_ganar(0.5, 2.0) > prob_ganar(0.5, 10.0)
 
 
@@ -80,7 +83,7 @@ def test_prob_ganar_baja_con_el_nivel_y_con_la_competencia():
 def test_niveles_en_los_cuantiles(cuantiles):
     p = precios_niveles(cuantiles)
     assert p.shape == (N_NIVELES,)
-    assert p[0] == pytest.approx(2.0)                                  # u = 0   → min
+    assert p[0] > 2.0 and p[0] < 3.0                                   # u = 0.1 → entre min y q1
     assert p[list(U_NIVELES).index(0.5)] == pytest.approx(4.0)        # u = 0.5 → q2
     assert p[list(U_NIVELES).index(0.9)] == pytest.approx(6.0)        # u = 0.9 → p90
     assert np.all(np.diff(p) >= 0)
@@ -172,7 +175,7 @@ def test_con_un_competidor_cotiza_la_tarifa_de_siempre(mp, monkeypatch):
     monkeypatch.setattr(mp, "competidores", lambda nodos, dias: np.ones(len(nodos)))
     nodos = np.arange(NUM_NODES)
     t = _fila(mp, nodos, np.full(NUM_NODES, DIA), np.full(NUM_NODES, SEMILLA))
-    np.testing.assert_allclose(t.precio_competidor, t.tarifa, rtol=1e-6)
+    np.testing.assert_allclose(t.precio_competidor[..., 0], t.tarifa, rtol=1e-6)
 
 
 def test_formas_y_niveles_monotonos(mp):
@@ -181,7 +184,8 @@ def test_formas_y_niveles_monotonos(mp):
     assert t.loads.shape == (NUM_NODES, NUM_NODES) and t.m.shape == (NUM_NODES,)
     assert t.precios.shape == (NUM_NODES, NUM_NODES, N_NIVELES)
     assert np.all(np.diff(t.precios, axis=-1) >= -1e-9)
-    assert np.all(t.precios[..., 0] <= t.tarifa + 1e-4)                # nivel 0 = mínimo del mercado
+    assert np.all(t.precios[..., 0] <= t.precios[..., -1] + 1e-9)       # p10 ≤ p90
+    assert t.u_comp.shape == t.precio_competidor.shape == (NUM_NODES, NUM_NODES, COTIZACIONES_MAX_POR_NODO)
     assert np.all((t.u_comp >= 0) & (t.u_comp <= 1))
     assert np.all((t.m >= 1) & (t.m <= COMPETENCIA_M_MAX))
 
@@ -212,6 +216,21 @@ def test_mundo_cotizacion_coincide_con_tablero_y_sample_world(mp):
     d, i = 1, 4
     fila = _fila(mp, [i], [DIA + d], [SEMILLA])
     np.testing.assert_array_equal(mundo.u_comp[d, i], fila.u_comp[0])
+
+
+def test_valor_reintentos_es_la_recursion_y_sube_con_los_intentos():
+    P = (1.0 - U_NIVELES_ARR) ** 2.0
+    margen = -50.0 + 300.0 * U_NIVELES_ARR
+    for base in (0.0, -900.0):
+        V, ks = valor_reintentos(P, margen, base, 4)
+        v = base
+        for a in range(1, 5):
+            q = P * margen + (1 - P) * v
+            assert ks[a - 1] == int(np.argmax(q))
+            v = float(q.max())
+            assert V[a] == pytest.approx(v)
+        assert (np.diff(V) > 0).all() and (np.diff(ks) >= 0).all()      # con más cargas por cotizar, más valor y más alto
+    assert valor_reintentos(P, margen, -900.0, 1)[1][0] < valor_reintentos(P, margen, 0.0, 1)[1][0]
 
 
 def test_tablero_real_usa_el_dia_real_y_es_determinista(mp):

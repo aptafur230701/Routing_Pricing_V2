@@ -4,7 +4,7 @@ resumen_semillas.py
 Resume el DRL entrenado con varias semillas contra los baselines, mundo a mundo (mismos mundos y casos de
 replay en todas las corridas: los baselines no dependen de la semilla del DRL).
 
-Lee los Excel de resultados de cada semilla (hojas "Mundos simulados" y "Replay") y reporta, por modo:
+Lee los datos por mundo de cada semilla (mundos_AM.csv, que escribe main.py) y reporta, por modo:
   · margen medio del DRL de cada semilla y su promedio (el DRL promedio de un mundo es el promedio de las
     semillas en ese mundo);
   · margen medio de los baselines;
@@ -25,18 +25,19 @@ import pandas as pd
 from stats_analysis import ic_bootstrap_media
 
 _CWD = os.path.dirname(os.path.abspath(__file__))
-_HOJAS = {"simulado": "Mundos simulados", "replay": "Replay"}
+_MODOS = ("simulado", "replay")
 _BASELINES = ("B1", "B2", "B2P", "B3")
 
 
 def cargar(carpetas, semillas, K="libre") -> dict:
     """{modo: DataFrame ancho (mundo × [DRL_s42, ..., B1, B2, B2P, B3])}; comprueba que los baselines coinciden."""
+    datos = {c: pd.read_csv(os.path.join(_CWD, c, "mundos_AM.csv")) for c in carpetas}
     out = {}
-    for modo, hoja in _HOJAS.items():
+    for modo in _MODOS:
         ancho, base = {}, None
         for carpeta, semilla in zip(carpetas, semillas):
-            df = pd.read_excel(os.path.join(_CWD, carpeta, "DRL_Routing_Summary_AM.xlsx"), sheet_name=hoja)
-            df = df[df["K"].astype(str) == K]
+            df = datos[carpeta]
+            df = df[(df["modo"] == modo) & (df["K"].astype(str) == K)]
             p = df.pivot(index="mundo", columns="metodo", values="margen")
             ancho[f"DRL_s{semilla}"] = p["DRL"]
             b = p[list(_BASELINES)]

@@ -52,10 +52,12 @@ from config import (
 from routing_env import VectorRoutingEnv
 from greedy_rollout import greedy_rollout, construir_features
 from model.agent import AMRoutingAgent
+from model.encoder import COT_COLS
 from model.critic_head import CriticHead
+from baselines.dp_relajada import PENALIZACION_USD
 from baselines.politicas import calcular_ev_pronostico
 from model.debug_utils import check_tensor
-from evaluation import disenar_mundos
+from evaluation import dias_de_salida, disenar_mundos
 from market_process import MarketProcess, asegurar_parametros
 
 
@@ -240,11 +242,13 @@ def _forward(
     values = critic(h_t)
     if (mask_t.sum(dim=-1) == 0).any():
         raise RuntimeError("Invalid mask: sample(s) with zero valid actions detected")
+    cot = feats_t["node_feats"][..., COT_COLS]                                  # entra también a la cabeza de precio
     if actions_t is None:
-        actions, opcion, log_probs, h_dest, h_precio = agent.decoder.act_cotizacion(h_t, embeddings, mask_t, opciones_t)
+        actions, opcion, log_probs, h_dest, h_precio = agent.decoder.act_cotizacion(
+            h_t, embeddings, mask_t, opciones_t, cot)
     else:
         log_probs, h_dest, h_precio = agent.decoder.evaluate_cotizacion(
-            h_t, embeddings, mask_t, opciones_t, actions_t, opcion_t)
+            h_t, embeddings, mask_t, opciones_t, cot, actions_t, opcion_t)
         actions, opcion = actions_t, opcion_t
     check_tensor("log_probs", log_probs)
     return actions, opcion, log_probs, h_dest, h_precio, values
@@ -367,7 +371,7 @@ class ValidacionSimulada:
             k_max_arr=self.k_arr, avail_expected_arr=self.avail, world_seeds=self.semillas,
             ev_esperado=self.ev,
         )
-        margen = np.where(res.valid, res.raw_reward, 0.0)
+        margen = np.where(res.valid, res.raw_reward, res.raw_reward + PENALIZACION_USD)   # como en la evaluación
         out = {"por_k": {}}
         for i, K in enumerate(self.niveles):
             sl = slice(i * self.M, (i + 1) * self.M)
@@ -375,14 +379,14 @@ class ValidacionSimulada:
             cot = int(res.n_cotizaciones[sl].sum())
             niv = [n for lista in res.niveles[sl] for n in lista]
             out["por_k"]["free" if K is None else str(K)] = {
-                "margen": float(res.raw_reward[sl][v].mean()) if v.any() else 0.0,
+                "margen": float(margen[sl].mean()),
                 "valid_rate": float(v.mean()),
                 "tasa_aceptacion": float(res.n_ganadas[sl].sum() / cot) if cot else float("nan"),
                 "nivel_medio": float(np.mean(niv)) if niv else float("nan"),
             }
-        out["margen"] = float(res.raw_reward[res.valid].mean()) if res.valid.any() else 0.0
+        out["margen"] = float(margen.mean())
         out["valid_rate"] = float(res.valid.mean())
-        out["score"] = float(margen.mean())    # inválidos cuentan 0: elige el mejor update
+        out["score"] = out["margen"]           # con las fallas penalizadas: elige el mejor update
         return out
 
 
@@ -405,7 +409,7 @@ def _paso_rollout(agent, critic, env, masks, start_nodes, active, ep_bufs, fases
     with fases("rollout_env"):
         rewards, terminated, next_masks = env.step(actions, opciones)
         time_violation = env.last_time_violation
-        viajo = ~(env.last_cotizo & ~env.last_gano)
+        viajo = ~(env.last_cotizo & ~env.last_gano) & ~env.last_espero
         cotizo, gano = env.last_cotizo.copy(), env.last_gano.copy()
     with fases("rollout_buffer"):
         for b in np.flatnonzero(active):
@@ -588,7 +592,7 @@ def run_am_training(
     n_eval_episodes = min(N_EVAL_EPISODES, num_nodes, 20)
     eval_rng         = np.random.RandomState(SEED)
     eval_start_nodes = eval_rng.choice(num_nodes, size=n_eval_episodes, replace=False)
-    eval_start_days  = eval_rng.randint(0, num_train_days, size=n_eval_episodes)
+    eval_start_days  = eval_rng.randint(0, dias_de_salida(num_train_days), size=n_eval_episodes)
     # Niveles de K balanceados sobre el set fijo de evaluación — mismo eval_rng
     # dedicado (nunca np.random global), calculado una sola vez.
     eval_k_levels    = _balanced_k_assignment(n_eval_episodes, eval_rng)
@@ -647,7 +651,7 @@ def run_am_training(
             extra = np.random.choice(num_nodes, size=remainder, replace=False)
             start_nodes_arr = np.concatenate([start_nodes_arr, extra])
         start_nodes_arr = np.random.permutation(start_nodes_arr).astype(np.int64)
-        start_day_idxs  = np.random.randint(0, num_train_days, size=B).astype(np.int64)
+        start_day_idxs  = np.random.randint(0, dias_de_salida(num_train_days), size=B).astype(np.int64)
 
         # Balanced K-level sampling: los niveles de K_TRAINING_LEVELS (restringido
         # + libre) se reparten balanceados sobre los B episodios, con su propia permutación
@@ -666,7 +670,7 @@ def run_am_training(
 
         masks  = vec_env.reset(start_nodes_arr, start_day_idxs, k_max_arr=k_max_arr,
                                world_seeds=world_seeds)   # (B, N)
-        active = np.ones(B, dtype=bool)
+        active = vec_env.active.copy()   # una fila sin ninguna jugada desde casa no sale (sin transiciones)
 
         techo_pasos = vec_env.max_steps   # max_pasos_cotizacion
         with torch.no_grad():

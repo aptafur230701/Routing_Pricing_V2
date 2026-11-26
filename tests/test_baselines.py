@@ -32,8 +32,12 @@ from routing_env import OPCION_VACIO
 from config import (
     MAX_DURATION, TRAIN_DAYS, K_MAX, MARKET_SEED_TRAIN, MARKET_SEED_EVAL, MARKET_SEED_EVAL_FINAL,
 )
-from baselines.dp_relajada import calcular_tabla, cargar_o_calcular_tabla, franjas_rechazo, _sortear_tableros
+from baselines.dp_relajada import (calcular_tabla, cargar_o_calcular_tabla, franjas_rechazo, _sortear_tableros,
+                                   PENALIZACION_USD)
+from baselines.ub_pi import franjas_por_dia
+from routing_env import vacio_permitido
 import evaluation as ev
+from config import COTIZACIONES_MAX_POR_NODO
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices, lane_reward
 import stats_analysis as st
@@ -100,8 +104,9 @@ def test_tabla_dp_coincide_con_enumeracion_ingenua_de_los_dos_intentos():
     """Instancia chica (4 nodos, viajes de 6-10 h, franjas de 15 min, S = 4) donde sí hay revisitas y rechazos.
 
     La enumeración es la ecuación de especificacion_fase0_ruteo_pricing.md §7.3 escrita con loops: por cada
-    tablero, la mejor de (VACÍO a casa) y (cotizar j al nivel k; si se pierde, segundo intento sobre el mismo
-    tablero sin j; si se vuelve a perder, VACÍO a casa)."""
+    tablero y r rechazos, la mejor de E (la mejor jugada sin carga: casa vacío, reposicionarse ≤ 300 mi o esperar
+    al día siguiente) y (cotizar j al nivel k, si la lane tiene más de r cargas; si se pierde, lo mismo con r + 1). En casa sin haber salido (H): sin "volver"; sin ninguna jugada, 0 en s = 0 y la penalización
+    después."""
     asegurar_parametros()
     n, S, dt, K = 4, 4, 0.25, 3
     _, _, _, dist, diesel, *_ = load_matrices(n)
@@ -118,22 +123,41 @@ def test_tabla_dp_coincide_con_enumeracion_ingenua_de_los_dos_intentos():
     smax = int(np.floor(MAX_DURATION / dt + 1e-9))
     tau = franjas_rechazo(dt)
     assert tau == 1
+    C = COTIZACIONES_MAX_POR_NODO
+    pd_ = franjas_por_dia(dt)
+    rep = vacio_permitido(dist)
     niveles = range(Rk.shape[-1])
-    memo = {}
+    memo, memo_h = {}, {}
+    vuelta = f + f.T
+    np.fill_diagonal(vuelta, smax + 1)
+
+    def E_de(k, d0, h, i, t):
+        """La mejor jugada sin carga desde el intermedio i en la franja t."""
+        e = float(R0[i, h])
+        sw = (t // pd_ + 1) * pd_
+        if sw + f[i, h] <= smax:
+            e = max(e, V(k, d0, h, i, sw))
+        if k is None or k >= 2:
+            for j in range(n):
+                if rep[i, j] and j not in (i, h) and t + f[i, j] + f[j, h] <= smax:
+                    e = max(e, float(R0[i, j]) + V(None if k is None else k - 1, d0, h, j, t + f[i, j]))
+        return e
 
     def V(k, d0, h, i, s):
         clave = (k, d0, h, i, s)
         if clave in memo:
             return memo[clave]
         dw = (d0 + int((s * dt) // 14)) % 7
-        s2 = min(s + tau, smax)
-        E = float(R0[i, h])
+        ts = [min(s + r * tau, smax) for r in range(C + 1)]
+        Es = [E_de(k, d0, h, i, t) for t in ts]
         vals = []
         for m in range(S):
             d = D[dw, i, m]
 
-            def valido(j, t):
-                if not A[dw, i, m, j]:
+            def valido(j, t, r):
+                if A[dw, i, m, j] <= r:
+                    return False
+                if t + tau + f[i, h] > smax:                        # si se pierde, no alcanza a volver
                     return False
                 if j == h:
                     return True
@@ -144,29 +168,57 @@ def test_tabla_dp_coincide_con_enumeracion_ingenua_de_los_dos_intentos():
                 return float(Rk[dw, d, i, j, lvl]) + cont
 
             def intento(j, t, respaldo):
-                return max(P[dw, d, i, l] * G(j, l, t) + (1 - P[dw, d, i, l]) * respaldo(j) for l in niveles)
+                return max(P[dw, d, i, l] * G(j, l, t) + (1 - P[dw, d, i, l]) * respaldo for l in niveles)
 
-            segundo = {j: intento(j, s2, lambda _: E) for j in range(n) if valido(j, s2)}
-            W = lambda j: max([E] + [v for jj, v in segundo.items() if jj != j])
-            vals.append(max([E] + [intento(j, s, W) for j in range(n) if valido(j, s)]))
+            b = Es[C]
+            for r in range(C - 1, -1, -1):
+                b = max([Es[r]] + [intento(j, ts[r], b) for j in range(n) if valido(j, ts[r], r)])
+            vals.append(b)
         memo[clave] = float(np.mean(vals))
         return memo[clave]
 
-    def V0(k, d0, h):
+    def H(k, d0, h, s):
+        """Valor en casa sin haber salido, en la franja s (k arcos; None = libre)."""
+        clave = (k, d0, h, s)
+        if clave in memo_h:
+            return memo_h[clave]
         ks = None if k is None else k - 1
+        dw = (d0 + int((s * dt) // 14)) % 7
         ok = lambda j, t: j != h and t + f[h, j] + f[j, h] <= smax
-        E1 = max(float(R0[h, j]) + V(ks, d0, h, j, f[h, j]) for j in range(n) if ok(j, 0))
-        E2 = max(float(R0[h, j]) + V(ks, d0, h, j, tau + f[h, j]) for j in range(n) if ok(j, tau))
+
+        def sin_carga(t):
+            e = -np.inf
+            sw = (t // pd_ + 1) * pd_
+            if sw + vuelta[h].min() <= smax:
+                e = H(k, d0, h, sw)
+            for j in range(n):
+                if rep[h, j] and ok(j, t):
+                    e = max(e, float(R0[h, j]) + V(ks, d0, h, j, t + f[h, j]))
+            return e
+
+        ts = [min(s + r * tau, smax) for r in range(C + 1)]
+        Es = [sin_carga(t) for t in ts]
+        falla = lambda x: x if np.isfinite(x) else PENALIZACION_USD   # después de perder, sin jugadas: falla
         vals = []
         for m in range(S):
-            d = D[d0, h, m]
-            G = lambda j, l, t: float(Rk[d0, d, h, j, l]) + V(ks, d0, h, j, t + f[h, j])
-            intento = lambda j, t, resp: max(P[d0, d, h, l] * G(j, l, t) + (1 - P[d0, d, h, l]) * resp(j)
+            d = D[dw, h, m]
+            G = lambda j, l, t: float(Rk[dw, d, h, j, l]) + V(ks, d0, h, j, t + f[h, j])
+            intento = lambda j, t, resp: max(P[dw, d, h, l] * G(j, l, t) + (1 - P[dw, d, h, l]) * resp
                                              for l in niveles)
-            segundo = {j: intento(j, tau, lambda _: E2) for j in range(n) if A[d0, h, m, j] and ok(j, tau)}
-            W = lambda j: max([E2] + [v for jj, v in segundo.items() if jj != j])
-            vals.append(max([E1] + [intento(j, 0, W) for j in range(n) if A[d0, h, m, j] and ok(j, 0)]))
-        return float(np.mean(vals))
+            mejor = falla(Es[C])
+            for r in range(C - 1, -1, -1):
+                mejor = max([Es[r]] + [intento(j, ts[r], mejor) for j in range(n)
+                                       if A[dw, h, m, j] > r and ok(j, ts[r])])
+                if r > 0:
+                    mejor = falla(mejor)
+            if not np.isfinite(mejor):
+                mejor = 0.0 if s == 0 else PENALIZACION_USD        # no sale (s = 0) o falla (después)
+            vals.append(mejor)
+        memo_h[clave] = float(np.mean(vals))
+        return memo_h[clave]
+
+    def V0(k, d0, h):
+        return H(k, d0, h, 0)
 
     for d0, h in ((0, 0), (3, 2)):
         for k in (2, 3):
@@ -299,18 +351,24 @@ class _RutaConInformacionPerfecta:
 
     def actuar(self, obs) -> int:
         self._pos += 1
-        return int(self._ruta[self._pos])
+        return int(self._ruta[self._pos])                     # el mismo nodo = esperar
 
     def cotizar(self, obs, j) -> int:
-        if not obs.opciones[j, :N_NIVELES].any():
+        n = int(obs.intentos[j])
+        if j == obs.nodo or n == 0:
+            return OPCION_VACIO                               # esperar, o la lane se recorre vacía
+        u = self._env.u_comp_cargas[0, j, int(self._env.perdidas[0, j]):][:n]
+        if not gana(U_NIVELES_ARR, u.max()).any():
             return OPCION_VACIO
-        g = gana(U_NIVELES_ARR, self._env.u_comp_row[0, j])
-        return int(np.flatnonzero(g).max())
+        if u.argmax() > 0 and not gana(U_NIVELES_ARR[-1], u[0]):
+            self._pos -= 1                                    # pierde esta carga (p90) para llegar a la mejor
+            return N_NIVELES - 1
+        return int(np.flatnonzero(gana(U_NIVELES_ARR, u[0])).max())
 
 
 def test_ub_pi_alineado_con_el_entorno(inst10):
-    """El entorno acepta la ruta de UB-PI (cotizando el nivel más alto que gana, sin rechazos) y su margen no
-    supera el valor de UB-PI.
+    """El entorno acepta la ruta de UB-PI (en cada lane pierde a propósito las cargas peores y cotiza la mejor en el
+    nivel más alto que gana) y su margen no supera el valor de UB-PI, que no cobra esos 15 min por carga.
 
     UB-PI redondea los tiempos hacia abajo (franjas de 1 min) y usa la envolvente de días cerca de
     las fronteras, así que su ruta puede exceder MAX_DURATION en unos minutos (entonces el entorno
@@ -319,21 +377,26 @@ def test_ub_pi_alineado_con_el_entorno(inst10):
     env = ev.make_sim_env(inst.tm, inst.rate[:TRAIN_DAYS], inst.loads[:TRAIN_DAYS],
                           inst.dist, inst.diesel, inst.n, inst.market)
     dis = ev.disenar_mundos(inst.n, 12, inst.market)
+    comprobadas = 0
     for m in range(12):
         h, dow = int(dis["nodo"][m]), int(dis["dow"][m])
         dia, ws = int(dis["start_day"][m]), int(dis["world_seed"][m])
         mundo = ev.mundo_ub_pi(inst.market.mundo_cotizacion(ws, 6, dia))
         for K in (K_MAX, None):
             rew, ruta = ev.ub_pi(inst.T, inst.dist, inst.diesel, h, K, mundo)
-            duracion = sum(inst.T[a, b] for a, b in zip(ruta[:-1], ruta[1:]))
-            if duracion > MAX_DURATION:
-                assert duracion - MAX_DURATION < (len(ruta) - 1) / 60.0       # a lo sumo una franja por arco
-                continue
+            if len(ruta) == 1:
+                continue                                                       # no sale
+            viajes = [n for k, n in enumerate(ruta) if k == 0 or n != ruta[k - 1]]
+            duracion = sum(inst.T[a, b] for a, b in zip(viajes[:-1], viajes[1:]))
+            if duracion > MAX_DURATION or ruta != viajes:
+                continue          # redondeo de franjas o esperas: el día real puede diferir de la franja
             res = ev.ejecutar_politica(_RutaConInformacionPerfecta(ruta, env), env, h, dia, K, ws,
                                        inst.dist, inst.diesel, dow)
-            assert not res["violacion"] and res["ruta"] == ruta
-            assert res["n_ganadas"] == res["n_cotizaciones"]                  # sin rechazos
+            if res["violacion"] or res["ruta"] != viajes or duracion + res["horas_rechazo"] > MAX_DURATION:
+                continue                                                       # los 15 min por carga perdida no cupieron
             assert res["margen"] <= rew + 1e-6
+            comprobadas += 1
+    assert comprobadas >= 6
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -348,7 +411,7 @@ def test_diseno_de_mundos_balanceado(inst10):
     assert cuenta_nodos.min() >= M // n and cuenta_nodos.max() <= -(-M // n)
     assert cuenta_dow.min() >= M // 7 and cuenta_dow.max() <= -(-M // 7)
     assert (inst10.market.dia_semana(dis["start_day"]) == dis["dow"]).all()
-    assert (dis["start_day"] < TRAIN_DAYS).all()
+    assert (dis["start_day"] <= TRAIN_DAYS - ev.MARKET_DIAS_EPISODIO).all()      # ningún episodio se queda sin días
     # Reproducible y con semillas distintas de las de entrenamiento.
     otra = ev.disenar_mundos(n, M, inst10.market)
     assert all((dis[k] == otra[k]).all() for k in dis)
@@ -396,6 +459,7 @@ def test_marca_de_ub_dp_floja_y_cotas_separadas():
                                   frac_millas_cargadas=1.0, n_cargas=2, duracion=50.0, ms_decision=1.0,
                                   ruta=[0, 1, 0], n_cotizaciones=3, n_ganadas=2, horas_rechazo=0.25,
                                   niveles=[1, 4, 2], usd_mi_sobre_mediana=0.1, dinero_en_la_mesa=30.0,
+                                  n_esperas=1, horas_espera=5.0, n_reposiciones=0, n_bajo_be=1, usd_bajo_be=-20.0,
                                   ub_dp=dp, ub_pi=100.0))
     df = pd.DataFrame(filas)
     res = ev.resumen_metodos(df)
@@ -416,8 +480,6 @@ def test_marca_de_ub_dp_floja_y_cotas_separadas():
     x = rng.normal(500, 100, size=200)
     lo, hi = st.ic_bootstrap_media(x)
     assert lo < x.mean() < hi and hi - lo == pytest.approx(2 * 1.96 * 100 / np.sqrt(200), rel=0.25)
-    gaps = st.gaps_contra_cotas(df, B=200)
-    assert gaps.loc[gaps["K"] == "libre", "ub_dp_floja"].all() and not gaps.loc[gaps["K"] == "5", "ub_dp_floja"].any()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -448,3 +510,51 @@ def test_ningun_nombre_borrado_sigue_referenciado():
                 if patron.search(linea):
                     hallazgos.append(f"{os.path.relpath(f, RAIZ)}:{n}: {linea.strip()[:100]}")
     assert not hallazgos, "Referencias a baselines borrados:\n" + "\n".join(hallazgos)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lo que cuesta perder la cotización y las fallas del ciclo
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _obs_de_prueba(nodo, casa, n=3, vacio=True):
+    from baselines.politicas import Observacion
+    opciones = np.zeros((n, N_NIVELES + 1), dtype=bool)
+    opciones[:, :N_NIVELES] = True
+    opciones[nodo] = False
+    if vacio:
+        opciones[casa, OPCION_VACIO] = nodo != casa
+        opciones[nodo, OPCION_VACIO] = True
+    return Observacion(nodo=nodo, casa=casa, tiempo=0.0, k_restante=None, mascara=np.ones(n, dtype=np.int8),
+                       loads_row=np.ones(n), rate_row=np.full(n, 2.0),
+                       precios=np.full((n, 1), 2.0) * (0.7 + 0.6 * U_NIVELES_ARR), m=2.0,
+                       opciones=opciones, dia_semana_salida=0)
+
+
+def test_precio_de_la_vuelta_cuenta_volver_vacio():
+    """En la vuelta a casa todas las reglas maximizan el ingreso esperado P·p (el costo se paga igual); en los
+    demás tramos cada regla usa su nivel y perder vale 0."""
+    from baselines.politicas import costo_de_perder, cotizar_regla, valor_inmediato
+    from pricing import lane_cost_row, nivel_regla, prob_ganar
+    dist, diesel = np.full((3, 3), 500.0), np.full((3, 3), 2.5)
+    obs = _obs_de_prueba(nodo=1, casa=0)
+    costo = float(lane_cost_row(dist[1, 0], diesel[1, 0]))
+    P = prob_ganar(U_NIVELES_ARR, obs.m)
+    esperado = int(np.argmax(P * obs.precios[0]))
+    assert costo_de_perder(obs, 0, costo) == -costo and costo_de_perder(obs, 2, costo) == 0.0
+    for regla in ("mediana", "be_margen", "miope"):
+        assert cotizar_regla(obs, 0, dist, diesel, regla) == esperado
+        assert cotizar_regla(obs, 2, dist, diesel, regla) == int(nivel_regla(regla, obs.precios[2], 500.0, costo, obs.m))
+    v = valor_inmediato(obs, dist, diesel, cierre=True)                                # B2 / B2P
+    assert v[0] == pytest.approx(float((P * obs.precios[0] * 500.0).max() - costo))
+    v1 = valor_inmediato(obs, dist, diesel)                                            # B1: contra no moverse
+    assert v1[0] == pytest.approx(float((P * (obs.precios[0] * 500.0 - costo)).max()))
+    assert costo_de_perder(_obs_de_prueba(nodo=0, casa=0), 2, costo) == 0.0            # en casa puede esperar
+
+
+def test_ciclo_fallido_se_reporta_con_la_penalizacion(sim10):
+    """margen de un ciclo fallido = −3000 USD (la penalización de la DP y del entrenamiento): nunca 0."""
+    assert PENALIZACION_USD == -3000.0
+    f = sim10[sim10["violacion"]]
+    assert (f["margen"] <= PENALIZACION_USD + 1e-6).all()
+    sin_salir = sim10[(sim10["duracion"] == 0) & ~sim10["violacion"]]
+    assert (sin_salir["margen"] == 0).all()

@@ -50,7 +50,7 @@ def test_vector_env_random_policy_respects_k(data):
     start_days = rng.integers(0, TRAIN_DAYS, size=B).astype(np.int64)
 
     env.reset(start_nodes, start_days, k_max_arr=k_max_arr, world_seeds=np.arange(B) + 7)
-    active = np.ones(B, dtype=bool)
+    active = env.active.copy()                                   # sin ninguna jugada desde casa: no sale
     rechazos = 0
     for _ in range(env.max_steps):
         if not active.any():

@@ -25,9 +25,10 @@ import numpy as np
 import pandas as pd
 
 from config import (
-    DEVICE, MAX_DURATION, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, RUN_TAG, SEED,
+    DEVICE, MAX_DURATION, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, SEED,
 )
 from model.agent import AMRoutingAgent
+from model.encoder import COT_COLS
 from baselines.politicas import calcular_ev_pronostico
 from evaluation import make_replay_env
 from greedy_rollout import construir_features, contexto_agente
@@ -107,13 +108,17 @@ CSV_COLUMNS = ["episode_id", "step", "from", "to", "opcion", "precio_cotizado", 
 
 def _rollout(agent, start_node, day) -> tuple:
     """Rollout greedy del DRL paso a paso. Retorna (route, reward, duración, pasos); route es None si el tour
-    no cierra el ciclo dentro de max_duration. Cada paso es una cotización (ganada o perdida) o un viaje VACÍO."""
+    no cierra el ciclo dentro de max_duration. Cada paso es una cotización (ganada o perdida), un viaje VACÍO o
+    una espera (VACÍO con destino el propio nodo). Si desde casa no hay ninguna jugada, el camión no sale:
+    route = [casa], reward 0."""
     env = day["env"]
     T, dist, diesel = day["time_matrix_arr"], day["distance_arr"], day["diesel_arr"]
     starts = np.array([start_node], dtype=np.int64)
     masks = env.reset(starts, np.array([0], dtype=np.int64), k_max_arr=[None],
                       world_seeds=np.array([SEED], dtype=np.int64))
     route, pasos, total = [int(start_node)], [], 0.0
+    if bool(env.sin_salida[0]):
+        return route, 0.0, 0.0, pasos
     valido = False
     with torch.no_grad():
         for _ in range(env.max_steps):
@@ -122,22 +127,26 @@ def _rollout(agent, start_node, day) -> tuple:
                                        day["avail_expected_arr"], day["ev_esperado"], MAX_DURATION)
             h_t, emb = contexto_agente(agent, feats, env.current_node, DEVICE)
             a_t, o_t = agent.decoder.greedy_cotizacion(h_t, emb, torch.from_numpy(masks).to(DEVICE),
-                                                       torch.from_numpy(feats["opciones"]).to(DEVICE))
+                                                       torch.from_numpy(feats["opciones"]).to(DEVICE),
+                                                       torch.from_numpy(feats["node_feats"][..., COT_COLS]).to(DEVICE))
             j, o = int(a_t[0]), int(o_t[0])
             vacio = o == OPCION_VACIO
             precio = float("nan") if vacio else float(env.precios_row[0][j, o])
             mediana = float(env.rate_row_obs[0][j])
             p_ganar = 1.0 if vacio else float(prob_ganar(U_NIVELES_ARR[o], env.competencia[0]))
+            t_antes = float(env.time_elapsed[0])
             _, terminated, masks = env.step(np.array([j]), np.array([o]))
-            gano = bool(env.last_gano[0])
+            gano, espero = bool(env.last_gano[0]), bool(env.last_espero[0])
             r = float(env.last_raw_reward[0])
             total += r
-            if vacio or gano:
+            if (vacio or gano) and not espero:
                 route.append(j)
-            pasos.append({"from": i, "to": j, "opcion": "VACIO" if vacio else int(o), "precio_cotizado": precio,
-                          "mediana": mediana, "p_ganar": p_ganar, "gano": gano,
-                          "break_even": float(lane_cost_row(dist[i, j], diesel[i, j]) / dist[i, j]),
-                          "margen": r, "is_return": (vacio or gano) and j == start_node})
+            pasos.append({"from": i, "to": j, "opcion": "ESPERA" if espero else "VACIO" if vacio else int(o),
+                          "precio_cotizado": precio, "mediana": mediana, "p_ganar": p_ganar, "gano": gano,
+                          "break_even": (float(lane_cost_row(dist[i, j], diesel[i, j]) / dist[i, j]) if i != j
+                                         else float("nan")),
+                          "horas": float(env.time_elapsed[0]) - t_antes,
+                          "margen": r, "is_return": (vacio or gano) and not espero and j == start_node})
             if terminated[0]:
                 valido = route[-1] == start_node and not bool(env.last_time_violation[0])
                 break
@@ -151,8 +160,11 @@ def formatear_bloque(route, pasos) -> str:
     lineas = ["Ruta: " + " → ".join(str(n) for n in route), "Pasos:"]
     for a in pasos:
         retorno = "  (regreso a casa)" if a["is_return"] else ""
+        if a["opcion"] == "ESPERA":
+            lineas.append(f"  {a['from']}: espera {a['horas']:.1f} h al siguiente día de mercado")
+            continue
         if a["opcion"] == "VACIO":
-            lineas.append(f"  {a['from']}→{a['to']}: sin carga cotizable (VACÍO), margen {a['margen']:.0f} USD{retorno}")
+            lineas.append(f"  {a['from']}→{a['to']}: viaje vacío, margen {a['margen']:.0f} USD{retorno}")
             continue
         cab = (f"  {a['from']}→{a['to']}: cotiza nivel {a['opcion']} = {a['precio_cotizado']:.2f} /mi "
                f"(mediana {a['mediana']:.2f}, break-even {a['break_even']:.2f}, P(ganar) {a['p_ganar']:.0%})")
@@ -192,9 +204,9 @@ def run_inference(agent: AMRoutingAgent, start_node: int, day: dict, filas_csv: 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def _escribir_csv(filas, cwd):
-    out = os.path.join(cwd, "results", f"{NUM_NODES}nodes" + (f"_{RUN_TAG}" if RUN_TAG else ""))
+    out = os.path.join(cwd, "results", f"{NUM_NODES}nodes")
     os.makedirs(out, exist_ok=True)
-    path = os.path.join(out, f"rutas_{RUN_TAG or 'inference'}.csv")
+    path = os.path.join(out, "rutas_inference.csv")
     pd.DataFrame(filas, columns=CSV_COLUMNS).to_csv(path, index=False)
     print(f"  Pasos de la ruta → {path}")
 
@@ -204,13 +216,13 @@ def main():
     ap = argparse.ArgumentParser(description="Inferencia del AM entrenado (ruta y cotización del DRL por paso).")
     ap.add_argument("--start-node", type=int, help="un solo tour desde este nodo (sin loop interactivo)")
     ap.add_argument("--num-nodes", type=int, default=NUM_NODES)
-    ap.add_argument("--checkpoint", help="ruta del .pt (default: checkpoints[/RUN_TAG]/am_checkpoint_<N>nodes.pt)")
+    ap.add_argument("--checkpoint", help="ruta del .pt (default: checkpoints/am_checkpoint_<N>nodes.pt)")
     args = ap.parse_args()
     NUM_NODES = args.num_nodes
     CHECKPOINT_NAME = f"am_checkpoint_{NUM_NODES}nodes.pt"
 
     cwd             = os.path.dirname(os.path.abspath(__file__))
-    checkpoint_path = args.checkpoint or os.path.join(cwd, "checkpoints", RUN_TAG, CHECKPOINT_NAME)
+    checkpoint_path = args.checkpoint or os.path.join(cwd, "checkpoints", CHECKPOINT_NAME)
 
     print("=" * 50)
     print(f"  AM Inference — {NUM_NODES} nodos")

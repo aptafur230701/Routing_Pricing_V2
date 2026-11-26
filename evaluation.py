@@ -24,7 +24,7 @@ Si la tabla de UB-DP es "no tratable" a ese tamaño (tabla None, baselines/dp_re
 calculan y el resumen los reporta como "no tratable" (un resultado válido, no un error).
 
 El margen de una ruta es la suma del reward de cada lane en USD con el precio cotizado
-(env.last_raw_reward: p·d − c si se ganó la carga, −c si fue VACÍO, 0 en un rechazo).
+(env.last_raw_reward: p·d − c si se ganó la carga, −c si fue VACÍO, 0 en un rechazo o una espera).
 """
 
 import copy
@@ -38,15 +38,18 @@ import matplotlib.pyplot as plt
 import torch
 from config import (
     MAX_DURATION, K_MAX, TRAIN_DAYS, MARKET_DIAS_EPISODIO,
-    MARKET_SEED_EVAL, MARKET_M_EVAL_WORLDS, REPLAY_MAX_CASOS, REGLA_PRECIO_BASELINES,
+    MARKET_SEED_EVAL, MARKET_M_EVAL_WORLDS, REPLAY_MAX_CASOS, REGLA_PRECIO_BASELINES, REPOSICION_MAX_MILLAS,
 )
 from baselines.politicas import (
     Observacion, PoliticaB1, PoliticaB2, PoliticaB2P, PoliticaB3, calcular_ev_pronostico, cotizar_regla,
 )
 from greedy_rollout import greedy_rollout, construir_features, contexto_agente
+from model.encoder import COT_COLS
 from market_process import Tablero
 from pricing import REGLAS_PRECIO, U_NIVELES_ARR, N_NIVELES, gana, prob_ganar
 from routing_env import VectorRoutingEnv
+from baselines.dp_relajada import PENALIZACION_USD
+from config import COTIZACIONES_MAX_POR_NODO, BANDA_PRECIO_MASA, BE_MARGEN
 from baselines.ub_pi import solve_ub_pi
 from stats_analysis import gap_pct, ic_bootstrap_media, ub_dp_floja, NOTA_UB_DP_FLOJA
 
@@ -54,22 +57,42 @@ _DIAS_SIMULADOS_UB_PI = MARKET_DIAS_EPISODIO   # días del mundo que cubren cual
 _BASELINES = ("B1", "B2", "B2P", "B3")   # no dependen del agente: se calculan una vez y se cachean
 _DRL_REGLAS = tuple(f"DRL-dest+{r}" for r in REGLAS_PRECIO)   # comparación B
 _METODOS = ("DRL",) + _DRL_REGLAS + _BASELINES
-# Qué decide cada método (columnas "destino" y "precio" del resumen) y el grupo en que se reporta.
-_NOMBRE_REGLA = {"mediana": "regla: mediana", "be_margen": "regla: break-even + margen", "miope": "regla: miope"}
+# Nombre visible de cada método en los reportes (los códigos internos — "DRL-dest+miope", "UB-PI", … — quedan en
+# los datos y en mundos_AM.csv), qué decide (columnas "destino" y "precio" del resumen) y el grupo en que se reporta.
+_PRECIO_TRAMO = "El que maximiza la ganancia esperada del tramo, sin mirar los siguientes"
+NOMBRE = {
+    "DRL": "DRL (modelo propuesto)",
+    "DRL-dest+mediana": "Rutas del DRL + tarifa mediana",
+    "DRL-dest+be_margen": f"Rutas del DRL + costo + {BE_MARGEN:.2f} USD/mi",
+    "DRL-dest+miope": "Rutas del DRL + mejor precio del tramo",
+    "B1": "B1 · Mejor tramo inmediato",
+    "B2": "B2 · Plan con promedios",
+    "B2P": "B2P · Plan con pronóstico",
+    "B3": "B3 · Programación dinámica",
+    "UB-PI": "Máximo teórico (información perfecta)",
+    "UB-DP": "Óptimo con mercado promedio",
+}
+_PRECIO_REGLA = {
+    "mediana": "Siempre la tarifa mediana publicada del día",
+    "be_margen": f"La tarifa publicada más baja que cubre el costo + {BE_MARGEN:.2f} USD/mi",
+    "miope": _PRECIO_TRAMO,
+}
 DECISION = {
-    "DRL": ("DRL", "DRL (cabeza de precio)"),
-    **{f"DRL-dest+{r}": ("DRL", _NOMBRE_REGLA.get(r, f"regla: {r}")) for r in REGLAS_PRECIO},
-    "B1": ("B1: greedy miope", "regla: miope"),
-    "B2": ("B2: reoptimización con valores esperados", "regla: miope"),
-    "B2P": ("B2P: B2 con pronóstico del índice", "regla: miope"),
-    "B3": ("B3: tabla V de la DP (dos intentos)", "regla: miope"),
-    "UB-PI": ("información perfecta (cota)", "nivel más alto que gana"),
-    "UB-DP": ("DP que ignora el índice de mercado", "óptimo de la DP"),
+    "DRL": ("El DRL, pensando en todo el ciclo", "El DRL, según el mercado del día"),
+    **{f"DRL-dest+{r}": ("Las mismas del DRL", _PRECIO_REGLA.get(r, r)) for r in REGLAS_PRECIO},
+    "B1": ("La ciudad con mayor ganancia esperada en el próximo tramo", _PRECIO_TRAMO),
+    "B2": ("En cada ciudad replanifica el resto de la ruta con cargas y tarifas promedio", _PRECIO_TRAMO),
+    "B2P": ("Como B2, ajustando las tarifas promedio con un pronóstico del mercado", _PRECIO_TRAMO),
+    "B3": ("Tabla de programación dinámica calculada con el mercado promedio",
+           f"El de la misma tabla (hasta {COTIZACIONES_MAX_POR_NODO} intentos por ciudad)"),
+    "UB-PI": ("Conoce de antemano todas las cargas y los precios de la competencia",
+              "El más alto que todavía gana la carga"),
+    "UB-DP": ("Lo que obtendría B3 si el mercado de cada día fuera el promedio", "El de la misma tabla"),
 }
 GRUPO_DRL, GRUPO_BASELINES, GRUPO_COTAS = (
-    "DRL y comparación B (mismos destinos del DRL, distinta regla de precio)",
-    "Baselines de ruteo (cotizan con la regla miope)",
-    "Cotas y referencias")
+    "Modelo propuesto, y sus mismas rutas con reglas de precio fijas (muestran cuánto aporta que el DRL elija el precio)",
+    "Métodos de comparación",
+    "Referencias (no son métodos aplicables en la práctica)")
 
 
 def _grupo(metodo: str) -> str:
@@ -80,9 +103,8 @@ def _grupo(metodo: str) -> str:
 
 def _describir(metodo: str) -> dict:
     destino, precio = DECISION.get(metodo, ("", ""))
-    return {"grupo": _grupo(metodo), "destino": destino, "precio": precio}
-NOTA_NO_TRATABLE = ("no tratable: la tabla de UB-DP no se calcula por encima de UBDP_MAX_NODOS nodos o no terminó "
-                    "dentro del tiempo o la memoria disponibles")
+    return {"grupo": _grupo(metodo), "nombre": NOMBRE.get(metodo, metodo), "destino": destino, "precio": precio}
+NOTA_NO_TRATABLE = ("no se calcula: con este número de ciudades el cálculo es demasiado largo o no cabe en memoria")
 
 
 # ── Entornos ─────────────────────────────────────────────────
@@ -173,7 +195,11 @@ class PoliticaDRL:
             h_t, emb = contexto_agente(c.agent_cpu, feats, env.current_node, torch.device("cpu"))
             mask_t = torch.from_numpy(np.asarray(obs.mascara, dtype=np.int8)[None])
             op_t = torch.from_numpy(feats["opciones"])
-            a, o = c.agent_cpu.decoder.greedy_cotizacion(h_t, emb, mask_t, op_t)
+            cot_t = torch.from_numpy(feats["node_feats"][..., COT_COLS])
+            a, o = c.agent_cpu.decoder.greedy_cotizacion(h_t, emb, mask_t, op_t, cot_t)
+            # π(o | s, j) del destino elegido: el rango de precio de la evaluación (solo la cabeza de precio).
+            self.probs_precio = (c.agent_cpu.decoder.probs_precio(h_t, emb, mask_t, op_t, cot_t, a)[0].numpy()
+                                 if self.precio == "drl" and int(o[0]) < N_NIVELES else None)
         self._opcion = int(o[0])
         return int(a[0])
 
@@ -183,20 +209,43 @@ class PoliticaDRL:
         return cotizar_regla(obs, j, self.ctx.dist, self.ctx.diesel, self.precio)
 
 
+def banda_precio(probs, o: int, masa: float = BANDA_PRECIO_MASA) -> tuple:
+    """(nivel más bajo, nivel más alto) del rango de precio: los niveles contiguos alrededor del elegido `o` que
+    juntan al menos `masa` de la probabilidad de la cabeza de precio (renormalizada sobre los niveles, sin VACÍO).
+    Se agrega siempre el vecino más probable; son los precios que el DRL considera casi igual de buenos."""
+    p = np.asarray(probs[:N_NIVELES], dtype=np.float64)
+    p = p / p.sum()
+    lo = hi = int(o)
+    acum = p[o]
+    while acum < masa - 1e-12 and (lo > 0 or hi < N_NIVELES - 1):
+        izq = p[lo - 1] if lo > 0 else -1.0
+        der = p[hi + 1] if hi < N_NIVELES - 1 else -1.0
+        if der >= izq:
+            hi += 1
+            acum += der
+        else:
+            lo -= 1
+            acum += izq
+    return lo, hi
+
+
 def ejecutar_politica(politica, env, start_node, start_day_idx, k_max, world_seed,
                       distance_arr, diesel_arr, dow0) -> dict:
     """Corre `politica` paso a paso en `env` (B = 1) y devuelve las métricas de la ruta.
 
     En cada paso la política elige el destino (`actuar`) y la opción de precio (`cotizar`). Métricas:
-    margen (suma de env.last_raw_reward), violacion (no cerró el ciclo en casa dentro de max_duration),
-    frac_millas_cargadas, n_cargas, duracion, ms_decision (tiempo medio de actuar + cotizar), ruta (solo
-    viajes), n_cotizaciones, n_ganadas, horas_rechazo, niveles (lista), usd_mi_sobre_mediana (media de
-    precio cobrado − mediana de la lane en las cargas ganadas) y dinero_en_la_mesa (Σ (p_comp − p)·d en las
-    cargas ganadas).
-    Detalle por arco: `pasos` (una entrada por step: cotización ganada, cotización perdida o viaje vacío,
-    con el nivel, el percentil u, el precio cotizado, la mediana, P(ganar), el precio del competidor, las
-    millas y el reward del paso) y `ruta_precios`, la misma ruta en texto, p. ej.
-    "3→7 cotiza 2.95 USD/mi (u=0.6) ✗ | 3→5 cotiza 2.80 USD/mi (u=0.4) ✓ | 5→3 vacío".
+    margen (suma de env.last_raw_reward, más PENALIZACION_USD si el ciclo falla: la misma penalización del
+    entrenamiento y de UB-DP), violacion (no cerró el ciclo en casa dentro de max_duration; no salir
+    de casa por no tener ninguna jugada, env.sin_salida, no es violación), frac_millas_cargadas, n_cargas,
+    duracion, ms_decision (tiempo medio de actuar + cotizar), ruta (solo viajes), n_cotizaciones, n_ganadas,
+    horas_rechazo, niveles (lista), usd_mi_sobre_mediana (media de precio cobrado − mediana de la lane en las
+    cargas ganadas), dinero_en_la_mesa (Σ (p_comp − p)·d en las cargas ganadas), n_esperas, horas_espera,
+    n_reposiciones (viajes vacíos a un nodo que no es casa), n_bajo_be (cargas ganadas a un precio menor que
+    el costo por milla de la lane) y usd_bajo_be (Σ de lo que se perdió en ellas, ≤ 0).
+    Detalle por arco: `pasos` (una entrada por step: cotización ganada, cotización perdida, viaje vacío o
+    espera, con el nivel, el percentil u, el precio cotizado, la mediana, P(ganar), el precio del competidor,
+    las millas y el reward del paso) y `ruta_precios`, la misma ruta en texto, p. ej.
+    "3→7 cotiza 2.95 USD/mi (u=0.6) ✗ | 3 espera 9.5 h | 3→5 cotiza 2.80 USD/mi (u=0.4) ✓ | 5→3 vacío".
     """
     seeds = None if world_seed is None else np.array([world_seed], dtype=np.int64)
     masks = env.reset(
@@ -204,15 +253,17 @@ def ejecutar_politica(politica, env, start_node, start_day_idx, k_max, world_see
         k_max_arr=[k_max], world_seeds=seeds,
     )
     ruta = [int(start_node)]
-    margen = millas_carg = millas_tot = horas_rech = mesa = 0.0
-    n_cargas = n_dec = n_cot = 0
+    margen = millas_carg = millas_tot = horas_rech = mesa = horas_esp = usd_bajo_be = 0.0
+    n_cargas = n_dec = n_cot = n_esp = n_repos = n_bajo_be = 0
     niveles, sobre_mediana, pasos = [], [], []
+    cotizaciones = []                                     # rango de precio de cada cotización del DRL
+    con_rango = getattr(politica, "precio", None) == "drl"
     t_dec = 0.0
-    cerro = False
+    cerro = bool(env.sin_salida[0])                       # sin ninguna jugada desde casa: no sale (válido)
     for _ in range(env.max_steps):
         mascara = masks[0]
-        if not mascara.any():
-            break                                         # sin acción factible (no cierra el ciclo)
+        if not env.active[0] or not mascara.any():
+            break                                         # no salió, o sin acción factible (no cierra el ciclo)
         i = int(env.current_node[0])
         obs = Observacion(
             nodo=i, casa=int(start_node), tiempo=float(env.time_elapsed[0]),
@@ -222,7 +273,7 @@ def ejecutar_politica(politica, env, start_node, start_day_idx, k_max, world_see
             precios=env.precios_row[0].copy(), m=float(env.competencia[0]),
             opciones=env.opciones_validas[0].copy(), dia_semana_salida=int(dow0),
             indice=env.market_index[0].copy() if getattr(politica, "usa_indice", False) else None,
-            n_rechazos=int(env.n_rechazos[0]),
+            n_rechazos=int(env.n_rechazos[0]), restantes=(env.current_loads_row[0] - env.perdidas[0]),
         )
         t0 = time.perf_counter()
         a = int(politica.actuar(obs))
@@ -231,29 +282,46 @@ def ejecutar_politica(politica, env, start_node, start_day_idx, k_max, world_see
         n_dec += 1
         if not mascara[a] or not obs.opciones[a, o]:
             raise RuntimeError(f"{getattr(politica, 'nombre', politica)} eligió ({a}, {o}), fuera de la máscara")
+        rango = None
+        if con_rango and o < N_NIVELES and a != i:
+            lo, hi = banda_precio(politica.probs_precio, o)
+            banda = obs.precios[a, lo:hi + 1]
+            rango = dict(desde=i, hacia=a, piso=float(banda.min()), tope=float(banda.max()),
+                         referencia=float(obs.precios[a, o]), nivel=int(o), nivel_piso=lo, nivel_tope=hi,
+                         break_even=float(env.cost_rows[0, a] / distance_arr[i, a]),
+                         mediana=float(obs.rate_row[a]), gano=False)
         mediana = float(obs.rate_row[a])
         t_antes = float(env.time_elapsed[0])
         _, terminated, masks = env.step(np.array([a], dtype=np.int64), np.array([o], dtype=np.int64))
         margen += float(env.last_raw_reward[0])
-        cotizo, gano = bool(env.last_cotizo[0]), bool(env.last_gano[0])
+        cotizo, gano, espero = bool(env.last_cotizo[0]), bool(env.last_gano[0]), bool(env.last_espero[0])
         u = float(U_NIVELES_ARR[o]) if cotizo else float("nan")
         pasos.append(dict(
             paso=len(pasos) + 1, desde=i, hacia=a,
-            accion=("cotiza y gana" if gano else "cotiza y pierde") if cotizo else "viaja vacío",
+            accion=(("cotiza y gana" if gano else "cotiza y pierde") if cotizo
+                    else "espera" if espero else "viaja vacío"),
             nivel=o if cotizo else None, u=u,
             precio_cotizado_usd_mi=float(obs.precios[a, o]) if cotizo else float("nan"),
             mediana_usd_mi=mediana,
             p_ganar=float(prob_ganar(u, obs.m)) if cotizo else float("nan"),
             precio_competidor_usd_mi=float(env.last_precio_competidor[0]) if cotizo else float("nan"),
-            millas=0.0 if (cotizo and not gano) else float(distance_arr[i, a]),
+            millas=0.0 if ((cotizo and not gano) or espero) else float(distance_arr[i, a]),
             reward_usd=float(env.last_raw_reward[0]),
             horas_transcurridas=t_antes,
+            horas_paso=float(env.time_elapsed[0]) - t_antes,
+            rango=rango,
         ))
+        if rango is not None:
+            rango["gano"] = gano
+            cotizaciones.append(rango)
         if cotizo:
             n_cot += 1
             niveles.append(o)
         if cotizo and not gano:
             horas_rech += float(env.time_elapsed[0]) - t_antes
+        elif espero:
+            n_esp += 1
+            horas_esp += float(env.time_elapsed[0]) - t_antes
         else:                                             # viajó (ganó o VACÍO)
             ruta.append(a)
             millas_tot += float(distance_arr[i, a])
@@ -263,9 +331,16 @@ def ejecutar_politica(politica, env, start_node, start_day_idx, k_max, world_see
                 p = float(env.last_precio[0])
                 sobre_mediana.append(p - mediana)
                 mesa += (float(env.last_precio_competidor[0]) - p) * float(distance_arr[i, a])
+                if float(env.last_raw_reward[0]) < 0:     # ganó por debajo del costo de la lane
+                    n_bajo_be += 1
+                    usd_bajo_be += float(env.last_raw_reward[0])
+            elif a != start_node:
+                n_repos += 1
         if terminated[0]:
             cerro = (len(ruta) > 1 and ruta[-1] == start_node) and not bool(env.last_time_violation[0])
             break
+    if not cerro:
+        margen += PENALIZACION_USD
     return dict(
         margen=margen,
         violacion=not cerro,
@@ -280,17 +355,44 @@ def ejecutar_politica(politica, env, start_node, start_day_idx, k_max, world_see
         niveles=niveles,
         usd_mi_sobre_mediana=float(np.mean(sobre_mediana)) if sobre_mediana else float("nan"),
         dinero_en_la_mesa=mesa,
+        n_esperas=n_esp,
+        horas_espera=horas_esp,
+        n_reposiciones=n_repos,
+        n_bajo_be=n_bajo_be,
+        usd_bajo_be=usd_bajo_be,
         pasos=pasos,
         ruta_precios=ruta_con_precios(pasos),
+        cotizaciones=cotizaciones,
+        precios_por_arco=precios_por_arco(pasos) if con_rango else "",
     )
 
 
+def precios_por_arco(pasos) -> str:
+    """Los arcos recorridos con su rango de precio (USD/milla), una línea por arco, p. ej.
+    "1-5: 2.15–2.48 (ref. 2.40)" o "5-3: vacío". La referencia es el precio al que se ganó la carga (el del
+    margen de la ruta); el rango, los precios que el DRL consideraba casi igual de buenos en esa decisión."""
+    lineas = []
+    for p in pasos:
+        tramo = f"{p['desde']}-{p['hacia']}"
+        if p["accion"] == "viaja vacío":
+            lineas.append(f"{tramo}: vacío")
+        elif p["accion"] == "cotiza y gana":
+            r = p.get("rango")
+            if r is None:
+                lineas.append(f"{tramo}: {p['precio_cotizado_usd_mi']:.2f}")
+            else:
+                lineas.append(f"{tramo}: {r['piso']:.2f}–{r['tope']:.2f} (ref. {r['referencia']:.2f})")
+    return "\n".join(lineas)
+
+
 def ruta_con_precios(pasos) -> str:
-    """La ruta en texto, un tramo por paso: precio cotizado y si se ganó (✓) o se perdió (✗), o viaje vacío."""
+    """La ruta en texto, un tramo por paso: precio cotizado y si se ganó (✓) o se perdió (✗), viaje vacío o espera."""
     partes = []
     for p in pasos:
         tramo = f"{p['desde']}→{p['hacia']}"
-        if p["accion"] == "viaja vacío":
+        if p["accion"] == "espera":
+            partes.append(f"{p['desde']} espera {p['horas_paso']:.1f} h")
+        elif p["accion"] == "viaja vacío":
             partes.append(f"{tramo} vacío")
         else:
             marca = "✓" if p["accion"] == "cotiza y gana" else "✗"
@@ -339,12 +441,18 @@ class ContextoEval:
 # ── UB-PI ─────────────────────────────────────────────────────
 
 def mundo_ub_pi(tablero: Tablero) -> tuple:
-    """(loads, tarifas) para solve_ub_pi a partir de un Tablero (D, N, N, ...): con el competidor conocido, en
-    cada lane se cotiza el nivel más alto que gana (el nivel 0 siempre gana), así que no hay rechazos."""
-    gana_k = gana(U_NIVELES_ARR, tablero.u_comp[..., None])                       # (D, N, N, K)
+    """(loads, tarifas) para solve_ub_pi a partir de un Tablero (D, N, N, ...): con los competidores conocidos, en
+    cada lane se toma la mejor de las cargas cotizables (a lo sumo COTIZACIONES_MAX_POR_NODO) y se cotiza el nivel
+    más alto que gana. No cobra los 15 min de las cargas que habría que perder antes: sigue siendo cota. Si ningún
+    nivel gana en ninguna, la lane queda sin carga: solo se puede recorrer vacía, si las reglas lo permiten."""
+    C = tablero.u_comp.shape[-1]
+    existe = np.arange(C) < np.asarray(tablero.loads)[..., None]                  # (D, N, N, C)
+    u_mejor = np.where(existe, tablero.u_comp, 0.0).max(axis=-1)                  # la carga con el competidor más caro
+    gana_k = gana(U_NIVELES_ARR, u_mejor[..., None])                              # (D, N, N, K)
     k_mejor = (N_NIVELES - 1) - np.argmax(gana_k[..., ::-1], axis=-1)            # el más alto que gana
     tarifa = np.take_along_axis(tablero.precios, k_mejor[..., None], axis=-1)[..., 0]
-    return tablero.loads, tarifa
+    loads = np.where(gana_k.any(axis=-1), tablero.loads, 0)
+    return loads, tarifa
 
 
 def tablero_replay(market, semilla: int, dias_abs) -> Tablero:
@@ -380,6 +488,12 @@ def _asignacion_balanceada(n_valores: int, M: int, rng) -> np.ndarray:
     return rng.permutation(base)
 
 
+def dias_de_salida(num_dias: int) -> int:
+    """Cuántos de los primeros días sirven de salida: los que dejan ver MARKET_DIAS_EPISODIO días distintos. Más tarde
+    el entorno se queda sin días y repite el último (esperar devolvería el mismo tablero con las cargas perdidas)."""
+    return max(1, num_dias - MARKET_DIAS_EPISODIO + 1)
+
+
 def disenar_mundos(num_nodes: int, M: int, market, num_dias: int = TRAIN_DAYS,
                    semilla: int = MARKET_SEED_EVAL) -> dict:
     """Diseño de M mundos de evaluación a partir de MARKET_SEED_EVAL.
@@ -391,7 +505,7 @@ def disenar_mundos(num_nodes: int, M: int, market, num_dias: int = TRAIN_DAYS,
     rng = np.random.default_rng(semilla)
     nodos = _asignacion_balanceada(num_nodes, M, rng)
     dows = _asignacion_balanceada(7, M, rng)
-    dias = np.arange(num_dias)
+    dias = np.arange(dias_de_salida(num_dias))
     dow_dia = market.dia_semana(dias)
     inicio = np.array([rng.choice(dias[dow_dia == d]) for d in dows], dtype=np.int64)
     semillas = rng.integers(0, 2**31 - 1, size=M, dtype=np.int64)
@@ -400,8 +514,8 @@ def disenar_mundos(num_nodes: int, M: int, market, num_dias: int = TRAIN_DAYS,
 
 
 _COLS_METRICAS = ("margen", "violacion", "frac_millas_cargadas", "n_cargas", "duracion", "ms_decision", "ruta",
-                  "ruta_precios", "pasos", "n_cotizaciones", "n_ganadas", "horas_rechazo", "niveles", "usd_mi_sobre_mediana",
-                  "dinero_en_la_mesa")
+                  "ruta_precios", "precios_por_arco", "cotizaciones", "pasos", "n_cotizaciones", "n_ganadas", "horas_rechazo", "niveles", "usd_mi_sobre_mediana",
+                  "dinero_en_la_mesa", "n_esperas", "horas_espera", "n_reposiciones", "n_bajo_be", "usd_bajo_be")
 
 
 def _fila(modo, K, mundo, nodo, dia_abs, start_day, world_seed, dow, metodo, m, ub_dp, ub_pi_val) -> dict:
@@ -429,7 +543,8 @@ def _firma_cache(ctx, *partes) -> str:
     else:
         h.update(np.ascontiguousarray(ctx.tabla.V_k).tobytes())
         h.update(np.ascontiguousarray(ctx.tabla.V_libre).tobytes())
-    h.update(repr((partes, MAX_DURATION, REGLA_PRECIO_BASELINES, "cotizacion", "pasos por arco")).encode())
+    h.update(repr((partes, MAX_DURATION, REGLA_PRECIO_BASELINES, "cotizacion", "pasos por arco",
+                   "esperar-reposicionar", "perder cuesta", "fallas penalizadas", "varias cargas, vuelta, dias de salida", COTIZACIONES_MAX_POR_NODO, PENALIZACION_USD, REPOSICION_MAX_MILLAS, tuple(U_NIVELES_ARR))).encode())
     return h.hexdigest()
 
 
@@ -503,7 +618,7 @@ def _filas_drl(ctx, env, casos, k_levels, cota, modo, verbose) -> list:
                     res = ejecutar_politica(pol, env, nodo, dia, K, ws, ctx.dist, ctx.diesel, dow)
                     filas.append(_fila(modo, K, m, nodo, dia_abs, dia, ws, dow, nombre, res, dp, pi))
             if verbose and (n + 1) % 100 == 0:
-                print(f"  {modo} (DRL y comparación B): {n + 1}/{len(casos)}", flush=True)
+                print(f"  {modo} (DRL y sus rutas con precio fijo): {n + 1}/{len(casos)}", flush=True)
     return filas
 
 
@@ -580,6 +695,7 @@ def casos_replay(num_nodes: int, num_dias: int, max_casos: int = REPLAY_MAX_CASO
     no, un subconjunto balanceado (cada nodo y cada día aparecen ⌊·⌋ o ⌈·⌉ veces, barajados por separado).
     La semilla de cada caso fija el competidor que enfrentan todos los métodos en ese caso."""
     rng = np.random.default_rng(semilla)
+    num_dias = dias_de_salida(num_dias)
     if num_nodes * num_dias <= max_casos:
         nodos, dias = np.meshgrid(np.arange(num_nodes), np.arange(num_dias), indexing="ij")
         nodos, dias = nodos.ravel(), dias.ravel()
@@ -667,9 +783,11 @@ def resumen_metodos(df: pd.DataFrame) -> pd.DataFrame:
     Cada fila trae grupo, destino y precio (qué decide el método, ver DECISION) y dif_vs_drl_usd: margen del
     método − margen del DRL en los mismos mundos (media pareada; negativo = por debajo del DRL).
     Métricas de cotización (§8): tasa_aceptacion_pct (cargas ganadas / cotizaciones, sobre el total del
-    grupo), cotizaciones_por_arco, horas_rechazo (media por ruta), nivel_medio (índice 0–9 del nivel
+    grupo), cotizaciones_por_arco, horas_rechazo (media por ruta), nivel_medio (índice 0–8 del nivel
     cotizado) y u_medio (su percentil u, media por cotización), usd_mi_sobre_mediana (USD/mi cobrado − mediana de la lane, media por carga ganada) y
-    dinero_en_la_mesa (media por ruta; solo mundos simulados).
+    dinero_en_la_mesa (media por ruta; solo mundos simulados). Movimientos sin carga: esperas_por_ruta,
+    reposiciones_por_ruta (vacíos a un nodo que no es casa) y cargas_bajo_be_pct (% de las cargas ganadas
+    cobradas por debajo del costo de la lane) con usd_bajo_be (lo perdido en ellas, media por ruta).
     Los gaps comparan promedios sobre los mismos mundos: (ref − método) / |ref| · 100, con ref = UB-PI
     (cota) o UB-DP (política que ignora el mercado; un gap negativo significa que el método la supera).
     margen_medio va con su IC del 95 % por bootstrap sobre mundos (BOOTSTRAP_B remuestreos,
@@ -716,6 +834,10 @@ def resumen_metodos(df: pd.DataFrame) -> pd.DataFrame:
                 "u_medio": float(np.mean(U_NIVELES_ARR[np.asarray(niv, dtype=int)])) if niv else float("nan"),
                 "usd_mi_sobre_mediana": gm["usd_mi_sobre_mediana"].mean(),
                 "dinero_en_la_mesa": gm["dinero_en_la_mesa"].mean(),
+                "esperas_por_ruta": gm["n_esperas"].mean(),
+                "reposiciones_por_ruta": gm["n_reposiciones"].mean(),
+                "cargas_bajo_be_pct": 100.0 * gm["n_bajo_be"].sum() / n_gan if n_gan else float("nan"),
+                "usd_bajo_be": gm["usd_bajo_be"].mean(),
                 "nota": nota,
             })
         if df.attrs.get("ub_dp_no_tratable"):
@@ -740,7 +862,8 @@ _COLS_CONSOLA = (
     ("margen_medio", "margen USD", "{:,.0f}"), ("dif_vs_drl_usd", "Δ vs DRL", "{:+,.0f}"),
     ("gap_ub_pi_pct", "gap UB-PI %", "{:.1f}"), ("tasa_aceptacion_pct", "acept. %", "{:.0f}"),
     ("u_medio", "u cotizado", "{:.2f}"), ("usd_mi_sobre_mediana", "USD/mi vs mediana", "{:+.3f}"),
-    ("horas_rechazo", "h rechazos", "{:.2f}"), ("violacion_pct", "viol. %", "{:.1f}"),
+    ("esperas_por_ruta", "esperas", "{:.2f}"), ("reposiciones_por_ruta", "reposic.", "{:.2f}"),
+    ("cargas_bajo_be_pct", "bajo BE %", "{:.0f}"), ("violacion_pct", "viol. %", "{:.1f}"),
 )
 
 

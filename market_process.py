@@ -52,7 +52,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from config import MARKET_N_GRUPOS, TRAIN_DAYS, U_NIVELES, COMPETENCIA_KAPPA, COMPETENCIA_M_MAX
+from config import (
+    MARKET_N_GRUPOS, TRAIN_DAYS, U_NIVELES, COMPETENCIA_KAPPA, COMPETENCIA_M_MAX, COTIZACIONES_MAX_POR_NODO,
+)
 from fit_market_process import (
     params_path, estimar_m, indice_observado, dia_de_semana as _dia_de_semana_fi,
 )
@@ -82,8 +84,9 @@ class Tablero:
     y la segunda dimensión es el nodo de origen: loads (D, N, N), precios (D, N, N, K), m (D, N)):
       loads             (B, N) int64    cargas por lane
       precios           (B, N, K) f64   USD/milla de cada nivel: F⁻¹(u_k) · e^δ
-      u_comp            (B, N) f64      percentil del mejor competidor (el agente no lo ve)
-      precio_competidor (B, N) f64      F⁻¹(u_comp) · e^δ
+      u_comp            (B, N, C) f64   percentil del mejor competidor de cada carga de la lane (el agente no lo
+                                        ve); C = COTIZACIONES_MAX_POR_NODO cargas, la que se cotiza en el intento c
+      precio_competidor (B, N, C) f64   F⁻¹(u_comp) · e^δ
       m                 (B,) f64        competidores efectivos del nodo de origen ese día
       tarifa            (B, N) f32      la tarifa sorteada del modelo anterior (= precio del competidor si m = 1)
     """
@@ -288,18 +291,22 @@ class MarketProcess:
         devuelve el tablero de la cotización: el uniforme U de la tarifa se reutiliza para el mejor
         competidor, u_comp = 1 − (1 − U)^(1/m), así que con m = 1 el competidor cotiza la tarifa de siempre."""
         loads, cuantiles, u = self._sortear_detalle(nodos, dias, rng)
-        return self._armar_tablero(loads, cuantiles, u, deltas, nodos, dias)
+        extra = rng.random((len(nodos), self.num_nodes, COTIZACIONES_MAX_POR_NODO - 1))   # las otras cargas de la lane
+        return self._armar_tablero(loads, cuantiles, np.concatenate([u[..., None], extra], axis=-1), deltas, nodos, dias)
 
     def _armar_tablero(self, loads, cuantiles, u, deltas, nodos, dias) -> Tablero:
+        """u (B, N, C): un uniforme por carga cotizable de cada lane (el de la primera es el de la tarifa)."""
         escala = np.exp(deltas)[:, None]                                       # (B, 1)
-        tarifa = (_interp_cuantiles(u, cuantiles) * escala).astype(np.float32)
+        tarifa = (_interp_cuantiles(u[..., 0], cuantiles) * escala).astype(np.float32)
         m_comp = self.competidores(nodos, dias)                               # (B,)
-        u_comp = percentil_competidor(u, m_comp[:, None])                     # (B, N)
+        u_comp = percentil_competidor(u, m_comp[:, None, None])               # (B, N, C)
+        q = cuantiles.astype(np.float64)
         return Tablero(
             loads=loads,
             precios=precios_niveles(cuantiles, deltas[:, None]),
             u_comp=u_comp,
-            precio_competidor=_interp_cuantiles(u_comp, cuantiles.astype(np.float64)) * escala,
+            precio_competidor=np.stack([_interp_cuantiles(u_comp[..., c], q) * escala
+                                        for c in range(u_comp.shape[-1])], axis=-1),
             m=m_comp,
             tarifa=tarifa,
         )
@@ -463,9 +470,9 @@ class MarketProcess:
         cuantiles = np.stack([self._q[c][dia_p, nodos[:, None], self._cols[None, :]] for c in _COLS_Q], axis=-1)
         u = np.stack([
             np.random.Generator(np.random.PCG64(
-                [int(semillas[b]), int(nodos[b]), int(dias[b]), _TAG_REPLAY])).random(N)
+                [int(semillas[b]), int(nodos[b]), int(dias[b]), _TAG_REPLAY])).random((COTIZACIONES_MAX_POR_NODO, N)).T
             for b in range(B)
-        ])
+        ])                                                                        # (B, N, C)
         return self._armar_tablero(loads, cuantiles, u, np.zeros(B), nodos, dias)
 
 

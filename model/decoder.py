@@ -12,7 +12,8 @@ Flujo interno
 1. GlimpseAttention  — cross-attention (h_t → embeddings) → h_t refinado
 2. PointerAttention  — compatibilidad dot-product + tanh(C) → logits por nodo
 3. apply_mask        — logits de destinos inválidos → -inf; softmax → π(j|s)
-4. PriceHead         — MLP sobre [h_t ; glimpse ; e_j], enmascarado con las opciones válidas de j → π(o|s, j)
+4. PriceHead         — valor esperado por nivel + MLP sobre [h_t ; glimpse ; e_j ; cotización de la lane],
+                       enmascarado con las opciones válidas de j → π(o|s, j)
 
 Orden autorregresivo: primero j (máscara = el destino tiene alguna opción válida), después o.
     log π(j, o | s) = log π(j | s) + log π(o | s, j)
@@ -29,12 +30,14 @@ Compatibilidad
 · Sin dependencias de am_agent.py, am_training.py ni routing_env.py.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from model.debug_utils import check_tensor
+from model.encoder import COT_P, COT_V, N_COT_FEATURES
 from pricing import N_NIVELES
 
 
@@ -145,8 +148,15 @@ class PriceHead(nn.Module):
     """
     Logits de las opciones de precio (K niveles + VACÍO) para el destino ya elegido.
 
-    Entrada : h_t (batch, d_h), glimpse h_t' (batch, d_h), e_j (batch, d_h)
+    Entrada : h_t (batch, d_h), glimpse h_t' (batch, d_h), e_j (batch, d_h) y las features de cotización de la
+              lane (batch, N_COT_FEATURES): entre ellas v_k = P_k·(p_k·d − c)/p95 y P_k (model/encoder.py)
     Salida  : logits sin enmascarar (batch, n_opciones)
+
+        logit_k = τ · (v_k + P_k · Δ) + MLP_k          (los niveles; VACÍO: solo MLP)
+
+    Δ (aprendido, en unidades de p95) es lo que vale ganar la carga más allá del tramo: V(j) − V(perder). El
+    nivel óptimo es argmax_k P_k·(p_k·d − c + V(j) − V(perder)), así que la cabeza solo tiene que aprender Δ; con
+    Δ = 0 arranca en la cotización miope. El MLP corrige lo que falte.
 
     El embedding e_j ya trae, por la atención del encoder, el contexto de todo el grafo (cargas, competencia,
     índice de mercado, continuación esperada desde j); h_t trae el momento del ciclo (tiempo, K, rechazos).
@@ -156,18 +166,28 @@ class PriceHead(nn.Module):
 
     def __init__(self, d_h: int, n_opciones: int):
         super().__init__()
+        n_in = 3 * d_h + N_COT_FEATURES
         # RNG propio: crear la cabeza no consume el RNG global de torch, así que el resto del agente y el
         # crítico se inicializan igual que antes de agregarla (mismo entrenamiento con la misma semilla).
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(self._INIT_SEED)
             self.net = nn.Sequential(
-                nn.Linear(3 * d_h, d_h),
+                nn.Linear(n_in, d_h),
                 nn.ReLU(),
                 nn.Linear(d_h, n_opciones),
             )
+            self.delta = nn.Sequential(nn.Linear(n_in, d_h), nn.ReLU(), nn.Linear(d_h, 1))
+            nn.init.zeros_(self.delta[-1].weight)
+            nn.init.zeros_(self.delta[-1].bias)
+            self.log_tau = nn.Parameter(torch.tensor(float(np.log(10.0))))
 
-    def forward(self, context: torch.Tensor, glimpse: torch.Tensor, e_j: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([context, glimpse, e_j], dim=-1))
+    def forward(self, context: torch.Tensor, glimpse: torch.Tensor, e_j: torch.Tensor,
+                cot_j: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([context, glimpse, e_j, cot_j], dim=-1)
+        valor = cot_j[:, COT_V] + cot_j[:, COT_P] * self.delta(x)                # (batch, K)
+        logits = self.net(x)
+        K = valor.shape[1]
+        return torch.cat([logits[:, :K] + self.log_tau.exp() * valor, logits[:, K:]], dim=-1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,15 +206,15 @@ class AttentionDecoder(nn.Module):
 
     Uso en entrenamiento (PPO)
     --------------------------
-    destino, opcion, log_prob, H_destino, H_precio = decoder.act_cotizacion(context, embeddings, mask, opciones)
+    destino, opcion, log_prob, H_destino, H_precio = decoder.act_cotizacion(context, embeddings, mask, opciones, cot)
 
     Uso en evaluación (greedy)
     --------------------------
-    destino, opcion = decoder.greedy_cotizacion(context, embeddings, mask, opciones)
+    destino, opcion = decoder.greedy_cotizacion(context, embeddings, mask, opciones, cot)
 
     Recálculo para actualización PPO
     ---------------------------------
-    log_prob, H_destino, H_precio = decoder.evaluate_cotizacion(context, embeddings, mask, opciones, destino, opcion)
+    log_prob, H_destino, H_precio = decoder.evaluate_cotizacion(context, embeddings, mask, opciones, cot, destino, opcion)
     """
 
     def __init__(
@@ -230,7 +250,7 @@ class AttentionDecoder(nn.Module):
         check_tensor(tag, probs)
         return Categorical(probs=torch.clamp(probs, min=1e-8))
 
-    def _dist_precio(self, context, glimpse, embeddings, destinos, opciones) -> Categorical:
+    def _dist_precio(self, context, glimpse, embeddings, destinos, opciones, cot) -> Categorical:
         """Distribución de la opción de precio para el destino `destinos` (batch,), con la máscara
         opciones (batch, N, n_opciones) bool (True = válida) de ese destino."""
         B = embeddings.shape[0]
@@ -238,7 +258,7 @@ class AttentionDecoder(nn.Module):
         validas = opciones[filas, destinos]                                   # (batch, n_opciones)
         if (~validas).all(dim=-1).any():
             raise RuntimeError("cabeza de precio: destino sin opciones válidas")
-        logits = self.precio(context, glimpse, embeddings[filas, destinos])  # (batch, n_opciones)
+        logits = self.precio(context, glimpse, embeddings[filas, destinos], cot[filas, destinos])  # (batch, n_opciones)
         check_tensor("price head raw logits", logits)
         return self._categorica(logits.masked_fill(~validas, float("-inf")), "price head probs")
 
@@ -260,31 +280,38 @@ class AttentionDecoder(nn.Module):
         embeddings:  torch.Tensor,   # (batch, N, d_h)
         action_mask: torch.Tensor,   # (batch, N) int8: 1 = el destino tiene alguna opción válida
         opciones:    torch.Tensor,   # (batch, N, n_opciones) bool: True = opción válida
+        cot:         torch.Tensor,   # (batch, N, N_COT_FEATURES): node_feats[..., COT_COLS]
     ):
         """Samplea (destino, opción). Retorna destino, opción, log π(j, o), entropía del destino y del precio."""
         dist_j, glimpse = self._dist_destino(context, embeddings, action_mask, "decoder softmax probs")
         destino = dist_j.sample()
-        dist_o = self._dist_precio(context, glimpse, embeddings, destino, opciones)
+        dist_o = self._dist_precio(context, glimpse, embeddings, destino, opciones, cot)
         opcion = dist_o.sample()
         return destino, opcion, dist_j.log_prob(destino) + dist_o.log_prob(opcion), dist_j.entropy(), dist_o.entropy()
 
-    def greedy_cotizacion(self, context, embeddings, action_mask, opciones) -> tuple:
+    def greedy_cotizacion(self, context, embeddings, action_mask, opciones, cot) -> tuple:
         """Argmax del destino y, para ese destino, argmax de la opción de precio. Retorna (destino, opción)."""
         if (action_mask.sum(dim=-1) == 0).any():
             raise RuntimeError("AttentionDecoder.greedy_cotizacion: zero valid actions in mask")
         logits, glimpse = self._logits_y_glimpse(context, embeddings, self._bool_mask(action_mask))
         destino = logits.argmax(dim=-1)
-        return destino, self.greedy_precio(context, glimpse, embeddings, destino, opciones)
+        return destino, self.greedy_precio(context, glimpse, embeddings, destino, opciones, cot)
 
-    def greedy_precio(self, context, glimpse, embeddings, destino, opciones) -> torch.Tensor:
+    def greedy_precio(self, context, glimpse, embeddings, destino, opciones, cot) -> torch.Tensor:
         """Argmax de la opción de precio para un destino dado (lo usa también la comparación B)."""
         B = embeddings.shape[0]
         filas = torch.arange(B, device=embeddings.device)
-        logits = self.precio(context, glimpse, embeddings[filas, destino])
+        logits = self.precio(context, glimpse, embeddings[filas, destino], cot[filas, destino])
         return logits.masked_fill(~opciones[filas, destino], float("-inf")).argmax(dim=-1)
 
-    def evaluate_cotizacion(self, context, embeddings, action_mask, opciones, destino, opcion) -> tuple:
+    def probs_precio(self, context, embeddings, action_mask, opciones, cot, destino) -> torch.Tensor:
+        """π(o | s, j): probabilidades de la cabeza de precio (batch, n_opciones) para el destino `destino`
+        (la usa la evaluación para el rango de precio de cada arco)."""
+        _, glimpse = self._logits_y_glimpse(context, embeddings, self._bool_mask(action_mask))
+        return self._dist_precio(context, glimpse, embeddings, destino, opciones, cot).probs
+
+    def evaluate_cotizacion(self, context, embeddings, action_mask, opciones, cot, destino, opcion) -> tuple:
         """Recalcula log π(j, o) y las dos entropías para un batch almacenado (actualización PPO)."""
         dist_j, glimpse = self._dist_destino(context, embeddings, action_mask, "decoder softmax probs (eval)")
-        dist_o = self._dist_precio(context, glimpse, embeddings, destino, opciones)
+        dist_o = self._dist_precio(context, glimpse, embeddings, destino, opciones, cot)
         return dist_j.log_prob(destino) + dist_o.log_prob(opcion), dist_j.entropy(), dist_o.entropy()

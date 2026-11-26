@@ -1,14 +1,18 @@
 """
 test_env_cotizacion.py
 ======================
-Fase 2 de especificacion_fase0_ruteo_pricing.md: VectorRoutingEnv con cotización (§4, tests 5-7).
+VectorRoutingEnv con cotización, espera y reposicionamiento (especificacion_fase0_ruteo_pricing.md §4,
+tests 5-7):
 
-  · máscara = opciones_validas.any(-1); niveles solo con carga cotizable; VACÍO solo hacia casa o
-    desde casa y solo si esa lane no se puede cotizar (con carga siempre se cobra)
-  · ganar con el nivel k ⇔ u_k < u_comp; el nivel 0 gana siempre
+  · máscara = opciones_validas.any(-1); niveles solo en lanes j ≠ i con carga cotizable; VACÍO a j ≠ i solo
+    para reposicionarse (≤ REPOSICION_MAX_MILLAS) o volver a casa desde un intermedio; VACÍO en j = i = esperar
+  · ganar con el nivel k ⇔ u_k < u_comp; ningún nivel gana siempre
   · un rechazo no consume K, avanza COTIZACION_HORAS, no mueve el camión, deja el tablero igual y
     quita la cotización de esa lane (test 5)
-  · después de COTIZACIONES_MAX_POR_NODO rechazos solo quedan opciones VACÍO (test 6)
+  · después de COTIZACIONES_MAX_POR_NODO rechazos solo quedan VACÍO: casa, reposicionarse o esperar (test 6)
+  · esperar salta al siguiente día de mercado, no consume K, revela el tablero del día nuevo y reinicia los
+    rechazos
+  · sin jugadas en reset() ⇒ no sale (margen 0, válido); sin jugadas después ⇒ el ciclo falla
   · margen = Σ lane_reward con el precio cotizado, en episodios completos (test 7)
   · determinismo y números aleatorios comunes; replay con cotización; opción inválida ⇒ error
 """
@@ -16,11 +20,12 @@ Fase 2 de especificacion_fase0_ruteo_pricing.md: VectorRoutingEnv con cotizació
 import numpy as np
 import pytest
 
-from config import COTIZACION_HORAS, COTIZACIONES_MAX_POR_NODO, MAX_DURATION, TRAIN_DAYS, K_MAX
+from config import (COTIZACION_HORAS, COTIZACIONES_MAX_POR_NODO, MAX_DURATION, TRAIN_DAYS, K_MAX,
+                    REPOSICION_MAX_MILLAS, HORAS_DIA_MERCADO, TIME_VIOLATION_PENALTY)
 from market_process import MarketProcess, asegurar_parametros
 from pricing import N_NIVELES, U_NIVELES_ARR, lane_cost_row
 from problem_data import lane_reward, load_matrices
-from routing_env import OPCION_VACIO, VectorRoutingEnv
+from routing_env import OPCION_VACIO, VectorRoutingEnv, fin_espera
 
 NUM_NODES = 10
 B = 64
@@ -39,19 +44,18 @@ def mp():
     return MarketProcess(NUM_NODES)
 
 
-def _env(data, mp, replay=False):
+def _env(data, mp, replay=False, n=NUM_NODES):
     if replay:
         return VectorRoutingEnv(
-            data["time_matrix"], NUM_NODES, data["dist"], data["diesel"], data["rate"].shape[0] - TRAIN_DAYS,
+            data["time_matrix"], n, data["dist"], data["diesel"], data["rate"].shape[0] - TRAIN_DAYS,
             mercado_replay=mp, day_offset=TRAIN_DAYS,
         )
-    return VectorRoutingEnv(data["time_matrix"], NUM_NODES, data["dist"], data["diesel"], TRAIN_DAYS,
-                            market_process=mp)
+    return VectorRoutingEnv(data["time_matrix"], n, data["dist"], data["diesel"], TRAIN_DAYS, market_process=mp)
 
 
 def _reset(env, k=None, semillas=SEMILLAS):
     n = len(semillas)
-    return env.reset(np.arange(n) % NUM_NODES, np.arange(n) % 20, k_max_arr=[k] * n, world_seeds=semillas)
+    return env.reset(np.arange(n) % env.num_nodes, np.arange(n) % 20, k_max_arr=[k] * n, world_seeds=semillas)
 
 
 def _accion_al_azar(env, rng):
@@ -71,43 +75,57 @@ def _primera_opcion(env):
     return np.array([p[0] for p in pares]), np.array([p[1] for p in pares])
 
 
+def _nivel_que_gana(env, b, j):
+    """El nivel más bajo que gana la lane j de la fila b (conociendo el competidor), o None."""
+    gana = np.flatnonzero(env.opciones_validas[b, j, :N_NIVELES] & (U_NIVELES_ARR < env.u_comp_row[b, j]))
+    return int(gana[0]) if len(gana) else None
+
+
 def _alejarse_de_casa(env):
-    """Primer paso al destino factible más cercano de cada fila (para quedar en un nodo intermedio): VACÍO si
-    la lane no tiene carga y nivel 0 (gana siempre) si la tiene. Devuelve (destinos, opciones)."""
-    acts, opc = np.zeros(env._B, dtype=np.int64), np.zeros(env._B, dtype=np.int64)
+    """Un paso en el que cada fila que puede gana una lane a un nodo intermedio (la más cercana donde algún
+    nivel gana); las demás esperan si pueden. Devuelve las filas que quedaron en un nodo intermedio."""
+    acts, opc = _primera_opcion(env)
     for b in range(env._B):
-        cand = np.flatnonzero(env.opciones_validas[b].any(-1))
-        cand = cand[cand != env.start_node[b]]
-        j = cand[np.argmin(env._time_matrix_arr[env.current_node[b], cand])]
-        acts[b], opc[b] = j, (OPCION_VACIO if env.opciones_validas[b, j, OPCION_VACIO] else 0)
+        i = env.current_node[b]
+        if env.opciones_validas[b, i, OPCION_VACIO]:
+            acts[b], opc[b] = i, OPCION_VACIO
+        mejor = None
+        for j in np.argsort(env._time_matrix_arr[i]):
+            if j == env.start_node[b]:
+                continue
+            k = _nivel_que_gana(env, b, j)
+            if k is not None:
+                mejor = (j, k)
+                break
+        if mejor is not None:
+            acts[b], opc[b] = mejor
     env.step(acts, opc)
-    assert (env.current_node != env.start_node).all()
-    return acts, opc
+    fuera = np.flatnonzero(env._active & (env.current_node != env.start_node))
+    assert len(fuera) > env._B // 4, "pocas filas llegaron a un nodo intermedio"
+    return fuera
 
 
 def _lane_rechazable(env, b):
-    """Destino con cotización válida donde el nivel más alto pierde (u_comp ≤ u_9), o None.
-
-    A 10 nodos, desde un nodo intermedio casi siempre la única lane cotizable es la de vuelta a casa
-    (varios tiempos de viaje pasan de 50 h), así que la lane de casa cuenta."""
-    for j in range(NUM_NODES):
-        if env.opciones_validas[b, j, N_NIVELES - 1] and env.u_comp_row[b, j] <= U_NIVELES_ARR[-1]:
+    """Destino j ≠ i con cotización válida donde el nivel más alto pierde (u_comp ≤ u_9), o None."""
+    for j in range(env.num_nodes):
+        if (j != env.current_node[b] and env.opciones_validas[b, j, N_NIVELES - 1]
+                and env.u_comp_row[b, j] <= U_NIVELES_ARR[-1]):
             return j
     return None
 
 
-def _paso_rechazando(env):
-    """Un step() donde cada fila activa con una lane rechazable cotiza el nivel 9 ahí (y pierde); el resto
-    toma su primera opción válida. Devuelve (casos [(fila, lane)], estado previo, salida de step)."""
+def _paso_rechazando(env, filas=None):
+    """Un step() donde cada fila activa (de `filas`) con una lane rechazable cotiza el nivel más alto ahí (y
+    pierde); el resto espera si puede o toma su primera opción válida. Devuelve (casos, estado previo, salida)."""
     acts, opc = _primera_opcion(env)
     casos = []
-    for b in np.flatnonzero(env._active):
+    for b in (np.flatnonzero(env._active) if filas is None else filas):
         j = _lane_rechazable(env, b)
         if j is not None:
             acts[b], opc[b] = j, N_NIVELES - 1
             casos.append((b, j))
     antes = dict(nodo=env.current_node.copy(), t=env.time_elapsed.copy(), k=env.k_remaining.copy(),
-                 precios=env.precios_row.copy(), loads=env.current_loads_row.copy())
+                 precios=env.precios_row.copy(), loads=env.current_loads_row.copy(), perdidas=env.perdidas.copy())
     return casos, antes, env.step(acts, opc)
 
 
@@ -119,15 +137,21 @@ def _verificar_rechazo(env, casos, antes, salida):
         assert env.time_elapsed[b] == pytest.approx(antes["t"][b] + COTIZACION_HORAS)
         assert env.k_remaining[b] == antes["k"][b]                                       # no consume K
         assert env.last_raw_reward[b] == 0.0
-        if terminated[b]:                                                                # se pasó de max_duration
+        if terminated[b]:                                                                # sin jugadas o fuera de tiempo
             continue
         assert rewards[b] == 0.0
         np.testing.assert_array_equal(env.precios_row[b], antes["precios"][b])           # mismo tablero
         np.testing.assert_array_equal(env.current_loads_row[b], antes["loads"][b])
-        assert env.rechazadas[b, j] and not env.opciones_validas[b, j, :N_NIVELES].any()
-        puede_ir_vacio = (j == env.start_node[b]) or (env.current_node[b] == env.start_node[b])
+        # Se pierde UNA carga: la lane se puede volver a cotizar si le quedan cargas (y hay tiempo e intentos).
+        assert env.perdidas[b, j] == antes["perdidas"][b, j] + 1
+        if env.current_loads_row[b, j] <= env.perdidas[b, j] or env.n_rechazos[b] >= COTIZACIONES_MAX_POR_NODO:
+            assert not env.opciones_validas[b, j, :N_NIVELES].any()
+        elif antes["t"][b] + COTIZACION_HORAS + 1.0 < MAX_DURATION - env._time_matrix_arr[env.current_node[b], j] \
+                - (0.0 if j == env.start_node[b] else env._time_matrix_arr[j, env.start_node[b]]):
+            assert env.opciones_validas[b, j, :N_NIVELES].all()
+        i, h = env.current_node[b], env.start_node[b]
+        puede_ir_vacio = (j == h and i != h) or env._reposicion[i, j]
         assert env.opciones_validas[b, j, OPCION_VACIO] == puede_ir_vacio
-        assert bool(masks[b, j]) == puede_ir_vacio
 
 
 # ── Máscara y opciones ───────────────────────────────────────────────────────
@@ -137,132 +161,227 @@ def test_mascara_es_alguna_opcion_valida(data, mp):
     masks = _reset(env)
     op = env.opciones_validas
     assert op.shape == (B, NUM_NODES, N_NIVELES + 1)
-    np.testing.assert_array_equal(masks.astype(bool), op.any(axis=-1))
+    act = env.active
+    np.testing.assert_array_equal(masks[act].astype(bool), op[act].any(axis=-1))
+    filas = np.arange(B)
+    i = env.current_node
+    # Niveles: solo lanes j ≠ i con carga.
     con_carga = env.current_loads_row > 0
-    factible = masks.astype(bool)
-    # En casa: con carga se cotiza (niveles) y sin carga se reposiciona (VACÍO); nunca las dos.
-    np.testing.assert_array_equal(op[:, :, :N_NIVELES].any(-1), con_carga & factible)
-    np.testing.assert_array_equal(op[:, :, OPCION_VACIO], ~con_carga & factible)
-    assert not (op[:, :, :N_NIVELES].any(-1) & op[:, :, OPCION_VACIO]).any()
+    assert not (op[:, :, :N_NIVELES].any(-1) & ~con_carga)[act].any()
+    assert not op[filas, i, :N_NIVELES].any()
+    # En casa (antes de salir), VACÍO a j ≠ i solo si es reposicionamiento (≤ 300 mi; a 10 nodos, ninguno).
+    vacio_otro = op[:, :, OPCION_VACIO].copy()
+    vacio_otro[filas, i] = False
+    assert not (vacio_otro & ~env._reposicion[i])[act].any()
+    assert not env._reposicion.any()                                                     # a 10 nodos, nada ≤ 300 mi
 
 
-def test_en_nodo_intermedio_vacio_solo_hacia_casa(data, mp):
+def test_sin_salida_es_exogeno_y_valido(data, mp):
+    """La casa 9 a 10 nodos (ida y vuelta mínima 72.7 h): sin carga cotizable no tiene ninguna jugada."""
+    env = _env(data, mp)
+    sem = np.arange(5000, 5200)
+    env.reset(np.full(200, 9), np.arange(200) % 100, world_seeds=sem)
+    sin = env.sin_salida
+    assert sin.any() and not sin.all()
+    assert not env.active[sin].any() and env.active[~sin].all()
+    assert not env.last_time_violation.any()
+
+
+def test_en_nodo_intermedio_vacio_hacia_casa_o_esperar(data, mp):
     env = _env(data, mp)
     _reset(env)
-    _alejarse_de_casa(env)
-    act = env._active
+    fuera = _alejarse_de_casa(env)
     op = env.opciones_validas
-    for b in np.flatnonzero(act):
-        h = env.start_node[b]
+    for b in fuera:
+        h, i = env.start_node[b], env.current_node[b]
+        vacio = set(np.flatnonzero(op[b, :, OPCION_VACIO]))
+        assert h in vacio                                                                # volver siempre se puede
+        assert vacio <= {h, i} | set(np.flatnonzero(env._reposicion[i]))
+        espera_ok = fin_espera(env.time_elapsed[b]) + data["time_matrix"][i, h] <= MAX_DURATION
+        assert (i in vacio) == espera_ok
+
+
+def test_reposicionamiento_solo_a_300_millas(mp):
+    """A 20 nodos hay pares a ≤ 300 mi: VACÍO a j ≠ i fuera de casa solo hacia ellos (o hacia casa)."""
+    tm, rate, loads, dist, diesel, *_ = load_matrices(20)
+    mp20 = MarketProcess(20)
+    env = VectorRoutingEnv(np.asarray(tm, dtype=float), 20, dist, diesel, TRAIN_DAYS, market_process=mp20)
+    env.reset(np.arange(40) % 20, np.arange(40) % 20, world_seeds=np.arange(40))
+    op = env.opciones_validas
+    for b in np.flatnonzero(env.active):
+        i = env.current_node[b]
         vacio = np.flatnonzero(op[b, :, OPCION_VACIO])
-        # VACÍO solo hacia casa, y solo si la lane a casa no se puede cotizar.
-        np.testing.assert_array_equal(vacio, [] if op[b, h, :N_NIVELES].any() else [h])
-        assert op[b, h].any()                                                            # volver siempre se puede
+        otros = vacio[vacio != i]
+        assert np.all(np.asarray(dist)[i, otros] <= REPOSICION_MAX_MILLAS)
+    assert any(op[b, :, OPCION_VACIO].sum() > 1 for b in range(40))                     # alguien puede reposicionarse
 
 
 # ── Ganar y perder ───────────────────────────────────────────────────────────
-
-def test_nivel_cero_gana_y_cobra_su_precio(data, mp):
-    env = _env(data, mp)
-    _reset(env, k=K_MAX)
-    filas = [b for b in range(B) if env.opciones_validas[b, :, 0].any()]
-    acts, opc = _primera_opcion(env)
-    for b in filas:
-        acts[b], opc[b] = np.flatnonzero(env.opciones_validas[b, :, 0])[0], 0
-    origen = env.current_node.copy()
-    precios = env.precios_row.copy()
-    env.step(acts, opc)
-    for b in filas:
-        i, j = origen[b], acts[b]
-        assert env.last_gano[b] and env.current_node[b] == j
-        esperado = lane_reward(precios[b, j, 0], 1, data["dist"][i, j], data["diesel"][i, j])
-        assert env.last_raw_reward[b] == pytest.approx(float(esperado))
-        assert env.k_remaining[b] == K_MAX - 1 and env.n_rechazos[b] == 0
-
 
 def test_gana_si_y_solo_si_queda_bajo_el_competidor(data, mp):
     env = _env(data, mp)
     _reset(env)
     rng = np.random.default_rng(3)
-    acts, opc = np.zeros(B, dtype=np.int64), np.zeros(B, dtype=np.int64)
-    for b in range(B):
+    acts, opc = _primera_opcion(env)
+    for b in np.flatnonzero(env.active):
         pares = np.argwhere(env.opciones_validas[b, :, :N_NIVELES])
-        acts[b], opc[b] = pares[rng.integers(len(pares))] if len(pares) else (
-            np.flatnonzero(env.opciones_validas[b, :, OPCION_VACIO])[0], OPCION_VACIO)
+        if len(pares):
+            acts[b], opc[b] = pares[rng.integers(len(pares))]
     u_comp = env.u_comp_row[np.arange(B), acts].copy()
+    act = env.active.copy()
     env.step(acts, opc)
-    cot = opc < N_NIVELES
-    esperado = (U_NIVELES_ARR[np.minimum(opc, N_NIVELES - 1)] <= 0) | (U_NIVELES_ARR[np.minimum(opc, N_NIVELES - 1)] < u_comp)
+    cot = act & (opc < N_NIVELES)
+    esperado = U_NIVELES_ARR[np.minimum(opc, N_NIVELES - 1)] < u_comp
     np.testing.assert_array_equal(env.last_gano[cot], esperado[cot])
-    np.testing.assert_array_equal(env.last_cotizo, cot)
+    np.testing.assert_array_equal(env.last_cotizo[act], cot[act])
 
 
-def test_vacio_desde_casa_paga_solo_el_costo(data, mp):
+def test_ganar_cobra_el_precio_del_nivel(data, mp):
+    env = _env(data, mp)
+    _reset(env, k=K_MAX)
+    acts, opc = _primera_opcion(env)
+    filas = []
+    for b in np.flatnonzero(env.active):
+        for j in range(NUM_NODES):
+            k = _nivel_que_gana(env, b, j)
+            if k is not None:
+                acts[b], opc[b] = j, k
+                filas.append(b)
+                break
+    assert filas
+    origen, precios = env.current_node.copy(), env.precios_row.copy()
+    env.step(acts, opc)
+    for b in filas:
+        i, j, k = origen[b], acts[b], opc[b]
+        assert env.last_gano[b] and env.current_node[b] == j
+        esperado = lane_reward(precios[b, j, k], 1, data["dist"][i, j], data["diesel"][i, j])
+        assert env.last_raw_reward[b] == pytest.approx(float(esperado))
+        assert env.k_remaining[b] == K_MAX - 1 and env.n_rechazos[b] == 0
+
+
+def test_volver_a_casa_vacio_paga_solo_el_costo(data, mp):
     env = _env(data, mp)
     _reset(env)
+    fuera = _alejarse_de_casa(env)
+    acts, opc = _primera_opcion(env)
+    acts[fuera], opc[fuera] = env.start_node[fuera], OPCION_VACIO
     origen = env.current_node.copy()
-    acts, opc = _alejarse_de_casa(env)
-    vacio = opc == OPCION_VACIO
-    assert vacio.any()
+    env.step(acts, opc)
     costo = lane_cost_row(data["dist"][origen, acts], data["diesel"][origen, acts])
-    np.testing.assert_allclose(env.last_raw_reward[vacio], -np.round(costo[vacio]), atol=0.5)
-    assert not env.last_cotizo[vacio].any() and env.last_gano[~vacio].all()            # nivel 0 gana siempre
+    np.testing.assert_allclose(env.last_raw_reward[fuera], -np.round(costo[fuera]), atol=0.5)
+    assert not env.last_cotizo[fuera].any() and (env.current_node[fuera] == env.start_node[fuera]).all()
 
 
 def test_rechazo_en_casa(data, mp):
-    """Test 5 en el primer movimiento: la lane rechazada sigue disponible como reposicionamiento VACÍO."""
+    """Test 5 en casa, antes de salir."""
     env = _env(data, mp)
     _reset(env, k=K_MAX)
     casos, antes, salida = _paso_rechazando(env)
-    assert len(casos) > B // 2
+    assert len(casos) > B // 4
     _verificar_rechazo(env, casos, antes, salida)
     assert all(env.n_rechazos[b] == 1 for b, _ in casos)
 
 
 def test_rechazo_en_nodo_intermedio(data, mp):
-    """Test 5 lejos de casa: la lane rechazada desaparece (salvo la de casa, que queda como VACÍO)."""
     env = _env(data, mp)
     _reset(env, k=K_MAX)
-    _alejarse_de_casa(env)
-    casos, antes, salida = _paso_rechazando(env)
-    assert casos, "ninguna fila tiene una lane donde el nivel 9 pierda"
+    fuera = _alejarse_de_casa(env)
+    casos, antes, salida = _paso_rechazando(env, fuera)
+    assert casos, "ninguna fila tiene una lane donde el nivel más alto pierda"
     _verificar_rechazo(env, casos, antes, salida)
 
 
-def test_tope_de_cotizaciones_en_casa(data, mp):
-    """Test 6 en casa: tras el tope ya no se cotiza; los reposicionamientos VACÍO siguen."""
+def test_cada_carga_de_la_lane_tiene_su_competidor(data, mp):
+    """Al perder, la siguiente cotización de la lane se enfrenta al competidor de la carga siguiente; con una sola
+    carga la lane se cierra."""
     env = _env(data, mp)
     _reset(env)
-    for _ in range(COTIZACIONES_MAX_POR_NODO):
-        _paso_rechazando(env)
-    llenas = np.flatnonzero(env._active & (env.n_rechazos == COTIZACIONES_MAX_POR_NODO))
-    assert len(llenas), "ninguna fila llegó al tope de cotizaciones"
-    for b in llenas:
-        assert env.current_node[b] == env.start_node[b]
-        assert not env.opciones_validas[b, :, :N_NIVELES].any()
-        assert env.opciones_validas[b, :, OPCION_VACIO].any()
+    casos, antes, _ = _paso_rechazando(env)
+    vistos = 0
+    for b, j in casos:
+        if not env.active[b]:
+            continue
+        assert env.u_comp_row[b, j] == env.u_comp_cargas[b, j, 1]
+        vistos += env.u_comp_cargas[b, j, 0] != env.u_comp_cargas[b, j, 1]
+        esperado = min(antes["loads"][b, j] - 1, COTIZACIONES_MAX_POR_NODO - 1)
+        assert env.intentos[b, j] == esperado
+    assert vistos
+    b, j = next((b, j) for b, j in casos if env.active[b])
+    env._current_loads_row[b, j] = 1                                                     # la única que había se perdió
+    env._compute_masks()
+    assert not env.opciones_validas[b, j, :N_NIVELES].any()
 
 
 def test_tope_de_cotizaciones_en_nodo_intermedio(data, mp):
-    """Test 6 lejos de casa: con el tope alcanzado la única opción es volver a casa VACÍO."""
+    """Test 6 lejos de casa: con el tope alcanzado solo quedan VACÍO (casa y, si se puede, esperar)."""
     env = _env(data, mp)
     _reset(env)
-    _alejarse_de_casa(env)
-    act = np.flatnonzero(env._active)
-    env._n_rechazos[act] = COTIZACIONES_MAX_POR_NODO
+    fuera = _alejarse_de_casa(env)
+    env._n_rechazos[fuera] = COTIZACIONES_MAX_POR_NODO
     masks = env._compute_masks()
-    for b in act:
-        np.testing.assert_array_equal(np.argwhere(env.opciones_validas[b]), [[env.start_node[b], OPCION_VACIO]])
-        np.testing.assert_array_equal(np.flatnonzero(masks[b]), [env.start_node[b]])
+    for b in fuera:
+        op = env.opciones_validas[b]
+        assert not op[:, :N_NIVELES].any()
+        assert op[env.start_node[b], OPCION_VACIO] and masks[b, env.start_node[b]]
+
+
+# ── Esperar ──────────────────────────────────────────────────────────────────
+
+def test_esperar_salta_al_dia_siguiente_con_tablero_nuevo(data, mp):
+    env = _env(data, mp)
+    _reset(env, k=K_MAX)
+    puede = np.flatnonzero(env.active & env.opciones_validas[np.arange(B), env.current_node, OPCION_VACIO])
+    assert len(puede) > B // 2
+    # Primero un rechazo, para ver que la espera los reinicia.
+    _paso_rechazando(env, puede)
+    puede = [b for b in puede if env.active[b] and env.opciones_validas[b, env.current_node[b], OPCION_VACIO]]
+    acts, opc = _primera_opcion(env)
+    for b in puede:
+        acts[b], opc[b] = env.current_node[b], OPCION_VACIO
+    antes = dict(nodo=env.current_node.copy(), t=env.time_elapsed.copy(), k=env.k_remaining.copy(),
+                 dia=env.current_day_idx.copy(), u=env.u_comp_row.copy())
+    rewards, terminated, _ = env.step(acts, opc)
+    cambio = 0
+    for b in puede:
+        assert env.last_espero[b] and not env.last_cotizo[b]
+        assert env.current_node[b] == antes["nodo"][b] and env.k_remaining[b] == antes["k"][b]
+        assert env.last_raw_reward[b] == 0.0 and rewards[b] == 0.0 and not terminated[b]
+        assert env.time_elapsed[b] == pytest.approx(fin_espera(antes["t"][b]))
+        assert env.time_elapsed[b] % HORAS_DIA_MERCADO == pytest.approx(0.0, abs=1e-4)
+        assert env.current_day_idx[b] == min(antes["dia"][b] + 1, TRAIN_DAYS - 1)
+        assert env.n_rechazos[b] == 0 and not env.perdidas[b].any()
+        cambio += not np.array_equal(env.u_comp_row[b], antes["u"][b])
+    assert cambio > len(puede) // 2                                                      # tablero del día nuevo
+    assert (env.step_count[puede] == 0).all()                                            # no cuenta como arco
+
+
+def test_quedarse_sin_jugadas_despues_es_falla(data, mp):
+    """Casa 9 (ida y vuelta mínima 72.7 h): si tenía carga cotizable y la pierde, no puede esperar ni
+    reposicionarse: el ciclo falla con la penalización (no es 'no sale')."""
+    env = _env(data, mp)
+    sem = np.arange(5000, 5200)
+    env.reset(np.full(200, 9), np.arange(200) % 100, world_seeds=sem)
+    filas = [b for b in np.flatnonzero(env.active) if _lane_rechazable(env, b) is not None]
+    assert filas
+    fallan = []
+    for _ in range(COTIZACIONES_MAX_POR_NODO):
+        activas = [b for b in filas if env.active[b]]
+        casos, _, (rewards, terminated, _) = _paso_rechazando(env, activas)
+        for b, _j in casos:
+            if terminated[b] and env.step_count[b] == 0:                                # terminó en casa sin salir
+                assert env.last_time_violation[b] and not env.sin_salida[b]
+                assert rewards[b] == pytest.approx(TIME_VIOLATION_PENALTY)
+                fallan.append(b)
+    assert fallan
 
 
 def test_opcion_invalida_lanza_error(data, mp):
     env = _env(data, mp)
     _reset(env)
-    b = 0
-    malo = int(np.flatnonzero(~env.opciones_validas[b].any(-1))[0])                     # self-loop al menos
+    b = int(np.flatnonzero(env.active)[0])
+    malo_j, malo_o = np.argwhere(~env.opciones_validas[b])[0]
     acts, opc = _primera_opcion(env)
-    acts[b] = malo
+    acts[b], opc[b] = malo_j, malo_o
     with pytest.raises(ValueError):
         env.step(acts, opc)
 
@@ -283,10 +402,12 @@ def _episodio_al_azar(env, data, rng, k=None, semillas=SEMILLAS):
         acts, opc = _accion_al_azar(env, rng)
         rewards, terminated, _ = env.step(acts, opc)
         traza.append((acts.copy(), opc.copy(), rewards.copy()))
-        margen += env.last_raw_reward
+        margen += np.where(act, env.last_raw_reward, 0.0)
         for b in np.flatnonzero(act):
             i, j, o = origen[b], acts[b], opc[b]
-            if o == OPCION_VACIO:
+            if o == OPCION_VACIO and i == j:
+                pass                                                                     # esperar: reward 0
+            elif o == OPCION_VACIO:
                 a_mano[b] += lane_reward(0.0, 0, data["dist"][i, j], data["diesel"][i, j])
             elif env.last_gano[b]:
                 a_mano[b] += lane_reward(precios[b, j, o], 1, data["dist"][i, j], data["diesel"][i, j])
@@ -318,9 +439,11 @@ def test_misma_cotizacion_en_el_mismo_mundo_da_el_mismo_resultado(data, mp):
     for _ in range(2):
         env = _env(data, mp)
         _reset(env)
-        acts = np.array([np.flatnonzero(env.opciones_validas[b].any(-1))[0] for b in range(B)])
-        opc = np.array([N_NIVELES // 2 if env.opciones_validas[b, acts[b], N_NIVELES // 2] else OPCION_VACIO
-                        for b in range(B)])
+        acts, opc = _primera_opcion(env)
+        for b in np.flatnonzero(env.active):
+            pares = np.argwhere(env.opciones_validas[b, :, :N_NIVELES])
+            if len(pares):
+                acts[b], opc[b] = pares[0][0], N_NIVELES // 2 if env.opciones_validas[b, pares[0][0], N_NIVELES // 2] else pares[0][1]
         env.step(acts, opc)
         resultados.append(env.last_gano.copy())
     np.testing.assert_array_equal(*resultados)

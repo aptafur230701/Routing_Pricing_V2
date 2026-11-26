@@ -23,6 +23,7 @@ import torch
 
 from config import MAX_DURATION, DEVICE
 from model.encoder import (
+    COT_COLS,
     build_node_features_batch,
     build_temporal_features_batch,
     build_market_features_batch,
@@ -42,9 +43,10 @@ class GreedyResult:
     raw_reward : (B,) suma de las recompensas de las lanes recorridas, en unidades
                  originales (las de los solvers). Solo significativa si valid[b].
     routes     : list[list[int]] — nodos visitados, desde start_node hasta donde terminó
-                 el episodio (solo los viajes: un rechazo no agrega nodo).
+                 el episodio (solo los viajes: un rechazo o una espera no agregan nodo).
     duration   : (B,) horas acumuladas al terminar.
-    valid      : (B,) bool — el episodio cerró el ciclo en start_node dentro de max_duration.
+    valid      : (B,) bool — el episodio cerró el ciclo en start_node dentro de max_duration, o no salió
+                 de casa porque no tenía ninguna jugada (env.sin_salida, margen 0).
     n_cotizaciones, n_ganadas : (B,) cotizaciones hechas y cargas ganadas.
     niveles    : list[list[int]] — nivel cotizado en cada cotización.
     """
@@ -64,7 +66,7 @@ def construir_features(
 ) -> dict:
     """Entradas del agente (numpy) para el estado actual de cada fila de `env`.
 
-    Claves: node_feats (B, N, F), temporal (B, 3), market (B, 1), budget (B, 2), dow (B, 7),
+    Claves: node_feats (B, N, F) (sus últimas columnas, COT_COLS, entran también a la cabeza de precio), temporal (B, 3), market (B, 1), budget (B, 2), dow (B, 7),
     cot (B, N_COT_CONTEXT) y opciones (B, N, K+1) bool.
     """
     B = len(start_nodes)
@@ -72,6 +74,7 @@ def construir_features(
     day_idx = env.current_day_idx
     cot_nodo = build_cotizacion_node_features_batch(
         cur_nodes, env.precios_row, env.opciones_validas, env.dist_rows, env.cost_rows,
+        env.competencia, env.intentos, reward_global_p95,
     )
     node_feats = build_node_features_batch(
         cur_nodes, start_nodes,
@@ -151,7 +154,7 @@ def greedy_rollout(
     niveles = [[] for _ in range(B)]
 
     masks  = env.reset(start_nodes, start_day_idxs, k_max_arr=k_max_arr, world_seeds=world_seeds)
-    active = np.ones(B, dtype=bool)
+    active = env.active.copy()                     # sin ninguna jugada desde casa: no sale (margen 0, válido)
     techo = env.max_steps
 
     was_training = agent.training
@@ -170,7 +173,9 @@ def greedy_rollout(
                 h_t, embeddings = contexto_agente(agent, feats, cur_nodes, device)
                 mask_t = torch.from_numpy(masks).to(device)
                 opciones_t = torch.from_numpy(feats["opciones"]).to(device)
-                a_t, o_t = agent.decoder.greedy_cotizacion(h_t, embeddings, mask_t, opciones_t)
+                feats_cot = torch.from_numpy(feats["node_feats"][..., COT_COLS]).to(device)
+                a_t, o_t = agent.decoder.greedy_cotizacion(
+                    h_t, embeddings, mask_t, opciones_t, feats_cot)
                 actions, opciones = a_t.cpu().numpy(), o_t.cpu().numpy()
 
                 if step_hook is not None:
@@ -179,7 +184,7 @@ def greedy_rollout(
 
                 rewards, terminated, masks = env.step(actions, opciones)
                 cotizo = active & env.last_cotizo
-                viajo = active & ~(env.last_cotizo & ~env.last_gano)
+                viajo = active & ~(env.last_cotizo & ~env.last_gano) & ~env.last_espero
                 n_cot += cotizo
                 n_gan += cotizo & env.last_gano
                 for b in np.flatnonzero(cotizo):
@@ -195,6 +200,7 @@ def greedy_rollout(
                 active = active & ~terminated
     finally:
         agent.train(was_training)
+    valid |= env.sin_salida                         # no salió de casa: ciclo válido con margen 0
 
     return GreedyResult(
         env_reward=env_reward,

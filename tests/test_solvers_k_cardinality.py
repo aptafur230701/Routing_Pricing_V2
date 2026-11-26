@@ -39,7 +39,8 @@ def synthetic_data():
 
 
 def _n_arcs(route):
-    return None if route is None else len(route) - 1
+    """Arcos recorridos: pares consecutivos distintos (una espera aparece como el nodo repetido)."""
+    return None if route is None else sum(a != b for a, b in zip(route[:-1], route[1:]))
 
 
 def test_ub_pi_respects_k(synthetic_data):

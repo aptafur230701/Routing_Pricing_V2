@@ -32,7 +32,7 @@ Uso
     python validate_market_process.py --nodos 194        # toda la red (lento y pesado en memoria)
     python validate_market_process.py --sorteos 200      # sorteos por lane-día de prueba
 
-Salida (results/market_validation/): tablas .csv.
+Salida (results/market_validation/<N>nodos/): tablas .csv.
 """
 
 import argparse
@@ -444,8 +444,9 @@ def main():
     ap.add_argument("--nodos", type=int, default=35, help="primeros N nodos a validar (máx. 194)")
     ap.add_argument("--sorteos", type=int, default=2000, help="sorteos por lane-día / semillas de muestra")
     ap.add_argument("--seed", type=int, default=20261101)
-    ap.add_argument("--salida", default=os.path.join(_CWD, "results", "market_validation"))
+    ap.add_argument("--salida", help="default: results/market_validation/<N>nodos")
     args = ap.parse_args()
+    args.salida = args.salida or os.path.join(_CWD, "results", "market_validation", f"{args.nodos}nodos")
 
     asegurar_parametros()
     mp = MarketProcess(args.nodos)

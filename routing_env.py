@@ -7,17 +7,22 @@ B episodios en paralelo.
 MDP
 ---
 En cada nodo la política elige (j, o): destino j y opción o ∈ {nivel 0 … nivel K−1, VACÍO}, con
-VACÍO = OPCION_VACIO = K. step(actions, opciones).
-  · Nivel k: válido si la lane i→j tiene carga, no fue rechazada en esta visita y quedan
-    cotizaciones (COTIZACIONES_MAX_POR_NODO). Se gana si u_k < u_comp (pricing.gana).
-  · VACÍO (moverse sin carga, sin ingreso): válido para volver a casa y en el primer movimiento
-    desde casa, y SOLO si esa lane no se puede cotizar (sin carga, carga rechazada o tope de
-    cotizaciones). Con carga cotizable siempre se cobra.
-  · Si se gana, o con VACÍO, el camión viaja a j. Reward = round(p_k·d − c) si se ganó, round(−c)
-    con VACÍO.
-  · Si se pierde: el camión se queda en i, el tiempo avanza COTIZACION_HORAS, reward 0, la lane
-    queda sin cotización en esta visita, no se consume K y el tablero no cambia. Si con ese tiempo
-    se pasa de max_duration, termina con TIME_VIOLATION_PENALTY.
+VACÍO = OPCION_VACIO = K. step(actions, opciones). El objetivo es el margen total del ciclo: en cada nodo
+(casa incluida, antes de salir) hay tres clases de jugada.
+  · Cotizar (nivel k, percentiles p10 … p90): válido si j ≠ i, la lane i→j tiene alguna carga que
+    no se haya perdido en esta visita y quedan cotizaciones (COTIZACIONES_MAX_POR_NODO). Se gana si u_k < u_comp
+    (pricing.gana); ningún nivel gana con seguridad. Si se gana, el camión viaja a j y cobra:
+    reward = round(p_k·d − c).
+    Si se pierde: el camión se queda en i, el tiempo avanza COTIZACION_HORAS, reward 0, esa carga
+    se pierde (la lane se puede volver a cotizar con OTRA carga, otro competidor independiente, hasta agotar las
+    suyas), no se consume K y el resto del tablero no cambia.
+  · VACÍO a j ≠ i (reward round(−c)): reposicionarse a un nodo a ≤ REPOSICION_MAX_MILLAS, o volver a casa
+    desde un nodo intermedio a cualquier distancia. Vale aunque la lane tenga carga.
+  · ESPERAR = (j = i, VACÍO): el camión se queda en i hasta el siguiente día de mercado (fin_espera:
+    el próximo múltiplo de HORAS_DIA_MERCADO), reward 0, sin consumir K ni contar como arco. Al despertar
+    se revela el tablero de i del día nuevo y se reinician los rechazos de la visita.
+Todo movimiento (y la espera, y perder una cotización lejos de casa) exige poder volver a casa dentro de max_duration. Si un paso se pasa de
+max_duration, termina con TIME_VIOLATION_PENALTY.
 `opciones_validas` (B, N, K+1) es la máscara de opciones y la máscara de destinos es su `any(-1)`.
 
 Revelación post-decisión: el tablero de un nodo (cargas, precios por nivel, competencia m y el
@@ -34,11 +39,16 @@ competidor (`u_comp_row` existe solo para la cota con información perfecta y lo
 
 Terminación:
   A) el camión viaja de vuelta al start_node, o el tiempo pasa de max_duration;
-  B) no queda ninguna acción factible (red de seguridad).
+  B) no queda ninguna acción factible. Fuera de casa no pasa (volver a casa siempre vale). En casa:
+     · si ya en reset() no hay ninguna jugada (sin carga cotizable, sin reposicionamiento ni tiempo para
+       esperar), el camión NO SALE: el ciclo termina con margen 0, no es violación (`sin_salida`) y la fila
+       arranca inactiva (`active`). Es exógeno: le pasa igual a todos los métodos.
+     · si la política tenía jugadas y se quedó sin ellas (perdió las cotizaciones o esperó hasta que no quedó
+       nada), el ciclo FALLA: violación con TIME_VIOLATION_PENALTY, como pasarse del tiempo. El ciclo hay que
+       hacerlo; cotizar alto a propósito no sirve para saltarse un ciclo malo.
 
-Máscara de destinos: excluye el self-loop, los nodos intermedios desde los que no se vuelve a casa
-dentro de max_duration y las lanes no cotizables (salvo casa y el primer movimiento, que pueden ir
-VACÍO). El camión puede revisitar nodos intermedios.
+Máscara de destinos: opciones_validas.any(-1). El self-loop es la espera. El camión puede revisitar
+nodos intermedios.
 
 Índice de mercado (feature del agente)
 --------------------------------------
@@ -49,7 +59,8 @@ VACÍO). El camión puede revisitar nodos intermedios.
 Presupuesto de cardinalidad K (número de arcos, incluido el retorno)
 ----------------------------------------------------------------------
 reset(k_max_arr=[K o None, …]). None = caso libre. Con K, k_remaining baja en 1 por cada arco
-recorrido (un rechazo no consume K) y, con k_remaining == 1, el único destino válido es casa.
+recorrido (un rechazo o una espera no consumen K) y, con k_remaining == 1, solo quedan volver a casa o
+esperar.
 Formulación ≤ K: la política puede cerrar el ciclo antes.
 """
 
@@ -60,11 +71,12 @@ from config import (
     REWARD_SCALE_FACTOR,
     RETURN_SUCCESS_BONUS,
     TIME_VIOLATION_PENALTY,
-    BIG_M_PENALTY,
     USE_REWARD_SHAPING,
     MARKET_SEED_TRAIN,
     COTIZACION_HORAS,
     COTIZACIONES_MAX_POR_NODO,
+    HORAS_DIA_MERCADO,
+    REPOSICION_MAX_MILLAS,
 )
 from fit_market_process import dia_de_semana
 from pricing import N_NIVELES, U_NIVELES_ARR, gana, indice_nivel, lane_cost_row
@@ -72,6 +84,25 @@ from problem_data import lane_reward
 
 OPCION_VACIO = N_NIVELES                 # índice de la opción "ir sin cotizar" (tras los K niveles)
 _NIVEL_MEDIANA = indice_nivel(0.5)
+
+
+def fin_espera(t):
+    """Hora en que termina una espera que empieza en t: el siguiente día de mercado (próximo múltiplo de
+    HORAS_DIA_MERCADO, estrictamente mayor que t). Sirve con escalares o arrays."""
+    return (np.floor(np.asarray(t, dtype=np.float64) / HORAS_DIA_MERCADO) + 1.0) * HORAS_DIA_MERCADO
+
+
+def max_esperas(max_duration: float = MAX_DURATION) -> int:
+    """Cota del número de esperas de un episodio: cada una salta a un día de mercado nuevo."""
+    return int(max_duration // HORAS_DIA_MERCADO) + 1
+
+
+def vacio_permitido(distance_arr, max_millas: float = REPOSICION_MAX_MILLAS) -> np.ndarray:
+    """(N, N) bool: lanes i→j (i ≠ j) que se pueden recorrer VACÍAS para reposicionarse (≤ max_millas).
+    Volver a casa vacío desde un nodo intermedio vale a cualquier distancia y va aparte."""
+    ok = np.asarray(distance_arr, dtype=float) <= max_millas
+    np.fill_diagonal(ok, False)
+    return ok
 
 
 def max_pasos(time_matrix, max_duration: float = MAX_DURATION) -> int:
@@ -87,8 +118,9 @@ def max_pasos(time_matrix, max_duration: float = MAX_DURATION) -> int:
 
 
 def max_pasos_cotizacion(time_matrix, max_duration: float = MAX_DURATION) -> int:
-    """Cota de pasos con cotización: en cada visita, hasta COTIZACIONES_MAX_POR_NODO rechazos más un viaje."""
-    return max_pasos(time_matrix, max_duration) * (COTIZACIONES_MAX_POR_NODO + 1)
+    """Cota de pasos con cotización: en cada visita (una llegada o una espera), hasta COTIZACIONES_MAX_POR_NODO
+    rechazos más el paso que viaja o espera."""
+    return (max_pasos(time_matrix, max_duration) + max_esperas(max_duration)) * (COTIZACIONES_MAX_POR_NODO + 1)
 
 
 class VectorRoutingEnv:
@@ -161,16 +193,23 @@ class VectorRoutingEnv:
         self._current_loads_row:   np.ndarray = None   # (B, N) int64 — cargas del tablero
         self._current_rate_row:    np.ndarray = None   # (B, N) float32 — precio en la mediana (USD/milla)
         self._precios:       np.ndarray = None   # (B, N, K) USD/milla de cada nivel en las lanes salientes
-        self._u_comp:        np.ndarray = None   # (B, N) percentil del mejor competidor (oculto al agente)
-        self._precio_comp:   np.ndarray = None   # (B, N) precio del mejor competidor (USD/milla)
+        self._u_comp:        np.ndarray = None   # (B, N, C) percentil del mejor competidor por carga (oculto al agente)
+        self._precio_comp:   np.ndarray = None   # (B, N, C) precio del mejor competidor (USD/milla)
         self._m:             np.ndarray = None   # (B,) competidores efectivos del nodo actual
-        self._rechazada:     np.ndarray = None   # (B, N) bool — lanes rechazadas en esta visita al nodo
+        self._perdidas:      np.ndarray = None   # (B, N) int64 — cargas perdidas por lane en esta visita al nodo
         self._n_rechazos:    np.ndarray = None   # (B,) int64 — rechazos en esta visita al nodo
         self._opciones:      np.ndarray = None   # (B, N, K+1) bool — opciones válidas del estado actual
         self._last_cotizo:   np.ndarray = None   # (B,) bool — el último step() fue una cotización
         self._last_gano:     np.ndarray = None   # (B,) bool — … y se ganó la carga
         self._last_precio:   np.ndarray = None   # (B,) USD/milla cobrado (NaN si no se cobró)
         self._last_precio_comp: np.ndarray = None   # (B,) USD/milla del competidor en esa lane (NaN si VACÍO)
+        self._last_espero:   np.ndarray = None   # (B,) bool — el último step() fue una espera
+        self._sin_salida:    np.ndarray = None   # (B,) bool — el ciclo terminó en casa sin salir (terminación B)
+        self._reposicion = vacio_permitido(self._distance_arr)        # (N, N) vacío permitido por distancia
+        T = self._time_matrix_arr
+        vuelta = T + T.T
+        np.fill_diagonal(vuelta, np.inf)
+        self._t_vuelta_min = vuelta.min(axis=1)  # (N,) la ida y vuelta más corta desde cada nodo (para esperar en casa)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Ciclo de vida
@@ -211,17 +250,23 @@ class VectorRoutingEnv:
         self._current_loads_row = np.zeros((B, N), dtype=np.int64)
         self._current_rate_row  = np.zeros((B, N), dtype=np.float32)
         self._precios      = np.zeros((B, N, K), dtype=np.float64)
-        self._u_comp       = np.zeros((B, N), dtype=np.float64)
-        self._precio_comp  = np.zeros((B, N), dtype=np.float64)
+        self._u_comp       = np.zeros((B, N, COTIZACIONES_MAX_POR_NODO), dtype=np.float64)
+        self._precio_comp  = np.zeros((B, N, COTIZACIONES_MAX_POR_NODO), dtype=np.float64)
         self._m            = np.ones(B, dtype=np.float64)
-        self._rechazada    = np.zeros((B, N), dtype=bool)
+        self._perdidas     = np.zeros((B, N), dtype=np.int64)
         self._n_rechazos   = np.zeros(B, dtype=np.int64)
         self._last_cotizo  = np.zeros(B, dtype=bool)
         self._last_gano    = np.zeros(B, dtype=bool)
         self._last_precio  = np.full(B, np.nan)
         self._last_precio_comp = np.full(B, np.nan)
+        self._last_espero = np.zeros(B, dtype=bool)
         self._revelar_tablero(np.arange(B), np.minimum(self._start_day_idx, self._max_day))
-        return self._compute_masks()
+        masks = self._compute_masks()
+        self._sin_salida = masks.sum(axis=1) == 0                # no hay ninguna jugada desde casa: no sale
+        self._active &= ~self._sin_salida
+        masks[self._sin_salida, 0] = 1                           # filas inactivas: una opción ficticia válida
+        self._opciones[self._sin_salida, 0, OPCION_VACIO] = True
+        return masks
 
     def step(self, actions: np.ndarray, opciones: np.ndarray) -> tuple:
         """Un paso de los B episodios: actions (B,) destino, opciones (B,) nivel 0 … K−1 o VACÍO = K.
@@ -241,13 +286,17 @@ class VectorRoutingEnv:
 
         cotiza = act & (opciones < K)
         nivel = np.minimum(opciones, K - 1)
-        gano = cotiza & gana(U_NIVELES_ARR[nivel], self._u_comp[filas, actions])
+        intento = np.minimum(self._perdidas[filas, actions], COTIZACIONES_MAX_POR_NODO - 1)   # la carga que se cotiza
+        gano = cotiza & gana(U_NIVELES_ARR[nivel], self._u_comp[filas, actions, intento])
         pierde = cotiza & ~gano
-        viaja = act & ~pierde                                     # ganó o fue VACÍO
+        espera = act & (actions == self._current_node)            # (i, VACÍO): esperar al día siguiente
+        viaja = act & ~pierde & ~espera                           # ganó, o VACÍO a otro nodo
 
         # ── Tiempo ────────────────────────────────────────────────────────────
         t_viaje = self._time_matrix_arr[self._current_node, actions].astype(np.float32)
-        next_time = self._time_elapsed + np.where(viaja, t_viaje, np.float32(COTIZACION_HORAS))
+        next_time = np.where(viaja, self._time_elapsed + t_viaje,
+                             np.where(espera, fin_espera(self._time_elapsed),
+                                      self._time_elapsed + np.float32(COTIZACION_HORAS))).astype(np.float32)
 
         # ── Reward de la lane (unidades originales) ───────────────────────────
         nodos = self._current_node
@@ -256,10 +305,11 @@ class VectorRoutingEnv:
                           self._diesel_arr[nodos, actions]).astype(np.float32)
         raw = np.where(viaja, raw, 0.0).astype(np.float32)
         self._last_raw_reward = raw
+        self._last_espero = espera
         self._last_cotizo = cotiza
         self._last_gano = gano
         self._last_precio = np.where(gano, precio, np.nan)
-        self._last_precio_comp = np.where(cotiza, self._precio_comp[filas, actions], np.nan)
+        self._last_precio_comp = np.where(cotiza, self._precio_comp[filas, actions, intento], np.nan)
 
         # ── Terminación (condición A) ─────────────────────────────────────────
         vuelve = viaja & (actions == self._start_node)
@@ -284,21 +334,24 @@ class VectorRoutingEnv:
         self._current_node = np.where(viaja, actions, self._current_node).astype(np.int64)
         self._time_elapsed = np.where(act, next_time, self._time_elapsed).astype(np.float32)
         self._step_count = np.where(viaja, self._step_count + 1, self._step_count)          # arcos recorridos
-        self._k_remaining = np.where(viaja, self._k_remaining - 1, self._k_remaining)      # el rechazo no consume K
-        self._rechazada[filas[pierde], actions[pierde]] = True
+        self._k_remaining = np.where(viaja, self._k_remaining - 1, self._k_remaining)      # rechazo y espera no consumen K
+        self._perdidas[filas[pierde], actions[pierde]] += 1
         self._n_rechazos = np.where(pierde, self._n_rechazos + 1, self._n_rechazos)
 
-        # ── Tablero del nodo de llegada (nueva visita) ───────────────────────
-        llega = np.flatnonzero(viaja & ~cond_a)
+        # ── Tablero del nodo de llegada, o del día nuevo tras esperar (nueva visita) ──
+        llega = np.flatnonzero((viaja | espera) & ~cond_a)
         if len(llega):
             dia = self._start_day_idx[llega] + (self._time_elapsed[llega] // 14).astype(np.int64)
-            self._rechazada[llega] = False
+            self._perdidas[llega] = 0
             self._n_rechazos[llega] = 0
             self._revelar_tablero(llega, np.minimum(dia, self._max_day))
 
         self._active = act & ~cond_a
         next_masks = self._compute_masks()
         cond_b = (next_masks.sum(axis=1) == 0) & self._active
+        if cond_b.any():                                         # se quedó sin jugadas en casa: el ciclo falla
+            rewards = np.where(cond_b, rewards + np.float32(TIME_VIOLATION_PENALTY), rewards).astype(np.float32)
+            self._last_time_violation = self._last_time_violation | cond_b
         self._active &= ~cond_b
         terminated = (act & cond_a) | cond_b
 
@@ -328,60 +381,55 @@ class VectorRoutingEnv:
         mediana = t.precios[..., _NIVEL_MEDIANA]
         self._current_rate_row[rows] = mediana.astype(np.float32)
         reward = lane_reward(mediana, t.loads, self._distance_arr[nodes], self._diesel_arr[nodes]).astype(np.float32)
-        reward[np.arange(len(rows)), nodes] = BIG_M_PENALTY
+        reward[np.arange(len(rows)), nodes] = 0.0           # self-loop = esperar: margen 0
         self._reward_row[rows] = reward
 
     def _puede_cotizar(self) -> np.ndarray:
-        """(B, N) la lane tiene carga, no se rechazó en esta visita y quedan cotizaciones."""
-        return ((self._current_loads_row > 0) & ~self._rechazada
-                & (self._n_rechazos < COTIZACIONES_MAX_POR_NODO)[:, None])
-
-    def _compute_opciones(self, destino_ok: np.ndarray, puede_cotizar: np.ndarray) -> np.ndarray:
-        """(B, N, K+1) opciones válidas dado el destino factible por tiempo, self-loop y K."""
-        B, N, K = self._B, self.num_nodes, N_NIVELES
-        vacio = np.zeros((B, N), dtype=bool)
-        vacio[np.arange(B), self._start_node] = True                                       # volver a casa
-        vacio |= (self._current_node == self._start_node)[:, None]                          # primer movimiento
-        # Si la lane se puede cotizar, se cobra: VACÍO estaría dominado (el nivel 0 gana siempre y cobra
-        # p₀·d − c > −c). VACÍO queda solo para moverse cuando no hay carga cotizable en esa lane.
-        vacio &= ~puede_cotizar
-        op = np.zeros((B, N, K + 1), dtype=bool)
-        op[:, :, :K] = puede_cotizar[:, :, None]
-        op[:, :, K] = vacio
-        op &= destino_ok[:, :, None]
-        op &= self._active[:, None, None]
-        return op
+        """(B, N) a la lane le queda alguna carga sin perder y quedan cotizaciones en la visita."""
+        return self.intentos > 0
 
     def _compute_masks(self) -> np.ndarray:
-        """Máscara de destinos (B, N) int8; deja en self._opciones la máscara de opciones."""
-        B, N = self._B, self.num_nodes
+        """Máscara de destinos (B, N) int8; deja en self._opciones (B, N, K+1) las opciones válidas.
+
+        Por destino j desde el nodo actual i (ver el docstring del módulo):
+          · niveles: j ≠ i y la lane se puede cotizar (`_puede_cotizar`);
+          · VACÍO a j ≠ i: reposicionamiento (≤ REPOSICION_MAX_MILLAS) o, desde un intermedio, volver a casa;
+          · VACÍO en j = i: esperar al siguiente día de mercado.
+        Factibilidad de tiempo: después del movimiento (o de la espera) hay que poder volver a casa dentro de
+        max_duration; en casa, antes de salir, la espera deja tiempo para la ida y vuelta más corta.
+        Con k_remaining == 1 solo quedan casa y esperar.
+        """
+        B, N, K = self._B, self.num_nodes, N_NIVELES
         filas = np.arange(B)
-        mask = np.ones((B, N), dtype=np.int8)
-        non_depot = np.arange(N)[None, :] != self._start_node[:, None]   # (B, N)
+        i, h, t = self._current_node, self._start_node, self._time_elapsed.astype(np.float64)
+        jj = np.arange(N)[None, :]
+        es_i, es_h = jj == i[:, None], jj == h[:, None]
+        en_casa = i == h                                                           # (B,) aún no sale
+        T = self._time_matrix_arr
 
-        # Lookahead temporal: excluir intermedios desde los que no se vuelve a casa a tiempo.
-        t_to_j     = self._time_matrix_arr[self._current_node, :]         # (B, N)
-        t_j_to_dep = self._time_matrix_arr[:, self._start_node].T         # (B, N)
-        over_budget = (self._time_elapsed[:, None] + t_to_j + t_j_to_dep) > self.max_duration
-        mask[over_budget & non_depot] = 0
+        # Tiempo: llegar a j y volver a casa (casa misma: solo llegar).
+        t_vuelta = np.where(es_h, 0.0, T[:, h].T)                                  # (B, N) T[j, h]
+        # Volver a casa desde un intermedio vale siempre: si ya no alcanza, el paso termina con la penalización.
+        a_tiempo = ((t[:, None] + T[i, :] + t_vuelta) <= self.max_duration) | (es_h & ~en_casa[:, None])
+        t_desp = fin_espera(t)                                                     # (B,) fin de la espera
+        espera_ok = np.where(en_casa, t_desp + self._t_vuelta_min[h], t_desp + T[i, h]) <= self.max_duration
 
-        # Lanes no cotizables (fuera de casa): sin carga, rechazadas o sin cotizaciones restantes.
-        puede_cotizar = self._puede_cotizar()
-        not_at_start = (self._current_node != self._start_node)[:, None]
-        mask[not_at_start & ~puede_cotizar & non_depot] = 0
-        mask[filas, self._start_node] = 1
+        # Lejos de casa, cotizar exige que, si se pierde (COTIZACION_HORAS), todavía se pueda volver a casa.
+        pierde_ok = en_casa | (t + COTIZACION_HORAS + T[i, h] <= self.max_duration)
+        cotizable = self._puede_cotizar() & ~es_i & a_tiempo & pierde_ok[:, None]
+        vacio = (self._reposicion[i] | (es_h & ~en_casa[:, None])) & a_tiempo & ~es_i
+        if self._k_restricted.any():                                               # K: con un arco, solo casa
+            solo_casa = (self._k_restricted & (self._k_remaining == 1))[:, None] & ~es_h
+            cotizable &= ~solo_casa
+            vacio &= ~solo_casa
+        vacio |= es_i & espera_ok[:, None]
 
-        # Self-loop: al final, gana sobre la restauración de casa (en el primer paso enmascara casa).
-        mask[filas, self._current_node] = 0
-
-        # Presupuesto de cardinalidad K: con un solo arco de margen, solo el retorno.
-        force_k = self._k_restricted & (self._k_remaining == 1)
-        if force_k.any():
-            mask[force_k, :] = 0
-            mask[force_k, self._start_node[force_k]] = 1
-
-        self._opciones = self._compute_opciones(mask.astype(bool), puede_cotizar)
-        return self._opciones.any(axis=-1).astype(np.int8)
+        op = np.zeros((B, N, K + 1), dtype=bool)
+        op[:, :, :K] = cotizable[:, :, None]
+        op[:, :, K] = vacio
+        op &= self._active[:, None, None]
+        self._opciones = op
+        return op.any(axis=-1).astype(np.int8)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Propiedades de solo lectura
@@ -503,9 +551,16 @@ class VectorRoutingEnv:
         return self._m
 
     @property
-    def rechazadas(self) -> np.ndarray:
-        """(B, N) bool — lanes rechazadas en la visita actual al nodo."""
-        return self._rechazada
+    def perdidas(self) -> np.ndarray:
+        """(B, N) int64 — cargas perdidas por lane en la visita actual al nodo."""
+        return self._perdidas
+
+    @property
+    def intentos(self) -> np.ndarray:
+        """(B, N) int64 — cuántas cargas de cada lane se pueden cotizar todavía en esta visita:
+        min(cargas − perdidas, COTIZACIONES_MAX_POR_NODO − rechazos)."""
+        return np.minimum(self._current_loads_row - self._perdidas,
+                          (COTIZACIONES_MAX_POR_NODO - self._n_rechazos)[:, None])
 
     @property
     def n_rechazos(self) -> np.ndarray:
@@ -514,9 +569,30 @@ class VectorRoutingEnv:
 
     @property
     def u_comp_row(self) -> np.ndarray:
-        """(B, N) percentil del mejor competidor. El agente y los baselines NO lo ven: existe solo para
-        la cota con información perfecta (UB-PI) y los tests."""
+        """(B, N) percentil del competidor de la carga que se cotizaría ahora en cada lane. Solo para la cota con
+        información perfecta y los tests: ninguna política lo puede leer."""
+        c = np.minimum(self._perdidas, COTIZACIONES_MAX_POR_NODO - 1)
+        return np.take_along_axis(self._u_comp, c[..., None], axis=-1)[..., 0]
+
+    @property
+    def u_comp_cargas(self) -> np.ndarray:
+        """(B, N, C) percentil del competidor de cada carga (idem: solo cota y tests)."""
         return self._u_comp
+
+    @property
+    def active(self) -> np.ndarray:
+        """(B,) bool — episodios aún en curso (tras reset(), False en las filas que no tienen ninguna jugada)."""
+        return self._active
+
+    @property
+    def sin_salida(self) -> np.ndarray:
+        """(B,) bool — el ciclo terminó en casa sin salir (ninguna jugada posible): margen 0, no es violación."""
+        return self._sin_salida
+
+    @property
+    def last_espero(self) -> np.ndarray:
+        """(B,) bool — el último step() fue una espera (self-loop VACÍO)."""
+        return self._last_espero
 
     @property
     def last_cotizo(self) -> np.ndarray:

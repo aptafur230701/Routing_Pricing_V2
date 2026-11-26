@@ -16,11 +16,11 @@ y con el mismo arnés de evaluation.py (`ejecutar_politica`), así que el margen
       con él. Las cotizaciones de (a) son las del DRL con κ = COMPETENCIA_KAPPA (la misma corrida).
 
 La comparación B (DRL contra sus destinos con reglas fijas de precio) no se repite aquí: la hace la evaluación
-de main.py, en los mundos de evaluación y en el replay (hoja "Comparación precio (B)").
+de main.py, en los mundos de evaluación y en el replay (hoja "Comparación", familia "precio").
 
 Salidas: <output_dir>/pricing_val/tables/*.csv y <output_dir>/pricing_val/figures/*.png
-(output_dir por defecto results/<N>nodes[_<RUN_TAG>]). main.py la corre al final de cada tamaño
-(`validar_pricing`) y agrega al Excel las hojas "Precio vs estado" y "Sensibilidad κ".
+(output_dir por defecto results/<N>nodes). main.py la corre al final de cada tamaño
+(`validar_pricing`); no escribe en el Excel de resultados.
 
 Uso aparte (sobre un checkpoint ya entrenado)
 ---------------------------------------------
@@ -41,7 +41,7 @@ import matplotlib.pyplot as plt
 
 from config import (
     TRAIN_DAYS, MAX_DURATION, PRICING_VAL_SEED, MARKET_M_EVAL_WORLDS, COMPETENCIA_KAPPA,
-    AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, RUN_TAG,
+    AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF,
 )
 import evaluation as ev
 from market_process import MarketProcess, asegurar_parametros
@@ -161,9 +161,8 @@ def _figuras(cot, por_q, fig_dir):
 
 
 def validar_pricing(agent, n, tm, rate, loads, dist, diesel, ltr, avail, p95, market, out,
-                    M=MARKET_M_EVAL_WORLDS, excel_path=None) -> dict:
-    """Corre (a) y (b) con `agent` y escribe <out>/pricing_val/{tables,figures}. Si `excel_path`, agrega al
-    Excel de resultados las hojas "Precio vs estado" (Spearman y quintiles) y "Sensibilidad κ". Devuelve las tablas."""
+                    M=MARKET_M_EVAL_WORLDS) -> dict:
+    """Corre (a) y (b) con `agent` y escribe <out>/pricing_val/{tables,figures}. Devuelve las tablas."""
     tab_dir, fig_dir = (os.path.join(out, "pricing_val", d) for d in ("tables", "figures"))
     os.makedirs(tab_dir, exist_ok=True)
     os.makedirs(fig_dir, exist_ok=True)
@@ -205,11 +204,6 @@ def validar_pricing(agent, n, tm, rate, loads, dist, diesel, ltr, avail, p95, ma
         t.to_csv(os.path.join(tab_dir, f"{nombre}.csv"), index=False)
     if len(cot):
         _figuras(cot, por_q, fig_dir)
-    if excel_path is not None and os.path.exists(excel_path):
-        with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
-            rho.to_excel(w, sheet_name="Precio vs estado", index=False)
-            por_q.to_excel(w, sheet_name="Precio vs estado", index=False, startrow=len(rho) + 3)
-            sens.to_excel(w, sheet_name="Sensibilidad κ", index=False)
 
     with pd.option_context("display.width", 160, "display.max_columns", 20):
         print("\nNivel cotizado por el DRL vs estado (Spearman):\n", rho.to_string(index=False))
@@ -222,14 +216,14 @@ def validar_pricing(agent, n, tm, rate, loads, dist, diesel, ltr, avail, p95, ma
 def main():
     ap = argparse.ArgumentParser(description="Validación de la decisión de precio del DRL.")
     ap.add_argument("--num-nodes", type=int, default=10)
-    ap.add_argument("--checkpoint", help="default: checkpoints[/RUN_TAG]/am_checkpoint_<N>nodes.pt")
-    ap.add_argument("--output-dir", help="default: results/<N>nodes[_<RUN_TAG>]")
+    ap.add_argument("--checkpoint", help="default: checkpoints/am_checkpoint_<N>nodes.pt")
+    ap.add_argument("--output-dir", help="default: results/<N>nodes")
     ap.add_argument("--quick", action="store_true", help="pocos mundos (prueba rápida)")
     args = ap.parse_args()
     n = args.num_nodes
     cwd = os.path.dirname(os.path.abspath(__file__))
-    ckpt = args.checkpoint or os.path.join(cwd, "checkpoints", RUN_TAG, f"am_checkpoint_{n}nodes.pt")
-    out = args.output_dir or os.path.join(cwd, "results", f"{n}nodes" + (f"_{RUN_TAG}" if RUN_TAG else ""))
+    ckpt = args.checkpoint or os.path.join(cwd, "checkpoints", f"am_checkpoint_{n}nodes.pt")
+    out = args.output_dir or os.path.join(cwd, "results", f"{n}nodes")
 
     asegurar_parametros()
     tm, rate, loads, dist, diesel, ltr, avail, p95 = load_matrices(n)

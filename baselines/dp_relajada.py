@@ -10,23 +10,29 @@ llegada (`MarketProcess.tablero_sin_memoria`) y sus cargas; los precios por nive
 día real. Con P_k = (1 − u_k)^m_i:
 
     G_jk(s)  = r_jk + V_{k−1}(j, s + f_ij)          r_jk = lane_reward(p_jk, carga, d_ij, c_ij); V(casa) = 0
-    E(s)     = mejor opción VACÍO: volver a casa sin carga (en la primera salida desde casa, cualquier j)
-    A_j      = max_k [ P_k G_jk(s+τ) + (1 − P_k) E(s+τ) ]        segundo intento, con VACÍO de respaldo
-    W_j      = max( E(s+τ), max_{j' ≠ j} A_j' )                  después de perder j (top-2 sobre j)
-    V(i, s)  = media_b  max( E(s), max_j max_k [ P_k G_jk(s) + (1 − P_k) W_j ] )
+    E(s)     = mejor jugada sin carga (routing_env.py): volver a casa vacío (−c), reposicionarse vacío a
+               j a ≤ REPOSICION_MAX_MILLAS (R0_ij + V_{k−1}(j, s + f_ij)), o esperar al siguiente día de
+               mercado (V_k(i, s_w), mismo k: la espera no consume arcos)
+    B_r      = max( E(s+rτ), max_j max_k [ P_k G_jk(s+rτ) + (1 − P_k) B_{r+1} ] )     después de r rechazos
+    B_R      = E(s+Rτ)                                           R = COTIZACIONES_MAX_POR_NODO
+    V(i, s)  = media_b B_0
 
-τ = COTIZACION_HORAS en franjas (redondeo hacia abajo). Un rechazo no consume k y reusa el MISMO tablero
-(W_j): si se sorteara uno nuevo, cotizar alto a propósito sería una forma gratis de "esperar otro tablero".
-Volver a casa vacío solo vale si la lane de casa no se puede cotizar, pero con carga el nivel 0 (que gana
-siempre y cobra p_0·d − c ≥ −c) domina esa opción, así que usar E como respaldo en todos los casos da el
-mismo valor que las reglas del entorno. Solo hay dos intentos por visita (COTIZACIONES_MAX_POR_NODO = 2).
+τ = COTIZACION_HORAS en franjas (redondeo hacia abajo). Un rechazo no consume k y reusa el MISMO tablero: un
+tablero nuevo solo se ve esperando al día siguiente (s_w), que cuesta tiempo. Cada carga de una lane es una
+cotización distinta. Lejos de casa se cotiza solo si, al perder, aún se puede volver (la máscara del entorno).
+Después de r rechazos se pueden cotizar las lanes con más de r cargas: es factible sea cual
+sea la lane que se perdió (exacto si se insiste en una sola lane, conservador si se alternan lanes con pocas cargas).
+
+La salida de casa es una tabla aparte, H(h, s): el camión todavía no salió (puede esperar en casa o
+reposicionarse, pero no "volver"). UB-DP es H(h, 0). Si en s = 0 no hay ninguna jugada, no sale: valor 0. Si
+se queda sin jugadas después (perdió o esperó), el ciclo falla: PENALIZACION_USD, como en el entorno.
 
 Es una inducción hacia atrás: s + τ y s + f son franjas posteriores, ya calculadas. UB-DP es el valor
 aproximado (franjas de 15 min, S sorteos) de la mejor política que IGNORA EL ESTADO DEL MERCADO: conoce la
 distribución de tableros por día de la semana pero no el día real, el índice ni el competidor. No es una
 cota para una política que observa el índice; UB-PI (información perfecta) sí lo es.
 
-Estado de la tabla: V[k, d0, h, j, s]
+Estado de la tabla: V[k, d0, h, j, s] (y H[k, d0, h, s] para la salida de casa)
   · k  : arcos restantes (incluido el retorno); solo en la tabla de K fijo.
   · d0 : día de la semana del día de salida (lunes = 0). El día de la semana al llegar
          a la franja s es (d0 + s·dt // 14) % 7.
@@ -53,15 +59,18 @@ import numpy as np
 import torch
 
 from config import (
-    DEVICE, MAX_DURATION, K_MAX,
+    DEVICE, MAX_DURATION, K_MAX, TIME_VIOLATION_PENALTY, REWARD_SCALE_FACTOR,
     UBDP_DT_HORAS, UBDP_S, UBDP_SEED, UBDP_TABLA_PATH, UBDP_TIEMPO_MAX_HORAS, UBDP_MAX_NODOS,
-    COTIZACION_HORAS, COTIZACIONES_MAX_POR_NODO, U_NIVELES,
+    COTIZACION_HORAS, COTIZACIONES_MAX_POR_NODO, U_NIVELES, REPOSICION_MAX_MILLAS,
 )
 from pricing import N_NIVELES, U_NIVELES_ARR, precios_niveles, prob_ganar
 from problem_data import lane_reward
+from routing_env import vacio_permitido
+from baselines.ub_pi import franjas_por_dia
 
 _CWD = os.path.dirname(os.path.abspath(__file__))
 _NEG = -1e9          # "menos infinito" finito: evita NaN en sumas
+PENALIZACION_USD = TIME_VIOLATION_PENALTY * REWARD_SCALE_FACTOR   # quedarse sin jugadas en casa: el ciclo falla
 _DIA_HORAS = 14.0    # un día de mercado = 14 h (igual que el entorno)
 
 
@@ -102,15 +111,18 @@ class TablaDP:
     V0_k   : (K+1, 7, H) float32 — valor de la primera decisión desde casa, por k.
     V0_se_k: (K+1, 7, H) float32 — error estándar de muestreo de V0_k.
     V0_libre, V0_se_libre : (7, H) float32.
+    H_k    : (K+1, 7, H, Ns) float32 — valor de estar en casa SIN haber salido en la franja s (H_k[..., 0] = V0_k).
+    H_libre: (7, H, Ns) float32.
     tiempo_calculo : segundos que tardó calcular (0.0 si se cargó de disco).
     """
 
-    def __init__(self, time_matrix, V_k, V_libre, V0_k, V0_se_k, V0_libre, V0_se_libre,
+    def __init__(self, time_matrix, V_k, V_libre, V0_k, V0_se_k, V0_libre, V0_se_libre, H_k, H_libre,
                  dt=UBDP_DT_HORAS, S=UBDP_S, tiempo_calculo=0.0):
         self.K = V_k.shape[0] - 1
         self.dt, self.S = dt, S
         self.Ns = V_libre.shape[-1]
         self.V_k, self.V_libre = V_k, V_libre
+        self.H_k, self.H_libre = H_k, H_libre
         self.V0_k, self.V0_se_k = V0_k, V0_se_k
         self.V0_libre, self.V0_se_libre = V0_libre, V0_se_libre
         self.tiempo_calculo = tiempo_calculo
@@ -149,6 +161,13 @@ class TablaDP:
             return self.V_libre[dia_semana, casa, nodos, s]
         return self.V_k[k_restante, dia_semana, casa, nodos, s]
 
+    def valor_salida(self, dia_semana: int, casa: int, tiempo: float, k_restante) -> float:
+        """H(casa, tiempo, k): valor de estar en casa sin haber salido (después de esperar en casa)."""
+        s = min(int(np.floor(tiempo / self.dt + 1e-9)), self.Ns - 1)
+        if k_restante is None:
+            return float(self.H_libre[dia_semana, casa, s])
+        return float(self.H_k[k_restante, dia_semana, casa, s])
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Tableros de la DP
@@ -164,7 +183,7 @@ def _sortear_tableros(market, distance_arr, diesel_arr, S, seed) -> dict:
 
     Por cada día de la semana: un día de entrenamiento al azar con ese día de la semana y las cargas
     sorteadas de ese día (lo mismo que `MarketProcess.tablero_sin_memoria`, δ = 0). Devuelve
-      A   (7, N, S, N) bool    — la lane tiene carga en el sorteo
+      A   (7, N, S, N) int8    — cargas cotizables de la lane: min(cargas, COTIZACIONES_MAX_POR_NODO)
       D   (7, N, S) int64      — índice local del día sorteado (en dias[dow])
       Rk  (7, Dmax, N, N, K)   — lane_reward cobrando el nivel k con carga, por día real (float32)
       P   (7, Dmax, N, K)      — P_k = (1 − u_k)^m del nodo de origen ese día (float32)
@@ -175,7 +194,7 @@ def _sortear_tableros(market, distance_arr, diesel_arr, S, seed) -> dict:
     rng = np.random.Generator(np.random.PCG64(seed))
     dias = [market.dias_train_por_dow(d) for d in range(7)]
     Dmax = max(len(d) for d in dias)
-    A = np.empty((7, N, S, N), dtype=bool)
+    A = np.empty((7, N, S, N), dtype=np.int8)
     D = np.empty((7, N, S), dtype=np.int64)
     Rk = np.zeros((7, Dmax, N, N, N_NIVELES), dtype=np.float32)
     P = np.zeros((7, Dmax, N, N_NIVELES), dtype=np.float32)
@@ -183,7 +202,7 @@ def _sortear_tableros(market, distance_arr, diesel_arr, S, seed) -> dict:
     for dow in range(7):
         idx = rng.integers(0, len(dias[dow]), size=N * S)
         loads = market.sortear_cargas(nodos, dias[dow][idx], rng)
-        A[dow] = (loads > 0).reshape(N, S, N)
+        A[dow] = np.minimum(loads, COTIZACIONES_MAX_POR_NODO).reshape(N, S, N)
         D[dow] = idx.reshape(N, S)
         for n_d, d in enumerate(dias[dow]):
             precios = precios_niveles(market.cuantiles_dia(int(d)))                        # (N, N, K)
@@ -200,8 +219,9 @@ def _firma(market, time_matrix, distance_arr, diesel_arr, K, S, dt, seed) -> str
     h.update(market.firma_params().encode())          # cargas, cuantiles, LTR, κ, M_MAX, LTR_REF, U_NIVELES
     for a in (time_matrix, distance_arr, diesel_arr):
         h.update(np.ascontiguousarray(a).tobytes())
-    h.update(repr((K, S, dt, seed, MAX_DURATION, market.num_nodes, "cotizacion-2-intentos",
-                   tuple(U_NIVELES), COTIZACION_HORAS, COTIZACIONES_MAX_POR_NODO)).encode())
+    h.update(repr((K, S, dt, seed, MAX_DURATION, market.num_nodes, "cotizacion-varias-cargas-vuelta",
+                   tuple(U_NIVELES), COTIZACION_HORAS, COTIZACIONES_MAX_POR_NODO,
+                   "esperar-reposicionar", REPOSICION_MAX_MILLAS)).encode())
     return h.hexdigest()
 
 
@@ -251,19 +271,33 @@ def _mejor_por_niveles(Rk_d, P_d, D_dw, filas, C, respaldo, valido, K):
     return acc.masked_fill(~valido, _NEG)
 
 
-def _despues_de_perder(A2, E2):
-    """W_j = max(E, max_{j' ≠ j} A_j'): con el top-2 sobre j (el mejor si j no es el mejor; si no, el segundo)."""
-    top = A2.topk(2, dim=-1)
-    jj = torch.arange(A2.shape[-1], device=A2.device)
-    W = torch.where(jj == top.indices[..., :1], top.values[..., 1:2], top.values[..., :1])
-    return torch.maximum(W, E2)
+def _sin_carga(V, V_prev, d0, s, f, ok_rep, por_dia, smax):
+    """E(h, i, s), (H, I): la mejor jugada sin carga desde el intermedio i (ver el docstring del módulo):
+    volver a casa vacío, reposicionarse (si hay nivel k−1) o esperar al siguiente día (misma tabla V)."""
+    N = f.shape[0]
+    jj = torch.arange(N, device=f.device)
+    E = _R0_T[0].clone()                                           # (H, I): volver a casa vacío desde i
+    s_w = (s // por_dia + 1) * por_dia
+    if s_w <= smax:                                                # esperar: V(i, s_w) si después se vuelve a casa
+        ok_w = (s_w + f.T) <= smax                                 # (H, I): f[i, h]
+        E = torch.maximum(E, torch.where(ok_w, V[d0][:, jj, s_w], _NEG))
+    if V_prev is not None:                                         # reposicionarse vacío: R0_ij + V_{k−1}(j, s + f_ij)
+        Vn = V_prev[d0][:, jj[None, :], torch.clamp(s + f, max=smax)]                  # (H, I, J)
+        rep = (_R0[0][None] + Vn).masked_fill(~(ok_rep & (s + _BASE[0] <= smax)), _NEG)
+        E = torch.maximum(E, rep.amax(dim=-1))
+    return E
 
 
-def _barrido(V, V_prev, tab, f, ok_est, base, smax, dt, tau, reloj):
-    """Rellena V[d0, h, i, s] hacia atrás en s con los dos intentos (ver el docstring del módulo).
+# Tensores fijos del cálculo (los fija calcular_tabla): R0 (I, J), su transpuesta (H, I) y f_ij + f_jh (H, I, J).
+_R0, _R0_T, _BASE = [None], [None], [None]
 
-    V_prev : tabla del nivel k−1 (o None para k = 1, solo retorno). Si es el mismo tensor que V (caso
-             libre) se lee de franjas posteriores, ya calculadas (f ≥ 1).
+
+def _barrido(V, V_prev, tab, f, ok_est, base, smax, dt, tau, reloj, ok_rep, por_dia):
+    """Rellena V[d0, h, i, s] hacia atrás en s con los intentos de cotización (ver el docstring del módulo).
+
+    V_prev : tabla del nivel k−1 (o None para k = 1: casa o esperar). Si es el mismo tensor que V (caso
+             libre) se lee de franjas posteriores, ya calculadas (f ≥ 1 y la espera salta a un día nuevo).
+    ok_rep : (H, I, J) reposicionamiento vacío permitido (≤ REPOSICION_MAX_MILLAS, j ∉ {i, h}).
     """
     N = f.shape[0]
     S = tab["A"].shape[2]
@@ -273,89 +307,104 @@ def _barrido(V, V_prev, tab, f, ok_est, base, smax, dt, tau, reloj):
     filas = jj[:, None]                                            # (I, 1)
     casa = (jj[None, :] == jj[:, None])                            # (H, J): j == h
     h_chunk = _h_chunk(N, S)
-    E = tab["R0"].T                                                # (H, I): volver a casa vacío desde i
     for s in range(smax, -1, -1):
         q = int((s * dt) // _DIA_HORAS)                            # días enteros transcurridos
-        s2 = min(s + tau, smax)
-        ok1 = ok_est & (s + base <= smax)                          # (H, I, J) destino intermedio factible
-        ok2 = ok_est & (s2 + base <= smax)
+        R = COTIZACIONES_MAX_POR_NODO
+        ss = [min(s + r * tau, smax) for r in range(R + 1)]
+        oks = [ok_est & (x + base <= smax) for x in ss[:R]]        # (H, I, J) destino intermedio factible tras r rechazos
+        vuelve = [(s + (r + 1) * tau + f.T) <= smax for r in range(R)]                  # (H, I): si se pierde, aún puede volver
         for d0 in range(7):
             dw = (d0 + q) % 7
             Ad, Dd = tab["A"][dw], tab["D"][dw]                    # (I, S, J), (I, S)
             Rk_d, P_d = tab["Rk"][dw], tab["P"][dw]
+            Es = [_sin_carga(V, V_prev, d0, x, f, ok_rep, por_dia, smax) for x in ss]                   # (H, I)
             if V_prev is not None:
-                Vn1 = V_prev[d0][:, jj[None, :], torch.clamp(s + f, max=smax)]    # (H, I, J)
-                Vn2 = V_prev[d0][:, jj[None, :], torch.clamp(s2 + f, max=smax)]
+                Vns = [V_prev[d0][:, jj[None, :], torch.clamp(x + f, max=smax)] for x in ss[:R]]       # (H, I, J)
             for h0 in range(0, N, h_chunk):
                 h1 = min(h0 + h_chunk, N)
                 cs = casa[h0:h1][:, None, None, :]                 # (hc, 1, 1, J)
-                Ec = E[h0:h1][:, :, None, None]                    # (hc, I, 1, 1)
-                if V_prev is None:                                 # k = 1: solo el retorno a casa
-                    C1 = C2 = torch.zeros(h1 - h0, N, 1, N, device=dev)
-                    v1 = v2 = Ad[None] & cs
-                else:
-                    C1 = torch.where(cs, 0.0, Vn1[h0:h1][:, :, None, :])          # V(casa) = 0
-                    C2 = torch.where(cs, 0.0, Vn2[h0:h1][:, :, None, :])
-                    v1 = Ad[None] & (ok1[h0:h1][:, :, None, :] | cs)
-                    v2 = Ad[None] & (ok2[h0:h1][:, :, None, :] | cs)
-                A2 = _mejor_por_niveles(Rk_d, P_d, Dd, filas, C2, Ec, v2, K)        # segundo intento
-                W = _despues_de_perder(A2, Ec)
-                del A2
-                A1 = _mejor_por_niveles(Rk_d, P_d, Dd, filas, C1, W, v1, K)         # primer intento
-                mejor = torch.maximum(A1.amax(dim=-1), Ec[..., 0])                  # (hc, I, S)
-                V[d0, h0:h1, :, s] = mejor.mean(dim=-1)
+                B = Es[R][h0:h1][:, :, None, None].expand(-1, -1, S, 1)                 # (hc, I, S, 1): B_R = E
+                for r in range(R - 1, -1, -1):
+                    if V_prev is None:                             # k = 1: solo el retorno a casa
+                        C = torch.zeros(h1 - h0, N, 1, N, device=dev)
+                        valido = (Ad > r)[None] & cs & vuelve[r][h0:h1][:, :, None, None]
+                    else:
+                        C = torch.where(cs, 0.0, Vns[r][h0:h1][:, :, None, :])          # V(casa) = 0
+                        valido = (Ad > r)[None] & (oks[r][h0:h1][:, :, None, :] | cs) & vuelve[r][h0:h1][:, :, None, None]
+                    Q = _mejor_por_niveles(Rk_d, P_d, Dd, filas, C, B, valido, K)       # (hc, I, S, J)
+                    B = torch.maximum(Q.amax(dim=-1, keepdim=True), Es[r][h0:h1][:, :, None, None])
+                V[d0, h0:h1, :, s] = B[..., 0].mean(dim=-1)
         reloj.avanzar(s)
 
 
-def _raiz(V_prev, tab, f, smax, tau, dev):
-    """V0[d0, h] y su error estándar: primera decisión desde casa (s = 0), con los dos intentos.
+def _raiz(V_prev, tab, f, smax, dt, tau, dev, por_dia, ok_rep_casa):
+    """H[d0, h, s] (salida de casa en cada franja, hacia atrás en s), V0 = H[..., 0] y su error estándar.
 
-    VACÍO puede ir a cualquier destino factible (primer movimiento), así que E = max_j R0[h, j] + V(j, f_hj).
+    En casa sin haber salido no hay "volver": E = max(esperar → H(s_w), reposicionarse vacío ≤ 300 mi →
+    R0_hj + V(j, s + f_hj)). Con los dos intentos de cotización, como el barrido. Si no hay ninguna jugada,
+    el camión no sale: valor 0.
     """
     N = f.shape[0]
     K = tab["Rk"].shape[-1]
     h_idx = torch.arange(N, device=dev)
     filas = h_idx[:, None]
     noeye = ~torch.eye(N, dtype=torch.bool, device=dev)
-    j_ok1 = ((f + f.T) <= smax) & noeye                             # ida y vuelta posibles en tiempo
-    j_ok2 = ((tau + f + f.T) <= smax) & noeye                       # … después de un rechazo
-    V0 = torch.empty(7, N, device=dev)
-    se = torch.empty(7, N, device=dev)
+    vuelta = (f + f.T).masked_fill(~noeye, smax + 1)
+    holgura = vuelta.amin(dim=1)                                    # (H,) ida y vuelta más corta desde casa
+    Ns = smax + 1
+    Hs = torch.zeros(7, N, Ns, device=dev)
+    se = torch.full((7, N), float("nan"), device=dev)
     R0 = tab["R0"]                                                 # (H, J): fila de casa
-    for d0 in range(7):
-        Vr1 = V_prev[d0][h_idx[:, None], h_idx[None, :], f.clamp(max=smax)]            # (H, J)
-        Vr2 = V_prev[d0][h_idx[:, None], h_idx[None, :], (tau + f).clamp(max=smax)]
-        E1 = (R0 + Vr1).masked_fill(~j_ok1, _NEG).amax(dim=-1)                         # (H,)
-        E2 = (R0 + Vr2).masked_fill(~j_ok2, _NEG).amax(dim=-1)
-        Ad = tab["A"][d0][h_idx]                                    # (H, S, J): tablero sorteado en casa
-        Dd = tab["D"][d0][h_idx]                                    # (H, S)
-        Rk_d, P_d = tab["Rk"][d0], tab["P"][d0]
-        # Mismas funciones que el barrido, con bloque = 1 (I = H es la casa misma).
-        v2 = (Ad & j_ok2[:, None, :])[None]
-        v1 = (Ad & j_ok1[:, None, :])[None]
-        A2 = _mejor_por_niveles(Rk_d, P_d, Dd, filas, Vr2[None, :, None, :], E2[None, :, None, None], v2, K)
-        W = _despues_de_perder(A2, E2[None, :, None, None])
-        A1 = _mejor_por_niveles(Rk_d, P_d, Dd, filas, Vr1[None, :, None, :], W, v1, K)
-        mejor = torch.maximum(A1.amax(dim=-1), E1[None, :, None])[0]                 # (H, S)
-        V0[d0] = mejor.mean(dim=-1)
-        se[d0] = mejor.std(dim=-1) / np.sqrt(mejor.shape[-1])
-    sin_ruta = ~j_ok1.any(dim=1)                                   # casas sin ningún viaje factible
-    V0[:, sin_ruta] = float("nan")
-    se[:, sin_ruta] = float("nan")
-    return V0, se
+
+    def sin_carga(d0, s, Vr):
+        E = torch.full((N,), _NEG, device=dev)
+        s_w = (s // por_dia + 1) * por_dia
+        if s_w <= smax:
+            E = torch.where(s_w + holgura <= smax, Hs[d0, :, s_w], E)
+        rep = (R0 + Vr).masked_fill(~(ok_rep_casa & ((s + f + f.T) <= smax)), _NEG)
+        return torch.maximum(E, rep.amax(dim=-1))
+
+    for s in range(smax, -1, -1):
+        q = int((s * dt) // _DIA_HORAS)
+        R = COTIZACIONES_MAX_POR_NODO
+        ss = [min(s + r * tau, smax) for r in range(R + 1)]
+        oks = [((x + f + f.T) <= smax) & noeye for x in ss[:R]]     # (H, J) ida y vuelta posibles tras r rechazos
+        for d0 in range(7):
+            dw = (d0 + q) % 7
+            Vr = [V_prev[d0][h_idx[:, None], h_idx[None, :], (x + f).clamp(max=smax)] for x in ss]      # (H, J)
+            Es = [sin_carga(d0, x, v) for x, v in zip(ss, Vr)]
+            Ad = tab["A"][dw][h_idx]                                # (H, S, J): tablero sorteado en casa
+            Dd = tab["D"][dw][h_idx]                                # (H, S)
+            Rk_d, P_d = tab["Rk"][dw], tab["P"][dw]
+            # Mismas funciones que el barrido, con bloque = 1 (I = H es la casa misma). Después de perder, sin ninguna
+            # otra jugada el ciclo falla (PENALIZACION_USD); en r = 0, si hay jugadas hay que tomar una.
+            S_ = Ad.shape[1]
+            falla = lambda x: torch.where(x <= _NEG / 2, torch.full_like(x, PENALIZACION_USD), x)
+            B = falla(Es[R])[None, :, None, None].expand(1, -1, S_, 1)
+            for r in range(R - 1, -1, -1):
+                valido = ((Ad > r) & oks[r][:, None, :])[None]
+                Q = _mejor_por_niveles(Rk_d, P_d, Dd, filas, Vr[r][None, :, None, :], B, valido, K)
+                B = torch.maximum(Q.amax(dim=-1, keepdim=True), Es[r][None, :, None, None])
+                if r > 0:
+                    B = falla(B)
+            mejor = B[0, ..., 0]                                    # (H, S)
+            # Sin ninguna jugada: en s = 0 el camión no sale (0, exógeno); más tarde (esperó en casa) el ciclo falla.
+            mejor = torch.where(mejor <= _NEG / 2, torch.full_like(mejor, 0.0 if s == 0 else PENALIZACION_USD), mejor)
+            Hs[d0, :, s] = mejor.mean(dim=-1)
+            if s == 0:
+                se[d0] = mejor.std(dim=-1) / np.sqrt(mejor.shape[-1])
+    return Hs[..., 0].clone(), se, Hs
 
 
 def calcular_tabla(market, time_matrix, distance_arr, diesel_arr, K=K_MAX,
                    S=UBDP_S, dt=UBDP_DT_HORAS, seed=UBDP_SEED, device=None,
                    max_horas=UBDP_TIEMPO_MAX_HORAS) -> TablaDP:
-    """Calcula V (K fijo y caso libre) y V0 con los dos intentos de cotización.
+    """Calcula V (K fijo y caso libre) y V0 con COTIZACIONES_MAX_POR_NODO intentos de cotización por visita.
 
     K = 0 calcula solo el caso libre (lo que usa la evaluación con K_RESTRINGIDO = False): un barrido en vez
     de K + 1. La firma incluye K, así que una tabla con K = 0 no se confunde con una de K = K_MAX.
 
     Lanza UBDPNoTratable si pasa de `max_horas` (None = sin tope)."""
-    if COTIZACIONES_MAX_POR_NODO != 2:
-        raise NotImplementedError("la DP de UB-DP está escrita para dos cotizaciones por visita")
     dev = device or DEVICE
     N = market.num_nodes
     T = np.asarray(time_matrix, dtype=float)
@@ -364,6 +413,7 @@ def calcular_tabla(market, time_matrix, distance_arr, diesel_arr, K=K_MAX,
     smax = int(np.floor(MAX_DURATION / dt + 1e-9))
     Ns = smax + 1
     tau = franjas_rechazo(dt)
+    por_dia = franjas_por_dia(dt)
     f_np = np.floor(T / dt + 1e-9).astype(np.int64)          # franjas de viaje, redondeo hacia abajo
     if f_np[~np.eye(N, dtype=bool)].min() < 1:
         raise ValueError("Hay tiempos de viaje menores a un paso de la DP: la recursión del caso "
@@ -377,20 +427,25 @@ def calcular_tabla(market, time_matrix, distance_arr, diesel_arr, K=K_MAX,
     # Destinos que cuentan como "continuar": j ≠ i y j ≠ h (el retorno va aparte).
     ok_est = (~eye)[None, :, :] & (~eye)[:, None, :]         # (H, I, J)
     base = f[None, :, :] + f.T[:, None, :]                   # (H, I, J) = f_ij + f_jh
+    rep = torch.from_numpy(vacio_permitido(dist)).to(dev)    # (I, J) vacío ≤ REPOSICION_MAX_MILLAS
+    ok_rep = rep[None] & ok_est                              # (H, I, J): reposicionarse a j ∉ {i, h}
+    ok_rep_casa = rep                                        # (H, J): desde casa (j ≠ h por la diagonal)
+    _R0[0], _R0_T[0], _BASE[0] = tab["R0"], tab["R0"].T.contiguous(), base
 
-    # Tabla con dimensión k: V_k[k] se apoya en V_k[k−1]; k = 1 es solo retorno.
+    # Tabla con dimensión k: V_k[k] se apoya en V_k[k−1]; k = 1 es casa o esperar.
     V_k = torch.zeros(K + 1, 7, N, N, Ns, device=dev)
     V0_k = torch.full((K + 1, 7, N), float("nan"), device=dev)
     V0_se_k = torch.full((K + 1, 7, N), float("nan"), device=dev)
+    H_k = torch.full((K + 1, 7, N, Ns), float("nan"), device=dev)
     for k in range(1, K + 1):
-        _barrido(V_k[k], V_k[k - 1] if k > 1 else None, tab, f, ok_est, base, smax, dt, tau, reloj)
+        _barrido(V_k[k], V_k[k - 1] if k > 1 else None, tab, f, ok_est, base, smax, dt, tau, reloj, ok_rep, por_dia)
         if k >= 2:
-            V0_k[k], V0_se_k[k] = _raiz(V_k[k - 1], tab, f, smax, tau, dev)
+            V0_k[k], V0_se_k[k], H_k[k] = _raiz(V_k[k - 1], tab, f, smax, dt, tau, dev, por_dia, ok_rep_casa)
 
-    # Caso libre: misma recursión sin k; f ≥ 1 garantiza que se lee de franjas ya calculadas.
+    # Caso libre: misma recursión sin k; f ≥ 1 y la espera a un día nuevo garantizan franjas ya calculadas.
     V_libre = torch.zeros(7, N, N, Ns, device=dev)
-    _barrido(V_libre, V_libre, tab, f, ok_est, base, smax, dt, tau, reloj)
-    V0_libre, V0_se_libre = _raiz(V_libre, tab, f, smax, tau, dev)
+    _barrido(V_libre, V_libre, tab, f, ok_est, base, smax, dt, tau, reloj, ok_rep, por_dia)
+    V0_libre, V0_se_libre, H_libre = _raiz(V_libre, tab, f, smax, dt, tau, dev, por_dia, ok_rep_casa)
 
     if dev.type == "cuda":
         torch.cuda.synchronize()
@@ -398,6 +453,7 @@ def calcular_tabla(market, time_matrix, distance_arr, diesel_arr, K=K_MAX,
         T, V_k.cpu().numpy(), V_libre.cpu().numpy(),
         V0_k.cpu().numpy(), V0_se_k.cpu().numpy(),
         V0_libre.cpu().numpy(), V0_se_libre.cpu().numpy(),
+        H_k.cpu().numpy(), H_libre.cpu().numpy(),
         dt=dt, S=S, tiempo_calculo=reloj.horas() * 3600.0,
     )
 
@@ -430,7 +486,7 @@ def cargar_o_calcular_tabla(market, time_matrix, distance_arr, diesel_arr, K=K_M
                     print(f"UB-DP: tabla V cargada de {path}")
                 return TablaDP(
                     time_matrix, z["V_k"], z["V_libre"], z["V0_k"], z["V0_se_k"],
-                    z["V0_libre"], z["V0_se_libre"], dt=dt, S=S,
+                    z["V0_libre"], z["V0_se_libre"], z["H_k"], z["H_libre"], dt=dt, S=S,
                     tiempo_calculo=float(z["tiempo_calculo"]),
                 )
         if verbose:
@@ -467,7 +523,7 @@ def cargar_o_calcular_tabla(market, time_matrix, distance_arr, diesel_arr, K=K_M
     np.savez_compressed(
         path, firma=firma, V_k=tabla.V_k, V_libre=tabla.V_libre,
         V0_k=tabla.V0_k, V0_se_k=tabla.V0_se_k, V0_libre=tabla.V0_libre,
-        V0_se_libre=tabla.V0_se_libre, tiempo_calculo=tabla.tiempo_calculo,
+        V0_se_libre=tabla.V0_se_libre, H_k=tabla.H_k, H_libre=tabla.H_libre, tiempo_calculo=tabla.tiempo_calculo,
     )
     if verbose:
         print(f"UB-DP: tabla V calculada en {tabla.tiempo_calculo:.1f} s → {path}")

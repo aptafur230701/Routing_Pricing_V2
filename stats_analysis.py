@@ -4,7 +4,7 @@ stats_analysis.py
 Comparación estadística pareada del DRL, mundo a mundo (baselines_drl_ruteo_estocastico.md, sección Pruebas
 estadísticas; especificacion_fase0_ruteo_pricing.md §8). Dos familias de comparaciones, cada una con su Holm:
   · "ruteo"  : DRL − B1, B2, B2P, B3 (el baseline elige destino y cotiza con REGLA_PRECIO_BASELINES).
-  · "precio" (comparación B): DRL − DRL-dest+mediana, DRL-dest+be_margen, DRL-dest+miope. Mismos destinos
+  · "precio" (mismas rutas del DRL con reglas de precio fijas): DRL − DRL-dest+mediana, DRL-dest+be_margen, DRL-dest+miope. Mismos destinos
     del DRL con una regla fija de precio: la diferencia mide lo que aporta la cabeza de precio.
 
 Unidad de análisis: la diferencia de margen (USD) DRL − método en un mismo mundo.
@@ -14,9 +14,7 @@ Unidad de análisis: la diferencia de margen (USD) DRL − método en un mismo m
     corrección de Holm por las comparaciones de cada (modo, K, familia) (Accorsi, Lodi y Vigo).
   · Si UB-DP es "no tratable" a ese tamaño, B3 no está en los datos y simplemente no se compara.
   · B2 se compara en todos los niveles de K, incluido el libre.
-  · Gap de cada método contra UB-DP y contra UB-PI: (ref − método) / |ref| · 100 sobre los
-    promedios de los mismos mundos, con intervalo bootstrap. UB-PI es cota; UB-DP es el valor de la
-    política que ignora el mercado (no es cota): un gap negativo contra UB-DP significa que el método la supera.
+  · gap_pct: (ref − método) / |ref| · 100 sobre los promedios de los mismos mundos (lo usa el Resumen).
 
 El replay (días reales desde TRAIN_DAYS, que ni el entrenamiento ni el ajuste del proceso vieron) se
 calcula igual pero va etiquetado con la fecha real de inicio (NOTA_REPLAY), calculada a partir de
@@ -46,16 +44,13 @@ def etiqueta_modo(modo: str) -> str:
     return NOTA_REPLAY if modo == "replay" else modo
 
 
-NOTA_UB_DP = ("UB-DP es el valor de la política que ignora el mercado, con dos intentos de cotización por visita "
-              "(supone la distribución de las tarifas, "
-              "no su estado): NO es una cota, y un método que observa el índice de mercado puede superarla. "
-              "UB-PI (información perfecta) sí es cota.")
-NOTA_UB_DP_FLOJA = "UB-DP floja (> UB-PI)"
+NOTA_UB_DP = ("«Óptimo con mercado promedio» es lo que lograría la mejor política si el mercado de cada día fuera "
+              "el promedio, sin memoria de los días anteriores. No es un tope: un método que observa el mercado del día "
+              "puede superarlo. El «Máximo teórico (información perfecta)» sí es un tope: ningún método puede superarlo.")
+NOTA_UB_DP_FLOJA = "supera al máximo teórico (ver nota)"
 NOTA_UB_DP_FLOJA_LARGA = (
-    "En este K la media de UB-DP supera a la de UB-PI. UB-DP es el valor aproximado de la política que "
-    "ignora el mercado y UB-PI el de información perfecta, así que UB-PI ≥ UB-DP debe cumplirse: la "
-    "diferencia indica sesgo de muestreo de la DP (máximo sobre S sorteos), la discretización de franjas "
-    "o un desajuste entre la DP y el entorno. No leer UB-DP como referencia principal en este K."
+    "Aquí el «Óptimo con mercado promedio» supera al «Máximo teórico», lo que no debería pasar: es un error de "
+    "aproximación de su cálculo (muestreo y discretización del tiempo). No usarlo como referencia en esta tabla."
 )
 
 
@@ -184,41 +179,11 @@ def _bloque_pareado(ancho, modo, K, familia, metodos, referencia, B, rng, alpha)
     return bloque
 
 
-def gaps_contra_cotas(df: pd.DataFrame, B: int = BOOTSTRAP_B, semilla: int = BOOTSTRAP_SEED) -> pd.DataFrame:
-    """Gap (%) de cada método contra UB-DP y UB-PI, con intervalo bootstrap del 95 % sobre mundos."""
-    rng = np.random.Generator(np.random.PCG64(semilla))
-    filas = []
-    for (modo, K), g in df.groupby(["modo", "K"], sort=False):
-        floja = ub_dp_floja(g["ub_dp"], g["ub_pi"])
-        for metodo, gm in g.groupby("metodo", sort=False):
-            fila = {"modo": etiqueta_modo(modo), "K": K, "metodo": metodo, "n_mundos": len(gm),
-                    "ub_dp_floja": floja}
-            for col, nombre in (("ub_dp", "ub_dp"), ("ub_pi", "ub_pi")):
-                ub, x = gm[col].to_numpy(float), gm["margen"].to_numpy(float)
-                ok = ~np.isnan(ub)
-                fila[f"gap_{nombre}_pct"] = gap_pct(ub, x)
-                if ok.sum() > 1:
-                    idx = _indices_bootstrap(int(ok.sum()), B, rng)
-                    u, v = ub[ok][idx].mean(axis=1), x[ok][idx].mean(axis=1)
-                    with np.errstate(divide="ignore", invalid="ignore"):
-                        gaps = (u - v) / np.abs(u) * 100.0
-                    fila[f"gap_{nombre}_ic95_inf"] = float(np.nanpercentile(gaps, 2.5))
-                    fila[f"gap_{nombre}_ic95_sup"] = float(np.nanpercentile(gaps, 97.5))
-            filas.append(fila)
-    return pd.DataFrame(filas)
-
-
-def append_stats_sheets_to_excel(excel_path: str, sim_df: pd.DataFrame, replay_df: pd.DataFrame = None) -> None:
-    """Agrega al Excel existente, sin tocar las hojas previas:
-      · 'Comparación ruteo'      — DRL − B1, B2, B2P, B3 (familia "ruteo" de Holm)
-      · 'Comparación precio (B)' — DRL − DRL-dest+regla (familia "precio": lo que aporta la cabeza de precio)
-      · 'Gaps vs cotas'"""
+def append_comparacion_to_excel(excel_path: str, sim_df: pd.DataFrame, replay_df: pd.DataFrame = None) -> None:
+    """Agrega al Excel la hoja 'Comparación': DRL − cada método, una fila por (modo, K, comparación).
+    familia "ruteo" = B1, B2, B2P, B3; familia "precio" = mismas rutas del DRL con reglas de precio fijas (lo que aporta la cabeza de precio)."""
     df = sim_df if replay_df is None or replay_df.empty else pd.concat([sim_df, replay_df], ignore_index=True)
-    pareada = comparar_con_baselines(df)
-    gaps = gaps_contra_cotas(df)
-    with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-        for familia, hoja in (("ruteo", "Comparación ruteo"), ("precio", "Comparación precio (B)")):
-            parte = pareada[pareada["familia"] == familia] if len(pareada) else pareada
-            parte.to_excel(writer, sheet_name=hoja, index=False)
-        gaps.to_excel(writer, sheet_name="Gaps vs cotas", index=False)
-    print(f"Hojas estadísticas agregadas → {excel_path}")
+    pareada = comparar_con_baselines(df).drop(columns=["wilcoxon_stat", "p_una_cola"], errors="ignore")
+    from excel_report import escribir_comparacion
+    escribir_comparacion(excel_path, pareada)
+    print(f"Hoja 'Comparación' agregada → {excel_path}")

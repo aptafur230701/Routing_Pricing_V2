@@ -74,6 +74,22 @@ def prob_ganar(u_nivel, m) -> np.ndarray:
     return np.power(1.0 - np.asarray(u_nivel, dtype=np.float64), np.asarray(m, dtype=np.float64))
 
 
+def valor_reintentos(P, margen, base, intentos: int) -> tuple:
+    """Cotizar hasta `intentos` cargas de una misma lane, una tras otra, con el mejor precio en cada intento.
+
+    V_0 = base (lo que vale perderlas todas) y V_a = max_k [P_k · margen_k + (1 − P_k) · V_{a−1}] con a intentos.
+    P, margen : (..., K); base : (...). Devuelve (V, k): V (intentos+1, ...) y k (intentos, ...) con k[a−1] el
+    nivel óptimo cuando quedan a intentos."""
+    P, margen = np.asarray(P, dtype=np.float64), np.asarray(margen, dtype=np.float64)
+    forma = np.broadcast_shapes(P.shape, margen.shape)[:-1]
+    V, ks = [np.broadcast_to(np.asarray(base, dtype=np.float64), forma)], []
+    for _ in range(intentos):
+        q = P * margen + (1.0 - P) * V[-1][..., None]
+        ks.append(q.argmax(axis=-1))
+        V.append(q.max(axis=-1))
+    return np.stack(V), np.stack(ks)
+
+
 def percentil_competidor(U, m) -> np.ndarray:
     """Percentil del mejor de m competidores uniformes a partir de un uniforme U: u_comp ~ Beta(1, m).
 
@@ -86,10 +102,9 @@ def gana(u_nivel, u_comp) -> np.ndarray:
     """La cotización en el percentil u_nivel gana si queda por debajo del mejor competidor.
 
     Se compara en percentiles (no en dólares) para evitar empates en lanes con cuantiles repetidos.
-    El nivel 0 (el mínimo del mercado) gana siempre.
+    Ningún nivel gana siempre: el más bajo es p10 (U_NIVELES).
     """
-    u_nivel = np.asarray(u_nivel, dtype=np.float64)
-    return (u_nivel <= 0.0) | (u_nivel < np.asarray(u_comp, dtype=np.float64))
+    return np.asarray(u_nivel, dtype=np.float64) < np.asarray(u_comp, dtype=np.float64)
 
 
 def indice_nivel(u: float, u_niveles: np.ndarray = U_NIVELES_ARR) -> int:

@@ -157,7 +157,7 @@ def test_entorno_ve_el_mismo_mundo_que_mundo_cotizacion(data, mp):
     env.reset(np.array([2]), np.array([3]), world_seeds=np.array([99]))
     assert np.array_equal(env.current_loads_row[0], t.loads[0, 2])
     assert np.allclose(env.precios_row[0], t.precios[0, 2])
-    assert np.allclose(env.u_comp_row[0], t.u_comp[0, 2])
+    assert np.allclose(env.u_comp_cargas[0], t.u_comp[0, 2]) and np.allclose(env.u_comp_row[0], t.u_comp[0, 2, :, 0])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,7 +234,7 @@ def test_rewards_row_vectorial_es_el_margen_a_la_mediana(data, mp):
             venv.rate_row_obs[b], venv.current_loads_row[b],
             data["distance_arr"][nodo], data["diesel_arr"][nodo],
         ).astype(np.float32)
-        esperado[nodo] = BIG_M_PENALTY
+        esperado[nodo] = 0.0                                             # self-loop = esperar: margen 0
         assert np.array_equal(venv.reward_rows[b], esperado)
 
 

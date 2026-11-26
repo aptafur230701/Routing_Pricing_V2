@@ -79,16 +79,25 @@ BE_MARGEN       = 0.30        # USD/milla sobre el break-even de la regla de pre
 # ── Ruteo y pricing conjunto (especificacion_fase0_ruteo_pricing.md) ──
 # En cada nodo la política elige (destino, nivel de precio). Los niveles son percentiles fijos, comunes a todas
 # las lanes, que se convierten en USD/milla con los cuantiles de cada lane y día (pricing.precios_niveles).
-U_NIVELES = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)   # nivel 0 = mínimo del mercado (gana siempre); 9 = p90
+U_NIVELES = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)   # p10 … p90: ningún nivel gana con seguridad (no hay
+                                                            # "cotizar al mínimo del mercado")
 COMPETENCIA_KAPPA = 1.0    # m = clip(1 + κ · LTR_REF / LTR, 1, M_MAX); sensibilidad κ ∈ {0.5, 2}
 COMPETENCIA_M_MAX = 20.0   # tope de competidores efectivos (con LTR ≈ 0.8, p5 del train, m sin tope sería ≈ 33)
 # LTR_REF no es constante: es la mediana del LTR por hub y día en los días de train (los 194 hubs, así no depende
 # de num_nodes) y la calcula MarketProcess al iniciar (≈ 25.5 con los datos jun-sep 2026).
 COTIZACION_HORAS = 0.25          # horas que se pierden por cada cotización rechazada (= una franja de la DP)
-COTIZACIONES_MAX_POR_NODO = 2    # rechazos por visita a un nodo; después solo quedan opciones sin cotizar
+COTIZACIONES_MAX_POR_NODO = 4    # rechazos por visita a un nodo (o por día de espera); después solo quedan esperar
+BANDA_PRECIO_MASA = 0.8   # rango de precio por arco (evaluación): niveles contiguos alrededor del elegido que juntan esta probabilidad de la cabeza de precio
+                                 # o moverse vacío. Se pueden gastar varios en la misma lane: cada carga de la lane
+                                 # es una cotización distinta, con su propio competidor
+# Movimientos sin carga (routing_env.py): en cualquier nodo, casa incluida antes de salir, el camión puede
+#   · ESPERAR al siguiente día de mercado (múltiplo de HORAS_DIA_MERCADO) y cotizar con un tablero nuevo;
+#   · moverse VACÍO a un nodo a ≤ REPOSICION_MAX_MILLAS (reposicionamiento, paga el costo completo por milla);
+#   · y desde un nodo intermedio, volver a casa VACÍO a cualquier distancia.
+REPOSICION_MAX_MILLAS = 300.0
 REGLA_PRECIO_BASELINES = "miope" # regla fija de precio de B1-B3 ("mediana" | "be_margen" | "miope")
-# Entropía de la cabeza de precio (aparte de la del destino). Máximo = log(11) ≈ 2.4 con 10 niveles + VACÍO.
-# Valores iniciales razonables, sin ajustar por HPO todavía.
+# Entropía de la cabeza de precio (aparte de la del destino). Máximo = log(10) ≈ 2.3 con 9 niveles + VACÍO.
+# Valores iniciales razonables; main.py los reemplaza por los del HPO (hpo_optuna.py, 20 nodos).
 PPO_ENTROPY_COEF_PRECIO_START = 0.05
 PPO_ENTROPY_COEF_PRECIO_END   = 0.01
 UBDP_TIEMPO_MAX_HORAS = 24.0     # si la tabla de UB-DP tarda más, ese tamaño se reporta "no tratable"
@@ -221,18 +230,13 @@ REPLAY_MAX_CASOS = 300   # tope de casos (nodo, día) del replay por nivel de K;
 BOOTSTRAP_B     = 10000   # remuestreos del intervalo bootstrap de la diferencia pareada
 BOOTSTRAP_SEED  = 20261019
 
-# ── Etiqueta de corrida ──────────────────────────────────────
-# Vacía por defecto (results/<N>nodes y checkpoints/ de siempre). Con RUN_TAG="abl_a" main.py usa
-# results/<N>nodes_abl_a y checkpoints/abl_a, para correr ablaciones sin pisar otras corridas.
-RUN_TAG = os.environ.get("RUN_TAG", "")
-
 # ── Hiperparámetros por tamaño de grafo ──────────────────────
 # Lo que se escriba aquí para un tamaño pisa el valor global de este archivo; {} = los de siempre.
 # Claves admitidas: PPO_LR, PPO_N_EPISODES_PER_UPDATE, PPO_ENTROPY_COEF_START, PPO_ENTROPY_COEF_END,
 # LR_FINAL_FRAC y EPISODES_PER_NODE (reemplaza a get_episodes_per_node).
 HP_POR_NODOS = {
     10: {},
-    20: {"PPO_ENTROPY_COEF_START": 0.10, "PPO_ENTROPY_COEF_END": 0.04},   # más exploración al final
+    20: {},   # sin overrides: aquí se corre el HPO (hpo_optuna.py) y sus valores no deben pisarse
     35: {"LR_FINAL_FRAC": 0.30},
     50: {},
     75: {},

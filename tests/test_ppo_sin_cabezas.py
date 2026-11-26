@@ -85,5 +85,5 @@ def test_checkpoint_anterior_a_la_cotizacion_es_error(tmp_path):
     sd = {k: v for k, v in agent.state_dict().items() if not k.startswith("decoder.precio.")}
     ruta = tmp_path / "sin_precio.pt"
     torch.save({"agent": sd, "critic": critic.state_dict()}, ruta)
-    with pytest.raises(ValueError, match="anterior a la cotización"):
+    with pytest.raises(ValueError, match="anterior a la cabeza de precio"):
         load_checkpoint_compatible(str(ruta), NUM_NODES, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, verbose=False)

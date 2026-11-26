@@ -44,7 +44,7 @@ from config import DEVICE
 # Secuencia canónica de escalado
 # ─────────────────────────────────────────────────────────────────────────────
 
-NODE_SEQUENCE = [10, 20, 50, 75, 100]
+NODE_SEQUENCE = [20, 35, 50, 75, 100]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,13 +116,17 @@ def _reconcile_state_dict(target_sd: dict, source_sd: dict) -> tuple:
 
 
 def _tiene_cabeza_de_precio(checkpoint: dict) -> bool:
-    return any(k.startswith("decoder.precio.") for k in checkpoint["agent"])
+    """La cabeza de precio actual (con Δ, model/decoder.PriceHead) y las opciones actuales (N_NIVELES + VACÍO)."""
+    from pricing import N_NIVELES
+    agente = checkpoint["agent"]
+    salida = agente.get("decoder.precio.net.2.weight")
+    return "decoder.precio.log_tau" in agente and salida is not None and salida.shape[0] == N_NIVELES + 1
 
 
 def es_checkpoint_con_cotizacion(checkpoint_path: str) -> bool:
-    """True si el .pt existe y trae la cabeza de precio (modelo con cotización conjunta)."""
-    return os.path.exists(checkpoint_path) and _tiene_cabeza_de_precio(
-        torch.load(checkpoint_path, map_location="cpu"))
+    """True si el .pt existe y trae la cabeza de precio actual (ver `_tiene_cabeza_de_precio`); un checkpoint
+    anterior al 2026-11-25 da False."""
+    return os.path.exists(checkpoint_path) and _tiene_cabeza_de_precio(torch.load(checkpoint_path, map_location="cpu"))
 
 
 def _instanciar_y_transferir(
@@ -149,7 +153,7 @@ def _instanciar_y_transferir(
         # Checkpoint de antes de la cotización (sin PriceHead): cargarlo dejaría la cabeza de precio aleatoria
         # y las features nuevas en cero sin aviso, y el transfer o la evaluación usarían un modelo viejo.
         raise ValueError(
-            f"{checkpoint_path} es anterior a la cotización conjunta (no trae decoder.precio). "
+            f"{checkpoint_path} es anterior a la cabeza de precio actual (decoder.precio). "
             f"Bórralo o vuelve a entrenar ese tamaño."
         )
 
@@ -203,7 +207,7 @@ def load_checkpoint_compatible(
 
 def get_source_checkpoint(base_dir: str, target_num_nodes: int) -> str | None:
     """Dado target_num_nodes, devuelve la ruta al checkpoint del tamaño anterior en
-    NODE_SEQUENCE, o None si target es el primero (10 nodos).
+    NODE_SEQUENCE, o None si target es el primero (20 nodos).
 
     Busca primero en results/{N}nodes/ y luego en la raíz del proyecto.
     """

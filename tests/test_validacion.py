@@ -22,6 +22,7 @@ from baselines.politicas import calcular_ev_pronostico
 from evaluation import disenar_mundos
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
+from pricing import N_NIVELES
 
 N = 10
 
@@ -62,10 +63,10 @@ def test_validacion_estructura_y_reproducibilidad(datos):
     assert a == b                                           # mismos mundos, misma política ⇒ mismo resultado
     assert set(a["por_k"]) == {"free" if K is None else str(K) for K in K_TRAINING_LEVELS}
     for d in a["por_k"].values():
-        assert d["valid_rate"] == 1.0
-        assert 0 < d["tasa_aceptacion"] <= 1 and 0 <= d["nivel_medio"] <= 9
+        assert 0 < d["valid_rate"] <= 1.0                  # con pesos al azar un ciclo puede fallar
+        assert 0 < d["tasa_aceptacion"] <= 1 and 0 <= d["nivel_medio"] <= N_NIVELES - 1
         assert set(d) == {"margen", "valid_rate", "tasa_aceptacion", "nivel_medio"}      # sin B3 ni UB-DP
-    assert a["score"] == pytest.approx(a["margen"] * a["valid_rate"])
+    assert a["score"] == a["margen"]                       # las fallas ya van penalizadas en el margen
 
 
 def test_entrenamiento_guarda_mejor_update_y_loguea_validacion(datos, monkeypatch, tmp_path):

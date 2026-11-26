@@ -3,19 +3,26 @@ main.py
 =======
 Entry point for the AM-PPO pipeline.
 
+  0. HPO de PPO         (hpo_optuna.py, en 20 nodos; una vez para todos los tamaños)
   1. Load data          (problem_data.py)
-  2. Training           (am_training.py)
+  2. Training           (am_training.py, con los hiperparámetros del paso 0)
   3. Evaluation         (evaluation.py: mundos simulados + replay; DRL, baselines B1-B3 y B2P, UB-PI, UB-DP)
-  4. Save results       (evaluation.py, excel_report.py, stats_analysis.py)
-  5. Validación del precio (validate_pricing.py: results/<N>nodes/pricing_val/ y hojas del Excel)
+  4. Save results       (Excel con hojas Resumen y Comparación + mundos_AM.csv con los datos por mundo)
+  5. Validación del precio (validate_pricing.py: results/<N>nodes/pricing_val/)
 
   La validación de la decisión de precio va aparte: python validate_pricing.py --num-nodes N.
 
 Uso
 ---
-  Edita NODE_SIZES en main() (por defecto, la cadena completa de transfer_learning.NODE_SEQUENCE:
-  10 · 20 · 50 · 75 · 100). Luego ejecuta simplemente:
+  Edita NODE_SIZES en main() (la cadena completa de transfer_learning.NODE_SEQUENCE es
+  20 · 35 · 50 · 75 · 100). Luego ejecuta simplemente:
     python main.py
+
+  Antes de entrenar se obtienen los hiperparámetros PPO con Optuna (variable de entorno HPO):
+    HPO=auto  (default) reusa results/20nodes/best_ppo_hyperparams.json si existe; si no, corre el HPO.
+    HPO=force corre (o continúa, el estudio es resumible) el HPO aunque el JSON exista.
+    HPO=off   no corre el HPO: entrena con los valores de config.py.
+  Con EVAL_ONLY=1 no se corre el HPO.
 
   Corre cada tamaño en orden: entrena, guarda checkpoint y resultados, y pasa al siguiente usando
   ese checkpoint recién guardado como punto de partida (transfer learning automático, ver
@@ -41,7 +48,7 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 from config import (
-    SEED, DEVICE, RUN_TAG, K_TRAINING_LEVELS, configurar_k, MARKET_SEED_EVAL, MARKET_SEED_EVAL_FINAL,
+    SEED, DEVICE, K_TRAINING_LEVELS, configurar_k, MARKET_SEED_EVAL, MARKET_SEED_EVAL_FINAL,
     HP_OVERRIDES, configurar_hp,
     get_episodes_per_node, TRAIN_DAYS, set_seeds,
     AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF,
@@ -54,7 +61,8 @@ from evaluation import (
     save_results, plot_diagnostics, plot_ppo_diagnostics,
 )
 from market_process import MarketProcess, asegurar_parametros
-from stats_analysis import append_stats_sheets_to_excel, comparar_con_baselines, FAMILIAS, NOTA_REPLAY
+from excel_report import guardar_mundos, agregar_rutas_y_precios
+from stats_analysis import append_comparacion_to_excel, comparar_con_baselines, FAMILIAS, NOTA_REPLAY
 from transfer_learning import (
     NODE_SEQUENCE, build_agent_for_training, load_checkpoint_compatible,
 )
@@ -163,6 +171,15 @@ def _evaluate_and_report(
     UB-DP. Replay: el mismo arnés sobre los días reales de evaluación (TRAIN_DAYS en adelante),
     fuera de muestra: ni el entrenamiento ni el ajuste del proceso exógeno usaron esos días.
     """
+    # Antes de evaluar (decenas de minutos): los archivos de salida tienen que poderse sobrescribir. En Windows
+    # un Excel abierto bloquea el archivo y la evaluación se perdería al final.
+    for nombre in (f"DRL_Routing_Summary_{label}.xlsx", f"mundos_{label}.csv"):
+        ruta = os.path.join(cwd, nombre)
+        if os.path.exists(ruta):
+            try:
+                open(ruta, "r+b").close()
+            except PermissionError:
+                raise PermissionError(f"{ruta} está abierto en otro programa (¿Excel?): ciérralo y vuelve a correr")
     # La tabla solo calcula los K que se evalúan: con K libre (K_RESTRINGIDO = False) es un solo barrido
     # (K = 0) en vez de K = 1…K_MAX más el libre.
     k_tabla = max([k for k in K_TRAINING_LEVELS if k is not None], default=0)
@@ -210,16 +227,16 @@ def _evaluate_and_report(
     plot_path  = os.path.join(cwd, f"DRL_Training_Diagnostics_{label}.png")
 
     save_results(sim_df, replay_df, summary_rows, excel_path)
-    append_stats_sheets_to_excel(excel_path, sim_df, replay_df)
+    append_comparacion_to_excel(excel_path, sim_df, replay_df)
+    agregar_rutas_y_precios(excel_path, sim_df, replay_df)
+    guardar_mundos(sim_df, replay_df, os.path.join(cwd, f"mundos_{label}.csv"))
     if ep_rewards:
         plot_diagnostics(ep_rewards, ep_losses, sim_df, NUM_NODES, plot_path)
 
-    # Validación de la decisión de precio (nivel según el estado, comparación B, sensibilidad a κ):
-    # results/<N>nodes/pricing_val/ y hojas "Precio vs estado" y "Sensibilidad κ" del Excel.
+    # Validación de la decisión de precio (nivel según el estado, sensibilidad a κ): results/<N>nodes/pricing_val/
     from validate_pricing import validar_pricing
     validar_pricing(agent, NUM_NODES, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-                    ltr_stack, avail_expected_arr, reward_global_p95, market_process, cwd,
-                    excel_path=excel_path)
+                    ltr_stack, avail_expected_arr, reward_global_p95, market_process, cwd)
 
     return sim_df, replay_df
 
@@ -231,7 +248,7 @@ def _imprimir_comparacion_b(sim_df, replay_df) -> None:
     if b.empty:
         return
     sig = [c for c in b.columns if c.startswith("significativo")][0]
-    print("\n  Comparación B — lo que aporta la cabeza de precio (DRL − mismos destinos con regla fija):")
+    print("\n  Lo que aporta el precio del DRL (DRL − mismas rutas con una regla de precio fija):")
     for _, r in b.iterrows():
         modo = "replay" if str(r["modo"]).startswith("replay") else "simulado"
         print(f"    {modo:<9} K={r['K']:<6} {r['comparacion']:<26} "
@@ -264,12 +281,11 @@ def _run_one_size(
 
     set_seeds(SEED)
 
-    etiqueta = f"_{RUN_TAG}" if RUN_TAG else ""    # RUN_TAG (config.py): ablaciones sin pisar otras corridas
-    output_dir = os.path.join(cwd, "results", f"{NUM_NODES}nodes{etiqueta}")
+    output_dir = os.path.join(cwd, "results", f"{NUM_NODES}nodes")
     os.makedirs(output_dir, exist_ok=True)
 
     # Carpeta compartida de checkpoints (para transfer learning entre ramas)
-    checkpoint_dir = os.path.join(cwd, "checkpoints", RUN_TAG) if RUN_TAG else os.path.join(cwd, "checkpoints")
+    checkpoint_dir = os.path.join(cwd, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
@@ -344,11 +360,16 @@ def _run_one_size(
 
 
 def main():
-    # Tamaños a correr, en orden. Por defecto la cadena completa de transfer_learning.NODE_SEQUENCE
-    # (10 → 20 → 50 → 75 → 100): cada tamaño arranca con el checkpoint recién guardado del
-    # anterior. Para correr uno solo, deja aquí un único elemento, p. ej. NODE_SIZES = [10].
+    # Tamaños a correr, en orden. La cadena completa de transfer_learning.NODE_SEQUENCE es
+    # (20 → 35 → 50 → 75 → 100): cada tamaño arranca con el checkpoint recién guardado del
+    # anterior. Para correr uno solo, deja aquí un único elemento, p. ej. NODE_SIZES = [20].
     # NODE_SIZES      = list(NODE_SEQUENCE)
-    NODE_SIZES      = [10]
+    NODE_SIZES      = [20, 35, 50]
+    # HPO de PPO (hpo_optuna.py) antes de entrenar: "auto" | "force" | "off" (ver docstring del módulo).
+    HPO_MODE            = os.environ.get("HPO", "auto")
+    HPO_N_TRIALS        = 50
+    HPO_UPDATES_TRIAL   = 60
+    HPO_SEEDS_TRIAL     = 2
     EVAL_ONLY       = os.environ.get("EVAL_ONLY", "0") == "1"   # True (EVAL_ONLY=1): carga checkpoint y salta entrenamiento
     USE_TRANSFER    = True   # True: inicializa los pesos desde el checkpoint del tamaño anterior. False: entrena desde pesos aleatorios con la
                               # arquitectura de config.py.
@@ -370,6 +391,22 @@ def main():
     # ──────────────────────────────────────────────────────────────────────────
 
     cwd = os.path.dirname(os.path.abspath(__file__))
+
+    # ── Paso 0: hiperparámetros PPO (Optuna, en 20 nodos), los mismos para todos los tamaños ──
+    if not EVAL_ONLY and HPO_MODE != "off":
+        import hpo_optuna   # import diferido: con EVAL_ONLY o HPO=off no hace falta optuna
+        print(f"\n{'='*60}\n  HPO de PPO ({hpo_optuna.HPO_NUM_NODES} nodos, modo {HPO_MODE})\n{'='*60}")
+        hps = hpo_optuna.obtener_hiperparametros(
+            HPO_MODE, n_trials=HPO_N_TRIALS, updates_per_trial=HPO_UPDATES_TRIAL,
+            n_seeds_per_trial=HPO_SEEDS_TRIAL, k_restringido=K_RESTRINGIDO,
+        )
+        hpo_optuna.aplicar_hiperparametros(hps)
+        print("Hiperparámetros PPO del entrenamiento:")
+        for k, v in hps.items():
+            print(f"  {k:30s} = {v}")
+        set_seeds(SEED)
+    else:
+        print("\nHPO desactivado: se entrena con los hiperparámetros de config.py.")
 
     fallidos = []
     for NUM_NODES in NODE_SIZES:
