@@ -51,22 +51,22 @@ AM_DROPOUT  = 0.0   # Dropout en las sublayers del encoder (nunca en el path de 
 # ── PPO hyperparameters ───────────────────────────────────────
 PPO_N_EPISODES_PER_UPDATE = 700    # Episodios recolectados antes de cada update PPO
 PPO_N_EPOCHS              = 4      # Épocas de entrenamiento PPO por rollout
-PPO_BATCH_SIZE            = 256    # Tamaño de batch para entrenamiento PPO. Subido de 64: la GPU
+PPO_BATCH_SIZE            = 512    # Tamaño de batch para entrenamiento PPO. Subido de 64: la GPU
                                     # está dominada por overhead de lanzamiento de kernels a batch
                                     # pequeño (tiempo/batch ~constante de 64 a 700), así que un batch
                                     # mayor da ~3.4x más rápido por update con caída mínima de EV.
-PPO_LR                    = 7.574781400016766e-05   # Learning rate para el actor. Subido de 1e-5: la KL media
+PPO_LR                    = 0.0001027303916436541   # Learning rate para el actor. Subido de 1e-5: la KL media
                                     # iba muy por debajo del target 0.02 con clip < 0.10,
                                     # indicando under-stepping. knob: subir hacia 5e-5 si KL se
                                     # mantiene < ~0.015 y el reward sigue subiendo pasado update 150.
 PPO_GAMMA                 = 1.0    # Factor de descuento. 1.0: horizonte finito de 2–5 pasos, sin descuento
                                     # (el margen del episodio es la suma de las lanes). Era 0.99.
-PPO_GAE_LAMBDA            = 0.9738083627173082   # Factor de GAE
-PPO_CLIP_EPS              = 0.22021368918814568   # Clip PPO para limitar cambios de política
-PPO_ENTROPY_COEF_START    = 0.07842497176858756   # coeficiente de entropía al inicio del entrenamiento
-PPO_ENTROPY_COEF_END      = 0.022646509161679096   # coeficiente de entropía al final del entrenamiento (decay lineal)
-PPO_GRAD_CLIP             = 1.7476269465868015    # Clipping de gradiente para PPO
-PPO_WEIGHT_DECAY          = 6.093123878168306e-05  # Weight decay (AdamW) del actor. Regularizador PRIMARIO
+PPO_GAE_LAMBDA            = 0.9700773994877414   # Factor de GAE
+PPO_CLIP_EPS              = 0.1855572933544571   # Clip PPO para limitar cambios de política
+PPO_ENTROPY_COEF_START    = 0.03839069309492253   # coeficiente de entropía al inicio del entrenamiento
+PPO_ENTROPY_COEF_END      = 0.009450213956724884   # coeficiente de entropía al final del entrenamiento (decay lineal)
+PPO_GRAD_CLIP             = 0.8164399100201447    # Clipping de gradiente para PPO
+PPO_WEIGHT_DECAY          = 1.8010135852882087e-05  # Weight decay (AdamW) del actor. Regularizador PRIMARIO
                                     # PPO-safe: no corrompe el ratio de importancia como el
                                     # dropout en el path de logits.
 
@@ -81,7 +81,7 @@ BE_MARGEN       = 0.30        # USD/milla sobre el break-even de la regla de pre
 # las lanes, que se convierten en USD/milla con los cuantiles de cada lane y día (pricing.precios_niveles).
 U_NIVELES = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)   # p10 … p90: ningún nivel gana con seguridad (no hay
                                                             # "cotizar al mínimo del mercado")
-COMPETENCIA_KAPPA = 1.0    # m = clip(1 + κ · LTR_REF / LTR, 1, M_MAX); sensibilidad κ ∈ {0.5, 2}
+COMPETENCIA_KAPPA = 1.0    # m = clip(1 + κ · LTR_REF / LTR, 1, M_MAX); sensibilidad κ ∈ {0.5, 1, 2} (entrenado con 1)
 COMPETENCIA_M_MAX = 20.0   # tope de competidores efectivos (con LTR ≈ 0.8, p5 del train, m sin tope sería ≈ 33)
 # LTR_REF no es constante: es la mediana del LTR por hub y día en los días de train (los 194 hubs, así no depende
 # de num_nodes) y la calcula MarketProcess al iniciar (≈ 25.5 con los datos jun-sep 2026).
@@ -97,14 +97,14 @@ BANDA_PRECIO_MASA = 0.8   # rango de precio por arco (evaluación): niveles cont
 REPOSICION_MAX_MILLAS = 300.0
 REGLA_PRECIO_BASELINES = "miope" # regla fija de precio de B1-B3 ("mediana" | "be_margen" | "miope")
 # Entropía de la cabeza de precio (aparte de la del destino). Máximo = log(10) ≈ 2.3 con 9 niveles + VACÍO.
-# Valores iniciales razonables; main.py los reemplaza por los del HPO (hpo_optuna.py, 20 nodos).
-PPO_ENTROPY_COEF_PRECIO_START = 0.05
-PPO_ENTROPY_COEF_PRECIO_END   = 0.01
+# Valores fijos: los del HPO de 20 nodos (hpo_optuna.py, results/20nodes/best_ppo_hyperparams.json).
+PPO_ENTROPY_COEF_PRECIO_START = 0.03688801102074321
+PPO_ENTROPY_COEF_PRECIO_END   = 0.019523395818174943
 UBDP_TIEMPO_MAX_HORAS = 24.0     # si la tabla de UB-DP tarda más, ese tamaño se reporta "no tratable"
 
 # ── Self-critical baseline (híbrido sobre actor-critic) ────────────
 USE_SELF_CRITICAL            = True   # término self-critical sobre el argmax greedy
-SELF_CRITICAL_COEF           = 0.5     # peso del término self-critical en el loss total
+SELF_CRITICAL_COEF           = 0.41233283242927726     # peso del término self-critical en el loss total
 SELF_CRITICAL_WARMUP_UPDATES = 50      # no aplicar self-critical hasta este update
                                         # (deja que el crítico se estabilice primero)
 
@@ -148,10 +148,10 @@ def configurar_k(restringido: bool) -> None:
     K_TRAINING_LEVELS[:] = K_LEVELS + [None]
 
 # ── Features de continuación por nodo ────────────────────────
-USE_CONTINUATION_FEATURES = True   # True: 4 features extra por nodo j (N_NODE_FEATURES = 12 con el índice de mercado) con la
-                                   # información de qué pasa después de j (tiempo y holgura de regreso a
-                                   # casa, valor esperado de volver a casa y de seguir un salto más; ver
-                                   # model/encoder.py). False: las 7 features base. Ablacionable.
+USE_CONTINUATION_FEATURES = True   # True: 8 features extra por nodo j (N_NODE_FEATURES = 38 con el índice de mercado) con la
+                                   # información de qué pasa después de j: tiempo y holgura de regreso a casa y
+                                   # estadísticas por día de la semana de las lanes que salen de j (market_process.
+                                   # EstadisticasLane; ver model/encoder.py). False: las 6 features base.
 
 # ── Train / eval split ───────────────────────────────────────
 # jun 1 - sep 30 2026 (122 días) entrenamiento; oct 1-31 2026 (31 días) prueba, fuera de muestra.
@@ -222,7 +222,7 @@ UBDP_DT_HORAS   = 0.25    # paso de tiempo de la DP (franjas de 15 min; tiempos 
                           # también lo usa B2
 UBPI_DT_HORAS   = 1.0 / 60.0   # paso de tiempo de la DP hacia atrás de UB-PI (franjas de 1 min; redondeo hacia abajo)
 UBDP_S          = 5000    # sorteos de filas por par (nodo, día de la semana)
-UBDP_MAX_NODOS  = 35      # por encima, UB-DP (y B3) no se calcula: se reporta "no tratable" sin gastar horas
+UBDP_MAX_NODOS  = 75      # por encima, UB-DP (y B3) no se calcula: se reporta "no tratable" sin gastar horas
                           # (con los dos intentos de cotización el costo crece con N³ · S)
 UBDP_SEED       = 20261018   # semilla del Generator propio de la DP
 UBDP_TABLA_PATH = "datos/ubdp_tabla_{n}nodos.npz"   # relativo a la raíz del proyecto; {n} = nº de nodos
@@ -233,10 +233,10 @@ BOOTSTRAP_SEED  = 20261019
 # ── Hiperparámetros por tamaño de grafo ──────────────────────
 # Lo que se escriba aquí para un tamaño pisa el valor global de este archivo; {} = los de siempre.
 # Claves admitidas: PPO_LR, PPO_N_EPISODES_PER_UPDATE, PPO_ENTROPY_COEF_START, PPO_ENTROPY_COEF_END,
-# LR_FINAL_FRAC y EPISODES_PER_NODE (reemplaza a get_episodes_per_node).
+# LR_FINAL_FRAC.
 HP_POR_NODOS = {
     10: {},
-    20: {},   # sin overrides: aquí se corre el HPO (hpo_optuna.py) y sus valores no deben pisarse
+    20: {},   # sin overrides: los hiperparámetros del HPO (hpo_optuna.py) ya están fijos en este archivo
     35: {"LR_FINAL_FRAC": 0.30},
     50: {},
     75: {},
@@ -292,18 +292,11 @@ DEVICE = _elegir_device()
 
 
 def get_episodes_per_node(num_nodes: int) -> int:
-    """Episodes per start-node for the full training run."""
-    if "EPISODES_PER_NODE" in HP_OVERRIDES:      # hiperparámetros propios del tamaño (HP_POR_NODOS)
-        return HP_OVERRIDES["EPISODES_PER_NODE"]
-    if num_nodes <= 10:  return 20000   # val_score se aplana ~update 200-220 (training_log_10nodes.pkl);
-                                        # 20000 da ~285 updates, margen ~1.6x
-    if num_nodes <= 20:  return 25000   # meseta ~update 400 (training_log_20nodes.pkl); 25000 da
-                                        # ~714 updates, margen ~1.7x
-    if num_nodes <= 35:  return 13000   # meseta ~update 350-400 (training_log_35nodes.pkl, corrida
-                                        # vieja de 3000 updates); 13000 da ~650 updates, margen ~1.7x
-    if num_nodes <= 50:  return 14000   # meseta ~update 550-600 (training_log_50nodes.pkl, corrida
-                                        # vieja de 4285 updates); 14000 da ~1000 updates, margen ~1.7x
-    if num_nodes <= 75:  return 10000   # PROVISIONAL: sin log propio, extrapolado del patrón 35/50;
-                                        # recalibrar tras la primera corrida real
-    return 9000           # 100 nodos — PROVISIONAL, mismo caso que 75
+    # Episodios por nodo de inicio del entrenamiento completo (updates = nodos x episodios / 700)
+    if num_nodes <= 10:  return 20000   # ~285 updates
+    if num_nodes <= 20:  return 25000   # ~714 updates
+    if num_nodes <= 35:  return 26000   # ~1300 updates
+    if num_nodes <= 50:  return 14000   # ~1000 updates
+    if num_nodes <= 75:  return 10000   # ~1070 updates
+    return 9000                         # ~1290 updates (100 nodos)
 

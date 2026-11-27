@@ -201,13 +201,13 @@ Ejemplo: un hub tuvo 1,200 cargas en sus lanes de salida y L/T = 30, es decir, 4
 
 **4. Competencia: el mejor competidor de cada lane.**
 
-El agente no acepta un precio dado: cotiza uno de 10 niveles comunes a todas las lanes, en escala de percentiles (u = 0, 0.1, …, 0.9). El precio de cada nivel sale de la misma interpolación del punto 2, F⁻¹(u) · e^δ, con los cuantiles de ese día y esa lane. El agente gana la carga si su percentil queda por debajo del de su mejor competidor, u_comp:
+El agente no acepta un precio dado: cotiza uno de 9 niveles comunes a todas las lanes, en escala de percentiles (u = 0.1, 0.2, …, 0.9, es decir p10 … p90). El precio de cada nivel sale de la misma interpolación del punto 2, F⁻¹(u) · e^δ, con los cuantiles de ese día y esa lane. El agente gana la carga si su percentil queda por debajo del de su mejor competidor, u_comp:
 
 $$
 u_{comp} = 1 - (1 - U)^{1/m_c}, \qquad P(\text{ganar con el nivel } u) = (1 - u)^{m_c}
 $$
 
-U es el mismo número uniforme del punto 2, y m_c es el número de competidores efectivos del hub de origen:
+Cada carga de la lane tiene su propio U y, por tanto, su propio u_comp. El U de la primera carga es el mismo número uniforme del punto 2; las demás cargas (hasta C = 4, el máximo de cotizaciones por visita) usan uniformes independientes. m_c es el número de competidores efectivos del hub de origen:
 
 $$
 m_c = \text{clip}\left(1 + \kappa \, \frac{LTR_{ref}}{LTR_{d,o}}, \; 1, \; M_{max}\right)
@@ -216,8 +216,10 @@ $$
 LTR_ref es la mediana del L/T por hub y día en los días de entrenamiento, y κ = 1.
 
 - **Por qué así.** El mejor de m_c competidores que cotizan al azar dentro de la distribución del día tiene percentil Beta(1, m_c), y la inversa de esa distribución es la fórmula de u_comp. Un hub con L/T bajo (pocas cargas por camión) tiene más competencia, y un hub tensionado (L/T alto) tiene menos.
-- **Por qué con el mismo U.** Con m_c = 1 el competidor cotiza exactamente la tarifa sorteada del punto 2, así que el mercado sin competencia adicional es el de siempre.
-- **Supuesto que se declara.** No hay datos de cargas ganadas y perdidas, así que la aceptación es un modelo: κ fija cuánto pesa el L/T. Por eso la tesis reporta la sensibilidad a κ ∈ {0.5, 1, 2}.
+- **Por qué con el mismo U (primera carga).** Con m_c = 1 el competidor cotiza exactamente la tarifa sorteada del punto 2, así que el mercado sin competencia adicional es el de siempre.
+- **Por qué un competidor independiente por carga.** Cada carga publicada es una oportunidad distinta, con su propio mejor competidor. Si el agente pierde una carga y vuelve a cotizar la misma lane, enfrenta otra carga y otro competidor, no el mismo rival con un precio nuevo; así un rechazo no revela nada sobre la siguiente carga. El número de cargas cotizables de una lane es min(cargas sorteadas, C).
+- **Por qué ningún nivel gana con seguridad.** Se quitó el nivel u = 0 (el mínimo del mercado). Cotizar al mínimo no garantiza ganar: un competidor puede quedar por debajo, y los datos no permiten asegurar lo contrario. Con el nivel más bajo en p10, `gana` es simplemente u_nivel < u_comp, sin caso especial.
+- **Supuesto que se declara.** No hay datos de cargas ganadas y perdidas, así que la aceptación es un modelo: κ fija cuánto pesa el L/T. El agente se entrena con κ = 1, y la tesis reporta la sensibilidad a κ ∈ {0.5, 1, 2} evaluando ese mismo modelo, sin reentrenarlo.
 - **Mismo competidor para todos los métodos.** u_comp se sortea con la semilla del episodio, así que el DRL y los baselines enfrentan el mismo competidor en cada lane y cada día (números aleatorios comunes).
 
 ### Pseudocódigo del generador
@@ -239,10 +241,10 @@ def realizacion(dia, hub, delta):
             k = r_de(lane)                          # r global o del grupo de volumen
             n = np.random.negative_binomial(k, k / (k + mu))
         d_p = dia_con_cargas_mas_cercano(dia, lane) # cuantiles reales, no imputados
-        U = np.random.rand()
-        tarifa = interp_cuantiles(cuantiles[d_p, lane], U) * np.exp(delta)
-        u_comp = 1 - (1 - U) ** (1 / m_comp(LT[dia, hub]))      # mejor competidor (punto 4)
-        precios_niveles = interp_cuantiles(cuantiles[d_p, lane], U_NIVELES) * np.exp(delta)
+        U = np.random.rand(C)                       # C = 4: un uniforme por carga cotizable
+        tarifa = interp_cuantiles(cuantiles[d_p, lane], U[0]) * np.exp(delta)
+        u_comp = 1 - (1 - U) ** (1 / m_comp(LT[dia, hub]))      # mejor competidor de cada carga (punto 4)
+        precios_niveles = interp_cuantiles(cuantiles[d_p, lane], U_NIVELES) * np.exp(delta)   # 9 niveles, p10 ... p90
         ofertas += [(lane, n, tarifa, precios_niveles, u_comp)]
         n_hub, c_hub = n_hub + n, c_hub + count_loads[dia, lane]
     lt = LT[dia, hub] * n_hub / c_hub if c_hub > 0 else LT[dia, hub]
@@ -258,7 +260,7 @@ Cada episodio sigue este ciclo, que se repite cada día real hasta completar H d
 1. **Inicio del episodio:** hub al azar, día real al azar y δ fijo.
 2. **Realización del día d:** cargas con binomial negativa, precios por nivel desde los cuantiles, mejor competidor, L/T recalculado.
 3. **Decisión del agente:** un destino y un nivel de precio para la carga de esa lane, o reposicionar vacío.
-4. **Resultado:** si el nivel queda por debajo del competidor, gana la carga, cobra ese precio y viaja. Si pierde, se queda en el hub, pierde 15 minutos, no ve un tablero nuevo y vuelve a decidir sin esa lane (a lo sumo 2 cotizaciones por visita).
+4. **Resultado:** si el nivel queda por debajo del competidor de esa carga, gana la carga, cobra ese precio y viaja. Si pierde, esa carga se pierde: el agente se queda en el hub, pierde 15 minutos, no ve un tablero nuevo y vuelve a decidir. Puede volver a cotizar la misma lane con otra de sus cargas (otro competidor independiente) hasta agotarlas, con a lo sumo 4 cotizaciones rechazadas por visita (`COTIZACIONES_MAX_POR_NODO`).
 5. **Avance:** al llegar al nuevo hub se toma la realización del día real en que llega y se vuelve al punto 3.
 
 El orden de los días siempre es el real; lo único que se sortea en cada vuelta es la realización del día.
@@ -270,7 +272,7 @@ El orden de los días siempre es el real; lo único que se sortea en cada vuelta
 
 **Ejemplo.** El episodio 1,050 sortea hub 20, día real 15 y δ = +1.5%.
 
-1. **Día real 15, hub 20.** En la lane 20→47 salen 11 cargas; los niveles de precio salen de los cuantiles del día 15, multiplicados por e^0.015. En la lane 20→63 no hay cargas en esta realización. El agente cotiza 20→47 en el nivel u = 0.6. El competidor sorteado está en u_comp = 0.45, así que pierde: se queda en el hub 20, pierde 15 minutos y cotiza otra lane. Gana la segunda cotización y viaja.
+1. **Día real 15, hub 20.** En la lane 20→47 salen 11 cargas; los niveles de precio salen de los cuantiles del día 15, multiplicados por e^0.015. En la lane 20→63 no hay cargas en esta realización. El agente cotiza 20→47 en el nivel u = 0.6. El competidor de la primera carga está en u_comp = 0.45, así que pierde: se queda en el hub 20, pierde 15 minutos y cotiza de nuevo, en la misma lane (con otra de sus 11 cargas y otro competidor) o en otra. Gana la segunda cotización y viaja.
 2. **Día real 16, hub de llegada.** Los precios salen de los cuantiles del día 16, con el mismo δ = +1.5%. El agente decide otra vez.
 3. **Días reales 17, 18, …** continúan igual hasta completar el horizonte H.
 
@@ -291,6 +293,8 @@ Para una muestra de días y lanes de entrenamiento (con lanes de volumen alto, m
 | Nivel de precios | Distribución de δ frente a la de ΔF_t real | Tienen la misma escala |
 
 La tolerancia de cada prueba se fija antes de correrla y se reporta en la tesis junto con los resultados.
+
+**Dónde está hecha.** `validar_generador_datos.py` corre estas pruebas con las 37,442 lanes y deja el informe en `validacion_generador_datos.md` (tablas y figuras en `results/market_validation/validacion_metodologia/`). Cubre las cargas (Kolmogorov-Smirnov por lane, con jun–sep y octubre por separado, más errores de media, desviación y fracción de días sin cargas), los precios (media sorteada frente a media real) y la normalidad de δ. **No cubre** la coherencia del L/T ni la competencia: u_comp y κ no tienen datos reales con los que compararse, y su efecto se evalúa con la sensibilidad a κ de `validate_pricing.py`.
 
 ## Referencias
 

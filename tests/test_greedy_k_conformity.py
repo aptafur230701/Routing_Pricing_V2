@@ -19,7 +19,7 @@ from config import DEVICE, K_LEVELS, REWARD_SCALE_FACTOR, TIME_VIOLATION_PENALTY
 from model.agent import AMRoutingAgent
 from greedy_rollout import greedy_rollout
 from problem_data import lane_reward
-from baselines.politicas import EvEsperado
+from market_process import EstadisticasLane
 from routing_env import VectorRoutingEnv
 from pricing import U_NIVELES_ARR
 from mercado_sintetico import MercadoSintetico
@@ -44,11 +44,11 @@ def synthetic():
         precio_base=precio_base,
         mercado=MercadoSintetico(loads, precio_base, m=2.0, u_min=0.15),   # p10 gana siempre aquí
         ltr_stack=np.ones((N, 3), dtype=np.float32) * 10.0,
-        ev_esperado=EvEsperado(                                                    # features de continuación
-            ev=np.random.RandomState(0).uniform(-50, 200, size=(7, N, N)),
-            q=np.random.RandomState(2).uniform(0, 50, size=(6, 7, N, N)), b=np.linspace(1.0, 0.5, 6),
-            ev_casa=np.random.RandomState(3).uniform(-50, 200, size=(7, N, N)),
-            q_casa=np.random.RandomState(4).uniform(0, 50, size=(6, 7, N, N))),
+        est_lane=EstadisticasLane(                                                 # features de continuación
+            L=np.random.RandomState(0).uniform(0, 30, size=(7, N, N)),
+            P1=np.random.RandomState(2).uniform(0, 1, size=(7, N, N)),
+            G=np.random.RandomState(3).uniform(-50, 200, size=(7, N, N)),
+            M=np.random.RandomState(4).uniform(1, 5, size=(7, N))),
     )
 
 
@@ -75,7 +75,7 @@ def _run(agent, env, synthetic, k_max):
         synthetic["ltr_stack"],
         reward_global_p95=1.0, num_nodes=N,
         k_max_arr=[k_max] * N, max_duration=MAX_DURATION_SYN,
-        world_seeds=np.arange(N) + 100, ev_esperado=synthetic["ev_esperado"],
+        world_seeds=np.arange(N) + 100, est_lane=synthetic["est_lane"],
     )
 
 

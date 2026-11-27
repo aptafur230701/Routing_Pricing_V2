@@ -62,7 +62,7 @@ from fit_market_process import main as _ajustar
 from pricing import (
     interp_cuantiles as _interp_cuantiles,      # alias: validate_market_process lo importa con este nombre
     PCT_CUANTILES as _PCT,
-    competidores_efectivos, percentil_competidor, precios_niveles,
+    competidores_efectivos, indice_nivel, lane_cost_row, percentil_competidor, precios_niveles,
 )
 from problem_data import cargar_dias_mercado
 
@@ -101,6 +101,26 @@ class Tablero:
     def apilar(tableros) -> "Tablero":
         return Tablero(*(np.stack([getattr(t, c) for t in tableros])
                          for c in ("loads", "precios", "u_comp", "precio_competidor", "m", "tarifa")))
+
+
+@dataclass(frozen=True, eq=False)
+class EstadisticasLane:
+    """Media del generador por día de la semana y lane (entrada de las features de continuación del DRL).
+
+    Todo sale de los días de ENTRENAMIENTO y de las mismas piezas que usa el generador (la media `m` de las
+    cargas, la binomial negativa / Poisson, los cuantiles de la lane y el LTR del hub), así que es lo que el
+    agente "sabe" del mercado promedio de cada día de la semana: la misma media que promedia la DP de B3
+    (`tablero_sin_memoria`), sin usar el día real ni el índice.
+
+      L  (7, N, N)  cargas publicadas esperadas de la lane j→l (media de m)
+      P1 (7, N, N)  P(al menos una carga) con la distribución del generador
+      G  (7, N, N)  margen en USD de la lane con una carga al precio mediano: p50 · dist − costo
+      M  (7, N)     competidores efectivos m medios del hub de origen (con el κ de entrenamiento)
+    """
+    L:  np.ndarray
+    P1: np.ndarray
+    G:  np.ndarray
+    M:  np.ndarray
 
 
 class MarketProcess:
@@ -226,6 +246,31 @@ class MarketProcess:
         dia_p = self._dia_precio(int(dia), nodos)                                     # (N, N)
         return np.stack([self._q[c][dia_p, nodos[:, None], self._cols[None, :]] for c in _COLS_Q], axis=-1)
 
+    def estadisticas_dow(self, distance_arr, diesel_arr) -> EstadisticasLane:
+        """Estadísticas por día de la semana y lane de los días de ENTRENAMIENTO (ver `EstadisticasLane`).
+
+        Se calcula una vez por número de nodos. M usa COMPETENCIA_KAPPA de config (el κ con el que se entrena), no
+        `self.kappa`: el agente no conoce el κ del mundo, así que la sensibilidad a κ no cambia lo que sabe de antemano.
+        """
+        N = self.num_nodes
+        dist = np.asarray(distance_arr, dtype=np.float64)
+        costo = lane_cost_row(dist, np.asarray(diesel_arr, dtype=np.float64))
+        u50 = indice_nivel(0.5)
+        L, P1, G = (np.zeros((7, N, N)) for _ in range(3))
+        M = np.zeros((7, N))
+        r = self._r_lane                                                          # (N, N) dispersión de la binomial negativa
+        for k in range(7):
+            dias = self._dias_train_por_dow[k]
+            m = self._m_stack[dias]                                               # (D_k, N, N) media del generador
+            L[k] = m.mean(axis=0)
+            m_pos = np.maximum(m, 1e-12)
+            p0 = np.where(m < 1.0, np.exp(-m_pos), np.exp(-r * np.log1p(m_pos / r)))   # P(0 cargas): Poisson o NegBin
+            P1[k] = (1.0 - p0).mean(axis=0)
+            q_medio = np.mean([self.cuantiles_dia(int(d)) for d in dias], axis=0)       # (N, N, 6)
+            G[k] = precios_niveles(q_medio)[..., u50] * dist - costo
+            M[k] = competidores_efectivos(self.ltr_hub[dias], self.ltr_ref, COMPETENCIA_KAPPA).mean(axis=0)
+        return EstadisticasLane(L=L, P1=P1, G=G, M=M)
+
     def dias_train_por_dow(self, dow: int) -> np.ndarray:
         """Días de entrenamiento con ese día de la semana (de entre ellos sortea `tablero_sin_memoria`)."""
         return self._dias_train_por_dow[int(dow)]
@@ -275,6 +320,13 @@ class MarketProcess:
         valido = self._con_cargas[dia, nodos]                   # (B, N)
         cercano = self._dia_cercano[dia, nodos]                  # (B, N)
         return np.where(valido, dia, np.where(cercano >= 0, cercano, dia))
+
+    def _dia_precio_filas(self, dias: np.ndarray, nodos: np.ndarray) -> np.ndarray:
+        """(B, N) como `_dia_precio`, con un día y un nodo propios por fila (sin loop sobre B)."""
+        dias = np.asarray(dias, dtype=np.int64)
+        valido = self._con_cargas[dias, nodos]                  # (B, N)
+        cercano = self._dia_cercano[dias, nodos]                 # (B, N)
+        return np.where(valido, dias[:, None], np.where(cercano >= 0, cercano, dias[:, None]))
 
     def _sortear(self, nodos: np.ndarray, dias: np.ndarray, deltas: np.ndarray,
                  rng: np.random.Generator) -> tuple:
@@ -331,7 +383,7 @@ class MarketProcess:
         B, N = len(nodos), self.num_nodes
         loads = self.sortear_cargas(nodos, dias, rng)
 
-        dia_p = np.stack([self._dia_precio(int(dias[b]), nodos[b:b + 1])[0] for b in range(B)])  # (B,N)
+        dia_p = self._dia_precio_filas(dias, nodos)                                         # (B,N)
         nodos_col = nodos[:, None]
         cuantiles = np.stack([self._q[c][dia_p, nodos_col, self._cols[None, :]]
                               for c in _COLS_Q], axis=-1)                           # (B,N,6)
@@ -437,14 +489,23 @@ class MarketProcess:
         nodos    = np.asarray(nodos,    dtype=np.int64)
         dias     = np.asarray(dias,     dtype=np.int64)
         semillas = np.asarray(semillas, dtype=np.int64)
-        filas = []
-        for b in range(len(nodos)):
+        B, N, C = len(nodos), self.num_nodes, COTIZACIONES_MAX_POR_NODO
+        # Cada fila tiene su propio generador (determinista dada la terna), así que los sorteos se hacen fila
+        # por fila y en el mismo orden de siempre (cargas, U de la tarifa, U de las otras cargas); el resto,
+        # que es aritmética elemento a elemento, se arma de una vez para todo el lote.
+        loads = np.empty((B, N), dtype=np.int64)
+        u = np.empty((B, N, C))
+        deltas = np.empty(B)
+        for b in range(B):
             rng = np.random.Generator(np.random.PCG64([int(semillas[b]), int(nodos[b]), int(dias[b])]))
-            delta = self._delta(int(semillas[b]))
-            t = self._tablero(nodos[b:b + 1], dias[b:b + 1], np.array([delta]), rng)
-            filas.append(Tablero(*(getattr(t, c)[0] for c in
-                                   ("loads", "precios", "u_comp", "precio_competidor", "m", "tarifa"))))
-        return Tablero.apilar(filas)
+            deltas[b] = self._delta(int(semillas[b]))
+            loads[b] = self.sortear_cargas(nodos[b:b + 1], dias[b:b + 1], rng)[0]
+            u[b, :, 0] = rng.random(N)
+            u[b, :, 1:] = rng.random((N, C - 1))
+        dia_p = self._dia_precio_filas(dias, nodos)                                         # (B, N)
+        cuantiles = np.stack([self._q[c][dia_p, nodos[:, None], self._cols[None, :]]
+                              for c in _COLS_Q], axis=-1)                                  # (B, N, 6)
+        return self._armar_tablero(loads, cuantiles, u, deltas, nodos, dias)
 
     def mundo_cotizacion(self, semilla: int, num_dias: int, dia_inicial: int = 0) -> Tablero:
         """Como `sample_world`: Tablero con loads (D, N, N), precios (D, N, N, K), m (D, N), etc.
@@ -466,7 +527,7 @@ class MarketProcess:
         semillas = np.asarray(semillas, dtype=np.int64)
         B, N = len(nodos), self.num_nodes
         loads = self.count_loads[dias, nodos].astype(np.int64)                    # (B, N)
-        dia_p = np.stack([self._dia_precio(int(dias[b]), nodos[b:b + 1])[0] for b in range(B)])
+        dia_p = self._dia_precio_filas(dias, nodos)
         cuantiles = np.stack([self._q[c][dia_p, nodos[:, None], self._cols[None, :]] for c in _COLS_Q], axis=-1)
         u = np.stack([
             np.random.Generator(np.random.PCG64(

@@ -1,0 +1,6 @@
+L/T faltante (LT=0 con cargas): 56 casos de 29682 hub-días, llenados con el día válido más cercano del hub.
+Multi-day data  : 153 días totales (jun-oct 2026) | train=122 | eval=31
+REWARD_GLOBAL_P95: 1932.0000
+L/T faltante (LT=0 con cargas): 56 casos de 29682 hub-días, llenados con el día válido más cercano del hub.
+Checkpoint: checkpoints/replica/am_checkpoint_20nodes_best.pt
+UB-DP: calculando la tabla V (20 nodos, S=5000, dt=0.25 h, tope 24.0 h)...

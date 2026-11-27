@@ -22,7 +22,6 @@ import pytest
 import torch
 
 import am_training
-from baselines.politicas import calcular_ev_pronostico
 from config import AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, DEVICE, TRAIN_DAYS, K_MAX
 from greedy_rollout import construir_features, greedy_rollout
 from market_process import MarketProcess, asegurar_parametros
@@ -48,7 +47,7 @@ def datos():
     tm, rate, loads, dist, diesel, ltr, avail, p95 = load_matrices(NUM_NODES)
     mp = MarketProcess(NUM_NODES)
     return dict(tm=np.asarray(tm, dtype=float), rate=rate, loads=loads, dist=dist, diesel=diesel, ltr=ltr,
-                avail=avail, p95=p95, mp=mp, ev=calcular_ev_pronostico(mp, dist, diesel))
+                avail=avail, p95=p95, mp=mp, est=mp.estadisticas_dow(dist, diesel))
 
 
 def _agente(seed=0):
@@ -63,7 +62,7 @@ def _env(d):
 def _estado(d, agent, env):
     starts = np.arange(B) % NUM_NODES
     env.reset(starts, np.arange(B) % 20, world_seeds=SEMILLAS)
-    feats = construir_features(env, starts, d["tm"], d["dist"], d["ltr"], d["p95"], NUM_NODES, d["avail"], d["ev"])
+    feats = construir_features(env, starts, d["tm"], d["dist"], d["ltr"], d["p95"], NUM_NODES, d["avail"], d["est"])
     t = {k: torch.from_numpy(v).to(DEVICE) for k, v in feats.items()}
     emb, g = agent.encoder(t["node_feats"])
     cur = torch.as_tensor(env.current_node, dtype=torch.long, device=DEVICE)
@@ -162,7 +161,7 @@ def test_features_de_cotizacion(datos):
     np.testing.assert_array_equal(cot[..., 2] > 0, env.opciones_validas[..., :N_NIVELES].any(-1)
                                   & (np.arange(NUM_NODES)[None] != env.current_node[:, None]))
     assert feats["cot"].shape == (B, 2) and (feats["cot"] >= 0).all() and (feats["cot"] <= 1).all()
-    assert INDEX_COL == 10
+    assert INDEX_COL == 14
 
 
 @pytest.mark.skipif(not es_checkpoint_con_cotizacion(os.path.join(
@@ -175,7 +174,7 @@ def test_checkpoint_real_de_10_nodos_carga_y_rutea(datos):
     agent, _ = load_checkpoint_compatible(ruta, NUM_NODES, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, verbose=False)
     res = greedy_rollout(agent, _env(datos), np.arange(B) % NUM_NODES, np.arange(B) % 20, datos["tm"], datos["dist"],
                          datos["ltr"], datos["p95"], NUM_NODES, avail_expected_arr=datos["avail"],
-                         world_seeds=SEMILLAS, ev_esperado=datos["ev"])
+                         world_seeds=SEMILLAS, est_lane=datos["est"])
     assert res.valid.mean() >= 0.75          # un ciclo puede fallar en casa: ningún nivel gana con seguridad
 
 
@@ -190,7 +189,7 @@ def test_greedy_rollout(datos):
 
     res = greedy_rollout(_agente(), env, np.arange(B) % NUM_NODES, np.arange(B) % 20, datos["tm"], datos["dist"],
                          datos["ltr"], datos["p95"], NUM_NODES, k_max_arr=[K_MAX] * B,
-                         avail_expected_arr=datos["avail"], world_seeds=SEMILLAS, ev_esperado=datos["ev"],
+                         avail_expected_arr=datos["avail"], world_seeds=SEMILLAS, est_lane=datos["est"],
                          step_hook=hook)
     assert pasos_margen and all(o is not None for o in pasos_margen)
     assert (res.n_ganadas <= res.n_cotizaciones).all()
@@ -200,7 +199,7 @@ def test_greedy_rollout(datos):
     # Mismas semillas ⇒ misma competencia ⇒ mismo resultado
     res2 = greedy_rollout(_agente(), _env(datos), np.arange(B) % NUM_NODES, np.arange(B) % 20, datos["tm"],
                           datos["dist"], datos["ltr"], datos["p95"], NUM_NODES, k_max_arr=[K_MAX] * B,
-                          avail_expected_arr=datos["avail"], world_seeds=SEMILLAS, ev_esperado=datos["ev"])
+                          avail_expected_arr=datos["avail"], world_seeds=SEMILLAS, est_lane=datos["est"])
     np.testing.assert_array_equal(res.raw_reward, res2.raw_reward)
 
 
@@ -214,7 +213,7 @@ def test_smoke_de_entrenamiento(monkeypatch, datos, simulado):
     agent, _, rewards, _, log = am_training.run_am_training(
         d["tm"], d["rate"][:TRAIN_DAYS], d["loads"][:TRAIN_DAYS], d["dist"], d["diesel"], NUM_NODES,
         ltr_stack=d["ltr"], reward_global_p95=d["p95"], avail_expected_arr=d["avail"],
-        market_process=d["mp"] if simulado else None, ev_esperado=d["ev"],
+        market_process=d["mp"] if simulado else None, est_lane=d["est"],
     )
     assert len(log) == 2 and all(np.isfinite(e["reward"]) and np.isfinite(e["total_loss"]) for e in log)
     for e in log:

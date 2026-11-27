@@ -73,7 +73,6 @@ import torch
 
 import am_training
 import config
-from baselines.politicas import calcular_ev_pronostico
 from config import SEED, TRAIN_DAYS, set_seeds
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
@@ -186,7 +185,7 @@ def make_objective(num_nodes: int, updates_per_trial: int, data: dict, seeds: li
                     reward_global_p95=data["reward_global_p95"],
                     avail_expected_arr=data["avail_expected_arr"],
                     market_process=data["market_process"],
-                    ev_esperado=data["ev_esperado"],
+                    est_lane=data["est_lane"],
                     trial_callback=_cb,
                 )
                 del agent, critic
@@ -239,7 +238,7 @@ def run(num_nodes: int = HPO_NUM_NODES, n_trials: int = 50, updates_per_trial: i
         ltr_stack=ltr_stack, avail_expected_arr=avail_expected_arr,
         reward_global_p95=reward_global_p95,
         market_process=market_process,
-        ev_esperado=calcular_ev_pronostico(market_process, distance_arr, diesel_arr),
+        est_lane=market_process.estadisticas_dow(distance_arr, diesel_arr),
     )
 
     n_episodes_per_update = _BASELINE["PPO_N_EPISODES_PER_UPDATE"]

@@ -189,14 +189,13 @@ def _valor_cotizado_por_dow(market, distance_arr, diesel_arr, a_casa: bool = Fal
 
 def calcular_ev_esperado(market, distance_arr, diesel_arr) -> np.ndarray:
     """Valor esperado por lane y día de la semana, (7, N, N), con la cotización miope (ver
-    `_valor_cotizado_por_dow`). Es el valor que usa B2 para los arcos futuros y el que alimenta las
-    features de continuación del DRL; se calcula una vez por número de nodos."""
+    `_valor_cotizado_por_dow`). Es el valor que usa B2 para los arcos futuros; se calcula una vez por número de nodos."""
     return _valor_cotizado_por_dow(market, distance_arr, diesel_arr)[0]
 
 
 @dataclass(frozen=True)
 class EvEsperado:
-    """Valor esperado por lane con pronóstico del índice de mercado (tabla compartida por B2P y el encoder).
+    """Valor esperado por lane con pronóstico del índice de mercado (tabla de B2P).
 
     Para un arco j→l que sale de j un día de mercado `dow` de la semana, h días de mercado después de hoy:
 
@@ -359,7 +358,7 @@ class PoliticaB2P(PoliticaB2):
         E[r_jl | h] = P(N_jl ≥ 1) · (q̄_jl + b_h · índice_j) · dist_jl − c_jl
 
     es lineal en el índice, así que se precalculan las tablas por h y día de la semana
-    (`calcular_ev_pronostico`, compartida con las features de continuación del DRL):
+    (`calcular_ev_pronostico`):
     E0[dow] = ev de B2 (b = 0) y Q[h, dow] = b_h · P(N ≥ 1) · dist; por decisión, ev(h, dow) =
     E0[dow] + índice[:, None] · Q[h, dow] (N×N). Con b_h = 0 (índice cero) B2P coincide con B2.
 
@@ -374,7 +373,7 @@ class PoliticaB2P(PoliticaB2):
                  dt=UBDP_DT_HORAS):
         super().__init__(market, time_matrix, distance_arr, diesel_arr, max_duration, dt)
         self.f, self.rho = float(market.frac_var_lento), float(market.rho)
-        tabla = calcular_ev_pronostico(market, distance_arr, diesel_arr)                   # la misma que usa el encoder
+        tabla = calcular_ev_pronostico(market, distance_arr, diesel_arr)                   # tabla de B2P
         self._h_max = tabla.h_max
         self.b = tabla.b                                                                   # (H+1,)
         self._E0 = tabla.ev                                                                # b = 0
@@ -530,7 +529,9 @@ class PoliticaB3:
         return float(self.tabla.valor_continuacion(obs.dia_semana_salida, obs.casa, np.array([obs.nodo]),
                                                    np.array([t_w]), obs.k_restante)[0])
 
-    def actuar(self, obs: Observacion) -> int:
+    def _resolver(self, obs: Observacion) -> tuple:
+        """(acts, v_cot, e1, Q) de la decisión AHORA (r = 0): para cada destino factible `acts[x]`, el valor de la mejor
+        cotización v_cot[x] (la opción de precio que la alcanza es argmax Q[x]) y el de la mejor jugada sin carga e1[x]."""
         i, h = obs.nodo, obs.casa
         acts = np.flatnonzero(obs.mascara)
         k_sig = None if obs.k_restante is None else obs.k_restante - 1
@@ -565,9 +566,23 @@ class PoliticaB3:
             B = float(np.maximum(v_cot, e1).max(initial=-np.inf))
             if not np.isfinite(B):
                 B = PENALIZACION_USD                   # sin respaldo (solo en casa): el ciclo falla
+        return acts, v_cot, e1, Q
+
+    def actuar(self, obs: Observacion) -> int:
+        acts, v_cot, e1, Q = self._resolver(obs)
         x = int(np.argmax(np.maximum(v_cot, e1)))      # r = 0: ahora; argmax devuelve el primero ⇒ índice menor
         self._opcion = int(np.argmax(Q[x])) if v_cot[x] >= e1[x] else _VACIO
         return int(acts[x])
+
+    def precio_en(self, obs: Observacion, j: int) -> int:
+        """Opción de B3 para un destino FIJADO desde afuera (comparación "rutas del DRL + precio de la tabla"): con el mismo
+        máximo de `actuar` pero restringido a j. El valor de lo que pasa después de un rechazo (B_1) sigue siendo libre: se
+        puede cambiar de destino. Devuelve el nivel de precio que maximiza el valor, o VACÍO si gana la jugada sin carga."""
+        acts, v_cot, e1, Q = self._resolver(obs)
+        x = int(np.flatnonzero(acts == j)[0])
+        if not np.isfinite(max(v_cot[x], e1[x])):      # la tabla no ve jugada en j (no debería pasar con j de la máscara)
+            return cotizar_regla(obs, j, self._dist, self._diesel, "miope")
+        return int(np.argmax(Q[x])) if v_cot[x] >= e1[x] else _VACIO
 
     def cotizar(self, obs: Observacion, j: int) -> int:
         return self._opcion                            # la decidió `actuar` con el mismo máximo

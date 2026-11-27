@@ -11,9 +11,6 @@ baselines/datos/ubdp_tabla_*.no_tratable.json
 # Caché de baselines y cotas de la evaluación (se regenera)
 datos/cache_eval/
 
-# Pesos del modelo (se regeneran entrenando; checkpoints/am_checkpoint_*.pt)
-checkpoints/*.pt
-
 # Guiones del runner de experimentos
 slurm_job.sh
 *.sbatch

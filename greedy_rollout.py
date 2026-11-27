@@ -62,7 +62,7 @@ class GreedyResult:
 
 def construir_features(
     env, start_nodes, time_matrix_arr, distance_arr, ltr_stack, reward_global_p95, num_nodes,
-    avail_expected_arr=None, ev_esperado=None, max_duration=MAX_DURATION,
+    avail_expected_arr=None, est_lane=None, max_duration=MAX_DURATION,
 ) -> dict:
     """Entradas del agente (numpy) para el estado actual de cada fila de `env`.
 
@@ -83,7 +83,7 @@ def construir_features(
         reward_global_p95=reward_global_p95,
         avail_expected_arr=avail_expected_arr,
         reward_rows=env.reward_rows,
-        ev=ev_esperado, time_elapsed=env.time_elapsed, dow0=env.start_dow,
+        est=est_lane, time_elapsed=env.time_elapsed, dow0=env.start_dow,
         market_index=env.market_index, index_std=env.index_std,
         cotizacion_feats=cot_nodo,
     )
@@ -126,8 +126,8 @@ def greedy_rollout(
                                              # rollout muestreado hacen que ambos vean el mismo mundo
     max_duration:       float      = MAX_DURATION,
     device:             torch.device = None,   # dispositivo del agente (default: DEVICE de config)
-    ev_esperado:        np.ndarray = None,   # EvEsperado, calcular_ev_pronostico (baselines/politicas.py); obligatorio con
-                                             # USE_CONTINUATION_FEATURES (features de continuación f7–f10)
+    est_lane:           object     = None,   # EstadisticasLane (MarketProcess.estadisticas_dow); obligatorio con
+                                             # USE_CONTINUATION_FEATURES (features de continuación [6-13])
     step_hook:          callable   = None,   # fn(dict) invocada en cada paso ANTES de env.step, para inspeccionar la
                                              # decisión sin alterarla (p. ej. la ruta por arco en inference.py).
                                              # Claves: env, h_t (B, d_h), embeddings (B, N, d_h), masks (B, N),
@@ -168,7 +168,7 @@ def greedy_rollout(
                 cur_nodes = env.current_node.copy()
                 feats = construir_features(
                     env, start_nodes, time_matrix_arr, distance_arr, ltr_stack, reward_global_p95, num_nodes,
-                    avail_expected_arr, ev_esperado, max_duration,
+                    avail_expected_arr, est_lane, max_duration,
                 )
                 h_t, embeddings = contexto_agente(agent, feats, cur_nodes, device)
                 mask_t = torch.from_numpy(masks).to(device)

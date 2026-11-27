@@ -6,8 +6,8 @@ Libro de Excel con los resultados de la evaluación (baselines_drl_ruteo_estocas
                   IC95, diferencia pareada contra el DRL, gap contra UB-PI, millas cargadas y aceptación; mundos
                   simulados y replay (días reales desde TRAIN_DAYS, fuera de muestra); tiempos fuera de línea.
   · Comparación — la agrega stats_analysis.append_comparacion_to_excel (DRL − cada método, Wilcoxon + Holm).
-  · Rutas, Precios por arco — agregar_rutas_y_precios: cada ciclo del DRL con su ruta y el rango de precio de
-                  cada arco (evaluation.banda_precio sobre la cabeza de precio), y el rango típico por lane.
+  · Rutas y precios — agregar_rutas_y_precios: una fila por tramo de cada ciclo del DRL con sus millas y su rango
+                  de precio (evaluation.banda_precio sobre la cabeza de precio), más una fila de total por ciclo.
 Los datos por mundo van aparte en un CSV (guardar_mundos), no en el Excel.
 """
 
@@ -107,11 +107,14 @@ _COLS_RESUMEN = [
     ("Diferencia vs DRL (USD por ciclo)",   "dif_vs_drl_usd",      '+#,##0;-#,##0;"—"'),
     ("Distancia al máximo teórico (%)",     "gap_ub_pi_pct",       '0.0"%"'),
     ("Ciclos que no vuelven a tiempo (%)",  "violacion_pct",       '0.0"%"'),
+    ("Millas totales por ciclo",            "millas_totales_medias", "#,##0"),
     ("Millas con carga (%)",                "millas_cargadas_pct", '0.0"%"'),
     ("Ofertas aceptadas (%)",               "tasa_aceptacion_pct", '0.0"%"'),
     ("Esperas por ciclo",                   "esperas_por_ruta",    "0.00"),
     ("Viajes vacíos a otra ciudad por ciclo", "reposiciones_por_ruta", "0.00"),
     ("Cargas por debajo del costo (%)",     "cargas_bajo_be_pct",  '0.0"%"'),
+    ("Percentil de precio medio (u)",       "u_medio",             "0.00"),
+    ("Precio sobre la mediana (USD/mi)",    "usd_mi_sobre_mediana", '+0.00;-0.00;0.00'),
     ("Nota",                                "nota",                None),
 ]
 
@@ -124,7 +127,9 @@ _COMO_LEER = (
     "(con y sin carga); si el camión no vuelve a tiempo se descuentan 3,000 USD. Diferencia vs DRL = margen del método "
     "− margen del DRL en los mismos escenarios (negativa: el DRL gana más). IC 95%: intervalo de confianza del margen "
     "medio. Distancia al máximo teórico: cuánto margen le falta al método para llegar al máximo posible con "
-    "información perfecta. La hoja Comparación indica qué diferencias son estadísticamente significativas.")
+    "información perfecta. Percentil de precio medio: promedio del nivel (0.1 … 0.9) con que el método cotizó; más alto = "
+    "más caro. Precio sobre la mediana: precio cobrado − tarifa mediana publicada de la lane, promedio sobre las "
+    "cargas ganadas. Cargas por debajo del costo: ganadas a un precio menor que el costo por milla. La hoja Comparación indica qué diferencias son estadísticamente significativas.")
 
 _TITULO_REAL = "DÍAS REALES DE OCTUBRE 2026 (no se usaron para entrenar): resultado principal"
 _TITULO_SIM = "ESCENARIOS SIMULADOS (mercados generados con el modelo de mercado ajustado a los datos)"
@@ -179,7 +184,7 @@ def _build_summary(wb, sim_df, replay_df, summary_rows):
     row = 1
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=len(_COLS_RESUMEN))
     _data_cell(ws.cell(row, 1), _COMO_LEER)
-    ws.row_dimensions[row].height = 78
+    ws.row_dimensions[row].height = 110
     row += 2
 
     if replay_df is not None and not replay_df.empty:
@@ -222,20 +227,16 @@ _DIAS = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domin
 _ETIQUETA_REAL, _ETIQUETA_SIM = "Días reales", "Simulado"
 
 _COMO_LEER_RUTAS = (
-    "CÓMO LEER ESTA HOJA. Una fila por ciclo del DRL. Escenario: el caso de prueba, el mismo para todos los métodos. "
-    "En días reales, un camión con base en una ciudad que sale un día de octubre de 2026, con las cargas y tarifas "
-    "publicadas ese día; en simulado, un mercado completo generado por el modelo de mercado. Ruta: las ciudades en "
-    "orden, de la base a la base. Precios por arco (USD por milla): la referencia es el precio al que el DRL ganó la "
-    "carga, el mismo con que se calcula el margen del ciclo (Σ (referencia × millas − costo) de los tramos con carga "
-    "− costo de los tramos vacíos). El rango son los precios que el DRL consideraba casi igual de buenos en esa "
-    "decisión (los que juntan el 80% de su preferencia). Todos los precios son percentiles (p10 … p90) de las "
-    "tarifas publicadas ese día en esa ruta.")
-
-_COMO_LEER_ARCOS = (
-    "CÓMO LEER ESTA HOJA. Una fila por tramo (ciudad de origen - ciudad de destino) en el que el DRL ganó cargas. "
-    "Rango y referencia: promedio sobre las cargas ganadas, como en la hoja Rutas. Ofertas aceptadas: cargas ganadas "
-    "/ ofertas hechas en el tramo. Costo por milla: diésel + costo operativo (el precio mínimo para no perder "
-    "dinero). Tarifa mediana publicada: la de las tarifas publicadas ese día en el tramo.")
+    "CÓMO LEER ESTA HOJA. Una fila por tramo de cada ciclo del DRL, en el orden en que se recorre, con una fila de "
+    "total al cierre de cada ciclo. Escenario: el caso de prueba, el mismo para todos los métodos. En días reales, un "
+    "camión con base en una ciudad que sale un día de octubre de 2026, con las cargas y tarifas publicadas ese día; "
+    "en simulado, un mercado completo generado por el modelo de mercado. Precios (USD por milla): la referencia es el "
+    "precio al que el DRL ganó la carga, el mismo con que se calcula el margen del ciclo; el rango son los precios "
+    "que el DRL consideraba casi igual de buenos en esa decisión (los que juntan el 80% de su preferencia). Todos "
+    "los precios son percentiles (p10 … p90) de las tarifas publicadas ese día en esa ruta. Costo por milla: diésel "
+    "+ costo operativo (el precio mínimo para no perder dinero). Margen del tramo = ingreso − costo (con carga) o "
+    "− costo (vacío); el total del ciclo incluye, si no vuelve a tiempo, la penalización de 3,000 USD. "
+    "Ofertas perdidas: cotizaciones rechazadas en ese tramo antes de ganar la carga.")
 
 
 def _hubs(num_nodes: int) -> list:
@@ -271,71 +272,71 @@ def _tabla(ws, row, columnas, filas, color):
 
 
 def agregar_rutas_y_precios(excel_path: str, sim_df: pd.DataFrame, replay_df: pd.DataFrame = None) -> None:
-    """Agrega al Excel las hojas 'Rutas' (cada ciclo del DRL con su ruta y el rango de precio de cada arco) y
-    'Precios por arco' (el rango típico por lane). Requiere las columnas precios_por_arco y cotizaciones."""
+    """Agrega al Excel la hoja 'Rutas y precios': una fila por tramo recorrido de cada ciclo del DRL (con su rango
+    de precio, referencia, mediana, costo y millas) y una fila de total por ciclo. Requiere la columna `pasos`."""
     from openpyxl import load_workbook
     from config import FECHA_INICIO
     partes = [(_ETIQUETA_REAL, replay_df), (_ETIQUETA_SIM, sim_df)]
-    partes = [(n, _filas_drl(d)) for n, d in partes if d is not None and not d.empty and "precios_por_arco" in d]
+    partes = [(n, _filas_drl(d)) for n, d in partes if d is not None and not d.empty and "pasos" in d]
     if not partes:
         return
     N = int(max(max(r) for _, d in partes for r in d["ruta"] if len(r)) + 1)
     hubs = _hubs(N)
     wb = load_workbook(excel_path)
-
-    # ── Rutas ──
-    for nombre in ("Rutas", "Precios por arco"):
+    for nombre in ("Rutas", "Precios por arco", "Rutas y precios"):
         if nombre in wb.sheetnames:
             del wb[nombre]
-    ws = wb.create_sheet("Rutas")
-    ncol = 9
+    ws = wb.create_sheet("Rutas y precios")
+    cols = [("Datos", 13, None), ("Escenario", 10, "0"), ("Ciudad base", 9, "0"), ("Salida", 22, None),
+            ("Tramo", 9, None), ("Tipo", 11, None), ("Millas", 9, "#,##0"), ("Ofertas perdidas", 9, "0"),
+            ("Rango: desde (USD/mi)", 10, "0.00"), ("Rango: hasta (USD/mi)", 10, "0.00"),
+            ("Referencia (USD/mi)", 10, "0.00"), ("Tarifa mediana publicada (USD/mi)", 12, "0.00"),
+            ("Costo por milla (USD/mi)", 10, "0.00"), ("Margen del tramo (USD)", 12, "#,##0;-#,##0;0"),
+            ("¿Volvió a tiempo?", 10, None)]
+    ncol = len(cols)
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncol)
     _data_cell(ws.cell(1, 1), _COMO_LEER_RUTAS)
-    ws.row_dimensions[1].height = 92
+    ws.row_dimensions[1].height = 120
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=ncol)
     _data_cell(ws.cell(2, 1), "Ciudades (nodos): " + " · ".join(f"{n} = hub {h}" for n, h in enumerate(hubs)))
     row = 4
-    cols = [("Datos", 13, None), ("Escenario", 11, "0"), ("Ciudad base", 9, "0"), ("Salida", 22, None),
-            ("Ruta", 16, None), ("Precios por arco (USD por milla)", 50, None), ("Cargas", 8, "0"),
-            ("Margen del ciclo (USD)", 13, "#,##0"), ("¿Volvió a tiempo?", 11, None)]
-    filas = []
+    for c, (titulo, ancho, _) in enumerate(cols, 1):
+        _header_cell(ws.cell(row, c), titulo, _BLUE_DARK)
+        ws.column_dimensions[get_column_letter(c)].width = ancho
+    ws.freeze_panes = ws.cell(row + 1, 1)
+    row += 1
     for nombre, d in partes:
         for _, r in d.sort_values("mundo").iterrows():
             dia = _DIAS[int(r["dia_semana"])]
             salida = (f"{dia} {(np.datetime64(FECHA_INICIO) + int(r['dia_abs'])).astype(str)}"
                       if nombre == _ETIQUETA_REAL else dia)
+            perdidas = {}
+            for p in r["pasos"]:
+                tramo = (p["desde"], p["hacia"])
+                if p["accion"] == "cotiza y pierde":
+                    perdidas[tramo] = perdidas.get(tramo, 0) + 1
+                    continue
+                if p["accion"] == "espera":
+                    continue
+                gana = p["accion"] == "cotiza y gana"
+                rg = p.get("rango") or {}
+                valores = (nombre, r["mundo"], r["nodo_inicio"], salida, f"{p['desde']}-{p['hacia']}",
+                           "Con carga" if gana else "Vacío", p["millas"], perdidas.pop(tramo, 0) if gana else None,
+                           rg.get("piso"), rg.get("tope"),
+                           rg.get("referencia", p["precio_cotizado_usd_mi"] if gana else None),
+                           p["mediana_usd_mi"] if gana else None, rg.get("break_even"), p["reward_usd"], None)
+                for c, ((_, _, fmt), v) in enumerate(zip(cols, valores), 1):
+                    _data_cell(ws.cell(row, c), _clean(v) if not isinstance(v, str) else v, fmt)
+                row += 1
             ruta = "-".join(str(n) for n in r["ruta"]) if len(r["ruta"]) > 1 else "no sale"
-            filas.append((nombre, r["mundo"], r["nodo_inicio"], salida, ruta, r["precios_por_arco"] or "—",
-                          r["n_cargas"], r["margen"], "no" if r["violacion"] else "sí"))
-    _tabla(ws, row, cols, filas, _BLUE_DARK)
-    ws.freeze_panes = ws.cell(row + 1, 1)
-
-    # ── Precios por arco ──
-    ws = wb.create_sheet("Precios por arco")
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=11)
-    _data_cell(ws.cell(1, 1), _COMO_LEER_ARCOS)
-    ws.row_dimensions[1].height = 45
-    cols = [("Datos", 13, None), ("Tramo", 9, None), ("Cargas ganadas", 10, "0"), ("Ofertas hechas", 10, "0"),
-            ("Ofertas aceptadas (%)", 11, '0"%"'), ("Rango: desde (USD/mi)", 11, "0.00"),
-            ("Rango: hasta (USD/mi)", 11, "0.00"), ("Referencia (USD/mi)", 11, "0.00"),
-            ("Tarifa mediana publicada (USD/mi)", 13, "0.00"), ("Costo por milla (USD/mi)", 11, "0.00"),
-            ("Referencia − costo (USD/mi)", 12, "+0.00;-0.00;0.00")]
-    filas = []
-    for nombre, d in partes:
-        e = pd.DataFrame([x for lista in d["cotizaciones"] for x in lista])
-        if e.empty:
-            continue
-        n_cot = e.groupby(["desde", "hacia"]).size()
-        g = e[e["gano"]].groupby(["desde", "hacia"])
-        t = pd.DataFrame({
-            "n": g.size(), "piso": g["piso"].mean(), "tope": g["tope"].mean(), "ref": g["referencia"].mean(),
-            "mediana": g["mediana"].mean(), "be": g["break_even"].mean(),
-        }).sort_values("n", ascending=False)
-        for (i, j), r in t.iterrows():
-            filas.append((nombre, f"{i}-{j}", r["n"], n_cot[(i, j)], 100 * r["n"] / n_cot[(i, j)], r["piso"],
-                          r["tope"], r["ref"], r["mediana"], r["be"], r["ref"] - r["be"]))
-    _tabla(ws, 3, cols, filas, _GREEN_DARK)
-    ws.freeze_panes = ws.cell(4, 1)
+            total = (nombre, r["mundo"], r["nodo_inicio"], salida, f"Ciclo {ruta}", f"{r['n_cargas']} cargas",
+                     r["millas_totales"], None, None, None, None, None, None, r["margen"],
+                     "no" if r["violacion"] else "sí")
+            for c, ((_, _, fmt), v) in enumerate(zip(cols, total), 1):
+                cel = ws.cell(row, c)
+                _data_cell(cel, _clean(v) if not isinstance(v, str) else v, fmt, fill_hex=_BLUE_LIGHT)
+                cel.font = _font(bold=True)
+            row += 1
     wb.save(excel_path)
 
 
@@ -379,8 +380,14 @@ def escribir_comparacion(excel_path: str, pareada: pd.DataFrame) -> None:
         otro = str(r["comparacion"]).split(" − ", 1)[-1]
         nombre = NOMBRE.get(otro, otro) + (f" (máx. {r['K']} tramos)" if varios_k else "")
         signif = bool(r[sig[0]]) if sig else False
-        conclusion = ("Sin diferencia significativa" if not signif else
-                      "El DRL gana más" if r["dif_media_usd"] > 0 else "El DRL gana menos")
+        # La prueba (Wilcoxon, una cola) solo detecta que el DRL gana; si el IC bootstrap queda
+        # entero por debajo de 0, el método de comparación es mejor aunque p ≈ 1.
+        if signif:
+            conclusion = "El DRL gana más" if r["dif_media_usd"] > 0 else "El DRL gana menos"
+        elif r["ic95_sup"] < 0:
+            conclusion = "El DRL gana menos (el IC 95% queda por debajo de 0)"
+        else:
+            conclusion = "Sin diferencia significativa"
         filas.append((_ETIQUETA_REAL if r["_real"] else _ETIQUETA_SIM, _PREGUNTA.get(r["familia"], r["familia"]),
                       nombre, r["n_mundos"], r["dif_media_usd"], r["ic95_inf"], r["ic95_sup"], r["p_holm"],
                       conclusion))

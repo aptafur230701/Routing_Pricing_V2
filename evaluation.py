@@ -150,7 +150,7 @@ def rollout_drl_env(
     avail_expected_arr: np.ndarray = None,
     world_seed:     int        = None,
     device:         torch.device = None,
-    ev_esperado:    np.ndarray = None,   # EvEsperado, calcular_ev_pronostico; obligatorio con USE_CONTINUATION_FEATURES
+    est_lane:       object = None,       # EstadisticasLane (MarketProcess.estadisticas_dow); obligatorio con USE_CONTINUATION_FEATURES
 ) -> tuple:
     """Una ruta del agente: paso a paso en el entorno, argmax de destino y de precio en cada nodo.
 
@@ -167,7 +167,7 @@ def rollout_drl_env(
         avail_expected_arr=avail_expected_arr,
         world_seeds=None if world_seed is None else np.array([world_seed], dtype=np.int64),
         device=device,
-        ev_esperado=ev_esperado,
+        est_lane=est_lane,
     )
     if not res.valid[0]:
         return None, -np.inf, np.inf
@@ -182,8 +182,10 @@ class PoliticaDRL:
     (las mismas features que en el entrenamiento)."""
 
     def __init__(self, ctx, env, precio: str = "drl"):
-        if precio != "drl" and precio not in REGLAS_PRECIO:
+        if precio not in ("drl", "dp") and precio not in REGLAS_PRECIO:
             raise ValueError(f"precio desconocido: {precio!r}")
+        if precio == "dp" and "B3" not in ctx.politicas:
+            raise ValueError('precio="dp" necesita la tabla de UB-DP (B3); a este tamaño no se calculó')
         self.ctx, self.env, self.precio = ctx, env, precio
         self.nombre = "DRL" if precio == "drl" else f"DRL-dest+{precio}"
         self._opcion = None
@@ -191,7 +193,7 @@ class PoliticaDRL:
     def actuar(self, obs) -> int:
         c, env = self.ctx, self.env
         with torch.no_grad():
-            feats = construir_features(env, env.start_node, c.T, c.dist, c.ltr, c.p95, c.N, c.avail, c.ev)
+            feats = construir_features(env, env.start_node, c.T, c.dist, c.ltr, c.p95, c.N, c.avail, c.est)
             h_t, emb = contexto_agente(c.agent_cpu, feats, env.current_node, torch.device("cpu"))
             mask_t = torch.from_numpy(np.asarray(obs.mascara, dtype=np.int8)[None])
             op_t = torch.from_numpy(feats["opciones"])
@@ -206,6 +208,8 @@ class PoliticaDRL:
     def cotizar(self, obs, j: int) -> int:
         if self.precio == "drl":
             return self._opcion
+        if self.precio == "dp":                       # el precio que daría la tabla de B3 en el destino del DRL
+            return self.ctx.politicas["B3"].precio_en(obs, j)
         return cotizar_regla(obs, j, self.ctx.dist, self.ctx.diesel, self.precio)
 
 
@@ -286,7 +290,7 @@ def ejecutar_politica(politica, env, start_node, start_day_idx, k_max, world_see
         if con_rango and o < N_NIVELES and a != i:
             lo, hi = banda_precio(politica.probs_precio, o)
             banda = obs.precios[a, lo:hi + 1]
-            rango = dict(desde=i, hacia=a, piso=float(banda.min()), tope=float(banda.max()),
+            rango = dict(desde=i, hacia=a, millas=float(distance_arr[i, a]), piso=float(banda.min()), tope=float(banda.max()),
                          referencia=float(obs.precios[a, o]), nivel=int(o), nivel_piso=lo, nivel_tope=hi,
                          break_even=float(env.cost_rows[0, a] / distance_arr[i, a]),
                          mediana=float(obs.rate_row[a]), gano=False)
@@ -345,6 +349,8 @@ def ejecutar_politica(politica, env, start_node, start_day_idx, k_max, world_see
         margen=margen,
         violacion=not cerro,
         frac_millas_cargadas=millas_carg / millas_tot if millas_tot > 0 else float("nan"),
+        millas_totales=millas_tot,
+        millas_cargadas=millas_carg,
         n_cargas=n_cargas,
         duracion=float(env.time_elapsed[0]),
         ms_decision=1000.0 * t_dec / n_dec if n_dec else float("nan"),
@@ -422,7 +428,8 @@ class ContextoEval:
         self.dist, self.diesel, self.N = distance_arr, diesel_arr, num_nodes
         self.ltr = ltr_stack
         self.avail, self.p95 = avail_expected_arr, reward_global_p95
-        self.ev = calcular_ev_pronostico(market, distance_arr, diesel_arr)   # una vez por evaluación
+        self.est = market.estadisticas_dow(distance_arr, diesel_arr)            # entrada del DRL, una vez por evaluación
+        self.ev = calcular_ev_pronostico(market, distance_arr, diesel_arr)   # la tabla de B2/B2P (solo entra a la huella del caché)
         self.politicas = {
             "B1": PoliticaB1(distance_arr, diesel_arr),
             "B2": PoliticaB2(market, self.T, distance_arr, diesel_arr),
@@ -431,6 +438,11 @@ class ContextoEval:
         if tabla is not None:                      # None: UB-DP "no tratable" ⇒ sin B3
             self.politicas["B3"] = PoliticaB3(tabla, distance_arr, diesel_arr)
         self.baselines = tuple(b for b in _BASELINES if b in self.politicas)
+
+    def politica_dp(self, env):
+        """Diagnóstico (fuera de la comparación B): las rutas del DRL con el precio óptimo de la tabla de B3. None si la
+        tabla no existe a este tamaño. Mide cuánto margen de mejora le queda al precio del DRL, a ruta fija."""
+        return PoliticaDRL(self, env, "dp") if "B3" in self.politicas else None
 
     def politicas_drl(self, env) -> dict:
         """DRL completo y destino del DRL con cada regla de precio (comparación B), sobre `env`."""
@@ -513,7 +525,7 @@ def disenar_mundos(num_nodes: int, M: int, market, num_dias: int = TRAIN_DAYS,
                 start_day=inicio, world_seed=semillas)
 
 
-_COLS_METRICAS = ("margen", "violacion", "frac_millas_cargadas", "n_cargas", "duracion", "ms_decision", "ruta",
+_COLS_METRICAS = ("margen", "violacion", "frac_millas_cargadas", "millas_totales", "millas_cargadas", "n_cargas", "duracion", "ms_decision", "ruta",
                   "ruta_precios", "precios_por_arco", "cotizaciones", "pasos", "n_cotizaciones", "n_ganadas", "horas_rechazo", "niveles", "usd_mi_sobre_mediana",
                   "dinero_en_la_mesa", "n_esperas", "horas_espera", "n_reposiciones", "n_bajo_be", "usd_bajo_be")
 
@@ -544,7 +556,7 @@ def _firma_cache(ctx, *partes) -> str:
         h.update(np.ascontiguousarray(ctx.tabla.V_k).tobytes())
         h.update(np.ascontiguousarray(ctx.tabla.V_libre).tobytes())
     h.update(repr((partes, MAX_DURATION, REGLA_PRECIO_BASELINES, "cotizacion", "pasos por arco",
-                   "esperar-reposicionar", "perder cuesta", "fallas penalizadas", "varias cargas, vuelta, dias de salida", COTIZACIONES_MAX_POR_NODO, PENALIZACION_USD, REPOSICION_MAX_MILLAS, tuple(U_NIVELES_ARR))).encode())
+                   "esperar-reposicionar", "perder cuesta", "fallas penalizadas", "varias cargas, vuelta, dias de salida", "millas totales", COTIZACIONES_MAX_POR_NODO, PENALIZACION_USD, REPOSICION_MAX_MILLAS, tuple(U_NIVELES_ARR))).encode())
     return h.hexdigest()
 
 
@@ -824,6 +836,7 @@ def resumen_metodos(df: pd.DataFrame) -> pd.DataFrame:
                 "gap_ub_pi_pct": gap_pct(gm["ub_pi"], gm["margen"]),
                 "violacion_pct": 100.0 * gm["violacion"].mean(),
                 "millas_cargadas_pct": 100.0 * gm["frac_millas_cargadas"].mean(),
+                "millas_totales_medias": gm["millas_totales"].mean(),
                 "cargas_medias": gm["n_cargas"].mean(),
                 "duracion_media_h": gm["duracion"].mean(),
                 "ms_por_decision": gm["ms_decision"].mean(),

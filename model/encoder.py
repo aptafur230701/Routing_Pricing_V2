@@ -27,40 +27,40 @@ Features por nodo j (desde la posición actual del camión):
                       probabilidad de existencia; es puramente descriptivo.
   [5] reward_abs    — reward crudo / REWARD_GLOBAL_P95, clipeado a [0, 1]; 0 si negativo
 
-Features de continuación (solo con USE_CONTINUATION_FEATURES; i = nodo actual, h = casa,
-t = tiempo transcurrido, ev = calcular_ev_pronostico(...) de baselines/politicas.py, la misma tabla de B2P):
-  [6]  home_time    — T[j, h] / MAX_DURATION (tiempo de j a casa)
-  [7]  slack_after  — clip((MAX − (t + T[i,j]) − T[j,h]) / MAX, 0, 1) (holgura después de j)
-  [8]  ev_home      — clip(ev_casa[dow_j, j, h] / p95, −1, 1): valor esperado de volver a casa desde j (si se
-                      pierde la carga se vuelve vacío: EvEsperado.ev_casa)
-  [9]  ev_2hop      — clip(max(ev_casa[dow_j,j,h], max_l ev[dow_j,j,l] + ev_casa[dow_l,l,h]) / p95, −1, 1):
-                      continuación esperada a 2 saltos, l ∉ {i, j, h} y con retorno factible
-  Con dow_j = (dow0 + (t + T[i,j]) // 14) % 7. Para j == h, f6 = f8 = f9 = 0 y f7 es la holgura del retorno
-  directo. La fila j == i es la ESPERA (routing_env): su "arco" termina en fin_espera(t), el siguiente día de
-  mercado, así que [1] son las horas de espera y [6-9] la continuación desde i mañana (en casa antes de salir,
-  [7] es la holgura después de esperar y [6], [8], [9] valen 0). Su reward [0] es 0.
-  Los valores esperados son los AJUSTADOS por el estado del mercado (los mismos de B2P): para un arco
-  o→d que sale el día de mercado `dia`, ev_aj = ev[dow, o, d] + índice(o, hoy) · q[h, dow, o, d], con
-  h = días de mercado entre hoy y esa salida (q[h] = b_h · P(N ≥ 1) · dist, b_h = f + (1 − f) ρ^h). Con
-  índice cero valen exactamente lo de siempre (ev sin índice).
+Features de continuación (solo con USE_CONTINUATION_FEATURES; i = nodo actual, h = casa, t = tiempo transcurrido,
+est = EstadisticasLane de market_process.py: la media del generador por día de la semana, de los días de ENTRENAMIENTO).
+Con t_j = llegada a j y dow_j = (dow0 + t_j // 14) % 7. Son datos del mercado, no la salida de ningún baseline: la red
+combina sola estas estadísticas en una continuación.
+  [6]  home_time     — T[j, h] / MAX_DURATION (tiempo de j a casa)
+  [7]  slack_after   — clip((MAX − t_j − T[j,h]) / MAX, 0, 1) (holgura después de j)
+  [8]  ret_margin    — clip(G[dow_j, j, h] / p95, −1, 1): margen de la lane de regreso j→casa al precio mediano
+  [9]  ret_loads     — min(L[dow_j, j, h], CLIP) / CLIP: cargas esperadas de esa lane
+  [10] out_best      — clip(max_{l ∈ F_j} P1·G / p95, −1, 1): valor de la mejor lane que sale de j
+  [11] out_loads     — media de min(L, CLIP) / CLIP sobre las lanes salientes factibles
+  [12] out_factible  — |F_j| / N: qué fracción de las lanes que salen de j se pueden usar con el tiempo que queda
+  [13] m_j           — log(M[dow_j, j]) / log(M_MAX): competencia media en j ese día de la semana
+  F_j = {l ∉ {i, j, h}: t_j + T[j,l] + T[l,h] ≤ MAX} (hay tiempo de ir de j a l y volver a casa). Para j == h (el ciclo
+  termina) [8]-[13] valen 0, salvo la espera en casa antes de salir (j == i == h), que sí lleva las salientes [10]-[13].
+  La fila j == i es la ESPERA (routing_env): su "arco" termina en fin_espera(t), el siguiente día de mercado, así que
+  [1] son las horas de espera y [6-13] describen i mañana. Su reward [0] es 0.
 
-Índice de mercado (columna INDEX_COL: [10] con continuación, [6] sin ella):
-  [10] market_index — índice(j, día actual) / desviación del índice histórico (una sola para todos los
+Índice de mercado (columna INDEX_COL: [14] con continuación, [6] sin ella):
+  [14] market_index — índice(j, día actual) / desviación del índice histórico (una sola para todos los
                       nodos, calculada en el ajuste). Estado del mercado de salida del nodo j neto del
                       nivel nacional, en desviaciones estándar (market_process.py).
 
 Cotización conjunta (especificacion_fase0_ruteo_pricing.md §4.4; las ÚLTIMAS N_COT_FEATURES columnas, en cero
 fuera del modo cotización). Van al final para que los checkpoints anteriores se carguen con esas columnas en
 cero (transfer_learning._reconcile_state_dict copia las columnas viejas en las primeras posiciones):
-  [11] dispersion   — (p_0.8 − p_0.2) / p_0.5 de la lane i→j, recortada a [0, 1]
-  [12] break_even   — costo / (dist · p_0.5): qué tan cerca está el mínimo rentable de la mediana, en [0, 2] / 2
-  [13] intentos     — cargas de la lane i→j que se pueden cotizar todavía en esta visita / COTIZACIONES_MAX_POR_NODO
+  [15] dispersion   — (p_0.8 − p_0.2) / p_0.5 de la lane i→j, recortada a [0, 1]
+  [16] break_even   — costo / (dist · p_0.5): qué tan cerca está el mínimo rentable de la mediana, en [0, 2] / 2
+  [17] intentos     — cargas de la lane i→j que se pueden cotizar todavía en esta visita / COTIZACIONES_MAX_POR_NODO
                       (> 0 si y solo si se puede cotizar)
-  [14 … 13+K]       — v_k = P_k·(p_k·d − c) / p95: valor esperado de cotizar cada nivel, recortado a [−1, 1]
-  [14+K … 13+2K]    — P_k = (1 − u_k)^m: probabilidad de ganar con cada nivel
-  [14+2K]           — valor de la lane con todos sus intentos (pricing.valor_reintentos) si perderlos vale 0, / p95
-  [15+2K]           — lo mismo si perderlos es recorrer la lane vacía (la vuelta): base −c
-  Las de [14] en adelante son 0 si la lane no se puede cotizar. Las columnas de cotización entran también a la
+  [18 … 17+K]       — v_k = P_k·(p_k·d − c) / p95: valor esperado de cotizar cada nivel, recortado a [−1, 1]
+  [18+K … 17+2K]    — P_k = (1 − u_k)^m: probabilidad de ganar con cada nivel
+  [18+2K]           — valor de la lane con todos sus intentos (pricing.valor_reintentos) si perderlos vale 0, / p95
+  [19+2K]           — lo mismo si perderlos es recorrer la lane vacía (la vuelta): base −c
+  Las de [18] en adelante son 0 si la lane no se puede cotizar. Las columnas de cotización entran también a la
   cabeza de precio (model/decoder.PriceHead), que así ve el valor de cada nivel y no solo el embedding.
   Las features [0] y [5] ya son, en ese modo, el margen si se cobrara la mediana (env.reward_rows).
 
@@ -88,7 +88,7 @@ from routing_env import fin_espera
 
 # Número de features por nodo — debe coincidir con build_node_features()
 N_BASE_NODE_FEATURES  = 6
-N_CONT_FEATURES       = 4
+N_CONT_FEATURES       = 8   # home_time, slack_after + 6 estadísticas de las lanes que salen de j
 N_INDEX_FEATURES      = 1   # índice de mercado (columna INDEX_COL)
 N_COT_FEATURES        = 3 + 2 * N_NIVELES + 2   # cotización conjunta: las últimas columnas
 COT_V = slice(3, 3 + N_NIVELES)                              # dentro de las de cotización: v_k
@@ -114,7 +114,7 @@ N_DOW_FEATURES = 7
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Features de continuación (f7–f10)
+# Features de continuación
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_continuation_features_batch(
@@ -123,20 +123,14 @@ def build_continuation_features_batch(
     time_elapsed:      np.ndarray,   # (B,) horas transcurridas t
     dow0:              np.ndarray,   # (B,) día de la semana (lunes = 0) del día de salida
     time_matrix_arr:   np.ndarray,   # (N, N) T
-    ev,                              # EvEsperado (baselines.calcular_ev_pronostico): ev (7, N, N), q (H+1, 7, N, N)
+    est,                             # EstadisticasLane (market_process.MarketProcess.estadisticas_dow)
     max_duration:      float,
     reward_global_p95: float,
-    market_index:      np.ndarray,   # (B, N) índice de mercado de todos los nodos hoy (env.market_index)
-) -> np.ndarray:                     # (B, N, 4) float32: f7, f8, f9, f10
+) -> np.ndarray:                     # (B, N, N_CONT_FEATURES) float32
     """Features de continuación por nodo j (ver docstring del módulo), sin loops sobre B ni N.
 
-    El valor esperado de cada arco es el ajustado por el estado del mercado, el mismo de B2P:
-
-        ev_aj(arco o→d, salida el día de mercado `dia`) = ev[dow, o, d] + índice(o, hoy) · q[h, dow, o, d]
-
-    con dow = (dow0 + dia) % 7 y h = días de mercado entre hoy y la salida del arco, h = clip(dia − hoy, 0, H),
-    dia = int(t_salida // 14) y hoy = int(t // 14). Con índice cero es exactamente `ev`.
-    f10 se calcula con un tensor (B, N, N) indexado por (episodio, j, l).
+    Las 6 últimas son estadísticas (por día de la semana de llegada a j) de las lanes que SALEN de j: la red no ve
+    esas lanes en ninguna otra entrada, porque sus features describen solo las lanes que salen del nodo actual i.
     """
     N    = np.asarray(time_matrix_arr).shape[0]
     T    = np.asarray(time_matrix_arr, dtype=np.float64)
@@ -144,11 +138,9 @@ def build_continuation_features_batch(
     h    = np.asarray(start_node, dtype=np.int64)
     t    = np.asarray(time_elapsed, dtype=np.float64)
     dow0 = np.asarray(dow0, dtype=np.int64)
-    idx  = np.asarray(market_index, dtype=np.float64)                        # (B, N)
     MAX  = max(float(max_duration), 1e-6)
     p95  = max(float(reward_global_p95), 1e-6)
     jj   = np.arange(N)
-    hoy  = (t // 14.0).astype(np.int64)                                      # (B,) día de mercado actual
 
     is_h = jj[None, :] == h[:, None]                                         # (B, N)
     is_i = jj[None, :] == i[:, None]                                         # (B, N)
@@ -157,42 +149,45 @@ def build_continuation_features_batch(
     T_jh = T[:, h].T                                                         # (B, N) tiempo de j a casa
     T_jh = np.where(is_h, 0.0, T_jh)                                         # casa → casa: sin tiempo
 
-    f7 = T_jh / MAX
-    f8 = np.clip((MAX - t_j - T_jh) / MAX, 0.0, 1.0)
+    home_time = T_jh / MAX
+    slack     = np.clip((MAX - t_j - T_jh) / MAX, 0.0, 1.0)
 
-    dia_j = (t_j // 14.0).astype(np.int64)                                   # (B, N) día de salida desde j
-    dow_j = (dow0[:, None] + dia_j) % 7                                      # (B, N)
-    h_j   = np.clip(dia_j - hoy[:, None], 0, ev.h_max)                       # (B, N) días desde hoy hasta salir de j
-    ev_jh = (ev.ev_casa[dow_j, jj[None, :], h[:, None]]
-             + idx * ev.q_casa[h_j, dow_j, jj[None, :], h[:, None]])              # (B, N) arco j→casa
-    f9 = np.clip(ev_jh / p95, -1.0, 1.0)
+    dow_j = (dow0[:, None] + (t_j // 14.0).astype(np.int64)) % 7             # (B, N) día de la semana al llegar a j
 
-    # Continuación a 2 saltos: j → l → casa, con l ∉ {i, j, h} y retorno factible.
-    t_l    = t_j[:, :, None] + T[None, :, :]                                 # (B, N, N) llegada a l desde j
-    T_lh   = T[:, h].T[:, None, :]                                           # (B, 1, N) T[l, h]
-    valid  = (
+    # Lane de regreso j → casa.
+    ret_margin = np.clip(est.G[dow_j, jj[None, :], h[:, None]] / p95, -1.0, 1.0)
+    ret_loads  = np.minimum(est.L[dow_j, jj[None, :], h[:, None]], LOADS_EXPECTED_CLIP) / LOADS_EXPECTED_CLIP
+
+    # Lanes salientes j → l con tiempo de llegar a l y volver a casa: l ∉ {i, j, h}.
+    t_l   = t_j[:, :, None] + T[None, :, :]                                  # (B, N, N) llegada a l desde j
+    T_lh  = T[:, h].T[:, None, :]                                            # (B, 1, N) T[l, h]
+    F     = (
         (jj[None, None, :] != jj[None, :, None])                             # l ≠ j
         & (jj[None, None, :] != i[:, None, None])                            # l ≠ i
         & (jj[None, None, :] != h[:, None, None])                            # l ≠ h
         & (t_l + T_lh <= max_duration)
-    )
-    dia_l = (t_l // 14.0).astype(np.int64)                                   # (B, N, N) día de salida desde l
-    dow_l = (dow0[:, None, None] + dia_l) % 7
-    h_l   = np.clip(dia_l - hoy[:, None, None], 0, ev.h_max)
-    dj, hj, jx, lx = dow_j[:, :, None], h_j[:, :, None], jj[None, :, None], jj[None, None, :]
-    ev_jl = ev.ev[dj, jx, lx] + idx[:, :, None] * ev.q[hj, dj, jx, lx]       # (B, N, N) arco j→l (origen j)
-    ev_lh = (ev.ev_casa[dow_l, lx, h[:, None, None]]
-             + idx[:, None, :] * ev.q_casa[h_l, dow_l, lx, h[:, None, None]])     # (B, N, N) arco l→casa (origen l)
-    dos   = np.where(valid, ev_jl + ev_lh, -np.inf).max(axis=2)              # (B, N); -inf si no hay l
-    f10 = np.clip(np.maximum(ev_jh, dos) / p95, -1.0, 1.0)
+    )                                                                        # (B, N, N)
+    dj, jx, lx = dow_j[:, :, None], jj[None, :, None], jj[None, None, :]
+    n_fact    = F.sum(axis=2)                                                # (B, N)
+    hay       = n_fact > 0
+    valor     = np.where(F, est.P1[dj, jx, lx] * est.G[dj, jx, lx], -np.inf).max(axis=2)
+    out_best  = np.where(hay, np.clip(valor / p95, -1.0, 1.0), 0.0)
+    cargas    = np.minimum(est.L[dj, jx, lx], LOADS_EXPECTED_CLIP) / LOADS_EXPECTED_CLIP
+    out_loads = np.where(hay, np.where(F, cargas, 0.0).sum(axis=2) / np.maximum(n_fact, 1), 0.0)
+    out_fact  = n_fact / max(N, 1)
+    m_j = np.clip(np.log(np.maximum(est.M[dow_j, jj[None, :]], 1.0)) / np.log(max(COMPETENCIA_M_MAX, 1.0 + 1e-9)),
+                  0.0, 1.0)
 
-    # Casos especiales: j == h → f7 = f9 = f10 = 0 (f8 = holgura del retorno directo; en casa antes de salir,
-    # la holgura después de esperar). j == i (fuera de casa) es la espera: la continuación desde i mañana.
-    f7[is_h] = 0.0
-    f9[is_h] = 0.0
-    f10[is_h] = 0.0
+    # j == h es volver a casa: la lane de regreso no existe y el ciclo termina (sin salientes). La espera en casa antes de
+    # salir (j == i == h) sí conserva las salientes de mañana. La holgura [7] se conserva en ambos casos.
+    termina = is_h & ~is_i
+    ret_margin[is_h] = 0.0
+    ret_loads[is_h] = 0.0
+    for x in (out_best, out_loads, out_fact, m_j):
+        x[termina] = 0.0
 
-    return np.stack([f7, f8, f9, f10], axis=-1).astype(np.float32)
+    return np.stack([home_time, slack, ret_margin, ret_loads, out_best, out_loads, out_fact, m_j],
+                    axis=-1).astype(np.float32)
 
 
 def _check_node_features(feats: np.ndarray, B: int, N: int) -> None:
@@ -214,9 +209,9 @@ def build_node_features(
     max_duration:            float,
     reward_global_p95:       float      = 1.0,
     avail_expected_arr:      np.ndarray = None,  # (N, N) — E[loads] histórico (train), usado en feature [4]
-    ev                                  = None,  # EvEsperado (baselines.calcular_ev_pronostico) — features [7-10]
-    time_elapsed:            float      = 0.0,   # horas transcurridas — features [7-10]
-    dow0:                    int        = 0,     # día de la semana (lunes = 0) de salida — features [7-10]
+    est                                 = None,  # EstadisticasLane (MarketProcess.estadisticas_dow) — features [6-13]
+    time_elapsed:            float      = 0.0,   # horas transcurridas — features [6-13]
+    dow0:                    int        = 0,     # día de la semana (lunes = 0) de salida — features [6-13]
     market_index:            np.ndarray = None,  # (N,) índice de mercado de todos los nodos hoy — última feature
     index_std:               float      = None,  # desviación del índice histórico (normaliza market_index)
 ) -> np.ndarray:
@@ -225,8 +220,8 @@ def build_node_features(
 
     Cada fila j contiene las features del nodo j vistas desde current_node:
       [reward_norm, time_norm, dist_norm, is_depot,
-       avail_prior, reward_abs] (+ 4 de continuación si USE_CONTINUATION_FEATURES; requieren
-       ev, time_elapsed y dow0) + market_index / index_std (última columna)
+       avail_prior, reward_abs] (+ 8 de continuación si USE_CONTINUATION_FEATURES; requieren
+       est, time_elapsed y dow0) + market_index / index_std (después de las de continuación)
 
     La diagonal de reward_matrix_penalized tiene BIG_M_PENALTY (-1e9).
     Se recorta a [-1e4, 1e4] antes de normalizar para evitar desbordamientos.
@@ -234,8 +229,8 @@ def build_node_features(
     Retorna np.ndarray de forma (N, N_NODE_FEATURES), dtype float32.
     """
     feats = np.zeros((num_nodes, N_NODE_FEATURES), dtype=np.float32)
-    if USE_CONTINUATION_FEATURES and ev is None:
-        raise ValueError("USE_CONTINUATION_FEATURES requiere ev (calcular_ev_pronostico)")
+    if USE_CONTINUATION_FEATURES and est is None:
+        raise ValueError("USE_CONTINUATION_FEATURES requiere est (MarketProcess.estadisticas_dow)")
     if market_index is None or index_std is None:
         raise ValueError("build_node_features requiere market_index e index_std (índice de mercado)")
 
@@ -278,12 +273,12 @@ def build_node_features(
     feat5[raw_rewards < 0] = 0.0
     feats[:, 5] = feat5
 
-    # Columnas 6-9: continuación (misma función que la versión batcheada, con B = 1)
+    # Columnas 6-13: continuación (misma función que la versión batcheada, con B = 1)
     if USE_CONTINUATION_FEATURES:
         feats[:, N_BASE_NODE_FEATURES:N_BASE_NODE_FEATURES + N_CONT_FEATURES] = build_continuation_features_batch(
             np.array([current_node]), np.array([start_node]),
-            np.array([time_elapsed]), np.array([dow0]), time_matrix, ev,
-            max_duration, reward_global_p95, np.asarray(market_index, dtype=np.float64)[None],
+            np.array([time_elapsed]), np.array([dow0]), time_matrix, est,
+            max_duration, reward_global_p95,
         )[0]
 
     # Índice de mercado normalizado por la desviación del índice histórico (las de cotización quedan en cero)
@@ -562,7 +557,7 @@ def build_node_features_batch(
     avail_expected_arr: np.ndarray = None,  # (N, N) — E[loads] histórico (train), usado en feature [4]
     reward_rows:       np.ndarray = None,   # (B, N) — env.reward_rows: margen de las lanes salientes a la
                                             # mediana del mercado (obligatorio)
-    ev                         = None,      # EvEsperado (baselines.calcular_ev_pronostico) — features de continuación [6-9]
+    est                        = None,      # EstadisticasLane (MarketProcess.estadisticas_dow) — features de continuación [6-13]
     time_elapsed:      np.ndarray = None,   # (B,) horas transcurridas — idem
     dow0:              np.ndarray = None,   # (B,) día de la semana (lunes = 0) de salida — idem
     market_index:      np.ndarray = None,   # (B, N) índice de mercado de todos los nodos en el día actual
@@ -579,8 +574,8 @@ def build_node_features_batch(
     """
     B = len(current_node)
     N = num_nodes
-    if USE_CONTINUATION_FEATURES and (ev is None or time_elapsed is None or dow0 is None):
-        raise ValueError("USE_CONTINUATION_FEATURES requiere ev, time_elapsed y dow0")
+    if USE_CONTINUATION_FEATURES and (est is None or time_elapsed is None or dow0 is None):
+        raise ValueError("USE_CONTINUATION_FEATURES requiere est, time_elapsed y dow0")
     if market_index is None or index_std is None:
         raise ValueError("build_node_features_batch requiere market_index e index_std (índice de mercado)")
     if reward_rows is None:
@@ -637,11 +632,11 @@ def build_node_features_batch(
     feat5[raw_rewards < 0] = 0.0
     feats[:, :, 5] = feat5
 
-    # ── f6–f9: continuación (tiempo/holgura de regreso, valor esperado a 1 y 2 saltos) ──
+    # ── f6–f13: continuación (tiempo/holgura de regreso y estadísticas de las lanes que salen de j) ──
     if USE_CONTINUATION_FEATURES:
         feats[:, :, N_BASE_NODE_FEATURES:N_BASE_NODE_FEATURES + N_CONT_FEATURES] = build_continuation_features_batch(
             current_node, start_node, time_elapsed, dow0,
-            time_matrix_arr, ev, max_duration, reward_global_p95, market_index,
+            time_matrix_arr, est, max_duration, reward_global_p95,
         )
 
     # ── índice de mercado / desviación del índice histórico ──

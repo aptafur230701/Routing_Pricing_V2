@@ -3,9 +3,8 @@ main.py
 =======
 Entry point for the AM-PPO pipeline.
 
-  0. HPO de PPO         (hpo_optuna.py, en 20 nodos; una vez para todos los tamaños)
   1. Load data          (problem_data.py)
-  2. Training           (am_training.py, con los hiperparámetros del paso 0)
+  2. Training           (am_training.py, con los hiperparámetros PPO fijos de config.py)
   3. Evaluation         (evaluation.py: mundos simulados + replay; DRL, baselines B1-B3 y B2P, UB-PI, UB-DP)
   4. Save results       (Excel con hojas Resumen y Comparación + mundos_AM.csv con los datos por mundo)
   5. Validación del precio (validate_pricing.py: results/<N>nodes/pricing_val/)
@@ -18,11 +17,8 @@ Uso
   20 · 35 · 50 · 75 · 100). Luego ejecuta simplemente:
     python main.py
 
-  Antes de entrenar se obtienen los hiperparámetros PPO con Optuna (variable de entorno HPO):
-    HPO=auto  (default) reusa results/20nodes/best_ppo_hyperparams.json si existe; si no, corre el HPO.
-    HPO=force corre (o continúa, el estudio es resumible) el HPO aunque el JSON exista.
-    HPO=off   no corre el HPO: entrena con los valores de config.py.
-  Con EVAL_ONLY=1 no se corre el HPO.
+  Los hiperparámetros de PPO son fijos (config.py; salen del HPO de hpo_optuna.py, que se corrió una vez
+  en 20 nodos y ya no forma parte del pipeline).
 
   Corre cada tamaño en orden: entrena, guarda checkpoint y resultados, y pasa al siguiente usando
   ese checkpoint recién guardado como punto de partida (transfer learning automático, ver
@@ -53,7 +49,6 @@ from config import (
     get_episodes_per_node, TRAIN_DAYS, set_seeds,
     AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF,
 )
-from baselines.politicas import calcular_ev_pronostico
 from problem_data import load_matrices
 from baselines.dp_relajada import cargar_o_calcular_tabla
 from evaluation import (
@@ -74,7 +69,7 @@ def _run_am(
     pretrained_agent=None, pretrained_critic=None,
     ltr_stack=None,
     reward_global_p95=1.0, avail_expected_arr=None,
-    market_process=None, best_checkpoint_path=None, ev_esperado=None,
+    market_process=None, best_checkpoint_path=None, est_lane=None,
 ):
     """Pipeline AM: entrenamiento PPO → checkpoint.
 
@@ -101,7 +96,7 @@ def _run_am(
         avail_expected_arr=avail_expected_arr,
         market_process=market_process,
         best_checkpoint_path=best_checkpoint_path,
-        ev_esperado=ev_esperado,
+        est_lane=est_lane,
     )
     train_time = time.time() - t0
     print(f"Training time: {train_time:.1f} s")
@@ -236,7 +231,7 @@ def _evaluate_and_report(
     # Validación de la decisión de precio (nivel según el estado, sensibilidad a κ): results/<N>nodes/pricing_val/
     from validate_pricing import validar_pricing
     validar_pricing(agent, NUM_NODES, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-                    ltr_stack, avail_expected_arr, reward_global_p95, market_process, cwd)
+                    ltr_stack, avail_expected_arr, reward_global_p95, market_process, cwd, tabla=tabla)
 
     return sim_df, replay_df
 
@@ -259,7 +254,7 @@ def _imprimir_comparacion_b(sim_df, replay_df) -> None:
 def _run_one_size(
     NUM_NODES, cwd,
     EVAL_ONLY, USE_TRANSFER, EVAL_BEST_CHECKPOINT, USE_MARKET_PROCESS,
-    EVAL_SET, K_RESTRINGIDO,
+    EVAL_SET, K_RESTRINGIDO, REPLICA_TAG="",
 ):
     """Pipeline completo (entrenamiento + evaluación) para un solo tamaño de grafo.
 
@@ -277,15 +272,20 @@ def _run_one_size(
     print(f"  AM — {NUM_NODES} nodes")
     print(f"  Niveles de K: {['libre' if k is None else k for k in K_TRAINING_LEVELS]}")
     print(f"  Hiperparámetros propios de este tamaño: {dict(HP_OVERRIDES) or 'ninguno (los de config.py)'}")
+    print(f"  Semilla de entrenamiento (SEED): {SEED}" + (f"   |   RÉPLICA '{REPLICA_TAG}'" if REPLICA_TAG else ""))
+    if REPLICA_TAG and SEED == 42:
+        print("  ⚠ SEED = 42, la misma de la corrida original: no es una réplica independiente "
+              "(lanza con SEED=43 python main.py).")
     print(f"{'='*60}")
 
     set_seeds(SEED)
 
-    output_dir = os.path.join(cwd, "results", f"{NUM_NODES}nodes")
+    sufijo = f"_{REPLICA_TAG}" if REPLICA_TAG else ""
+    output_dir = os.path.join(cwd, "results", f"{NUM_NODES}nodes{sufijo}")
     os.makedirs(output_dir, exist_ok=True)
 
-    # Carpeta compartida de checkpoints (para transfer learning entre ramas)
-    checkpoint_dir = os.path.join(cwd, "checkpoints")
+    # Carpeta compartida de checkpoints (para transfer learning entre ramas); una réplica usa la suya.
+    checkpoint_dir = os.path.join(cwd, "checkpoints", REPLICA_TAG) if REPLICA_TAG else os.path.join(cwd, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
@@ -296,7 +296,7 @@ def _run_one_size(
     # el entrenamiento lo usa solo si USE_MARKET_PROCESS.
     asegurar_parametros()
     market_process = MarketProcess(NUM_NODES)
-    ev_esperado = calcular_ev_pronostico(market_process, distance_arr, diesel_arr)   # una vez por nº de nodos
+    est_lane = market_process.estadisticas_dow(distance_arr, diesel_arr)   # una vez por nº de nodos
 
     # ── Train / eval split (temporal — el modelo no ve los días de eval) ──────
     rate_train  = rate_stack[:TRAIN_DAYS]
@@ -321,7 +321,7 @@ def _run_one_size(
             avail_expected_arr=avail_expected_arr,
             market_process=market_process if USE_MARKET_PROCESS else None,
             best_checkpoint_path=_checkpoint_path(checkpoint_dir, NUM_NODES, True),
-            ev_esperado=ev_esperado,
+            est_lane=est_lane,
         )
         best_path = _checkpoint_path(checkpoint_dir, NUM_NODES, True)
         if EVAL_BEST_CHECKPOINT and USE_MARKET_PROCESS and os.path.exists(best_path):
@@ -356,20 +356,23 @@ def _run_one_size(
         sufijo_cache="" if EVAL_SET == "dev" else "_final",
     )
 
-    print(f"\nDone! Checkpoint guardado en: checkpoints/am_checkpoint_{NUM_NODES}nodes.pt")
+    print(f"\nDone! Checkpoint guardado en: {os.path.relpath(checkpoint_dir, cwd)}/am_checkpoint_{NUM_NODES}nodes.pt")
 
 
 def main():
     # Tamaños a correr, en orden. La cadena completa de transfer_learning.NODE_SEQUENCE es
-    # (20 → 35 → 50 → 75 → 100): cada tamaño arranca con el checkpoint recién guardado del
+    # (20 → 35 → 50 → 75): cada tamaño arranca con el checkpoint recién guardado del
     # anterior. Para correr uno solo, deja aquí un único elemento, p. ej. NODE_SIZES = [20].
-    # NODE_SIZES      = list(NODE_SEQUENCE)
-    NODE_SIZES      = [20, 35, 50]
-    # HPO de PPO (hpo_optuna.py) antes de entrenar: "auto" | "force" | "off" (ver docstring del módulo).
-    HPO_MODE            = os.environ.get("HPO", "auto")
-    HPO_N_TRIALS        = 50
-    HPO_UPDATES_TRIAL   = 60
-    HPO_SEEDS_TRIAL     = 2
+    # NODE_SIZES      = list(NODE_SEQUENCE)   # cadena completa: [20, 35, 50, 75]
+    # NODE_SIZES      = [75]   # solo el que falta (20, 35 y 50 ya tienen checkpoint)
+    NODE_SIZES      = [20]   # solo 20 nodos: réplica de la corrida original (ver REPLICA_TAG)
+    # Réplica: con un REPLICA_TAG, los resultados van a results/<N>nodes_<tag>/ y los checkpoints a checkpoints/<tag>/, así
+    # la corrida original (results/<N>nodes/, checkpoints/) no se sobrescribe. Los mundos de evaluación salen de las mismas
+    # semillas (MARKET_SEED_EVAL) y los baselines (B1, B2, B2P, B3, UB-PI) son deterministas, así que la réplica se compara
+    # con la original sobre los MISMOS mundos. Si no están en datos/cache_eval, se recalculan (y quedan cacheados).
+    # Para que sea una réplica independiente hay que variar la semilla de entrenamiento: SEED=43 python main.py
+    # ("" = corrida normal, sin sufijo). Se puede fijar también con la variable de entorno REPLICA_TAG.
+    REPLICA_TAG     = os.environ.get("REPLICA_TAG", "replica")
     EVAL_ONLY       = os.environ.get("EVAL_ONLY", "0") == "1"   # True (EVAL_ONLY=1): carga checkpoint y salta entrenamiento
     USE_TRANSFER    = True   # True: inicializa los pesos desde el checkpoint del tamaño anterior. False: entrena desde pesos aleatorios con la
                               # arquitectura de config.py.
@@ -392,29 +395,13 @@ def main():
 
     cwd = os.path.dirname(os.path.abspath(__file__))
 
-    # ── Paso 0: hiperparámetros PPO (Optuna, en 20 nodos), los mismos para todos los tamaños ──
-    if not EVAL_ONLY and HPO_MODE != "off":
-        import hpo_optuna   # import diferido: con EVAL_ONLY o HPO=off no hace falta optuna
-        print(f"\n{'='*60}\n  HPO de PPO ({hpo_optuna.HPO_NUM_NODES} nodos, modo {HPO_MODE})\n{'='*60}")
-        hps = hpo_optuna.obtener_hiperparametros(
-            HPO_MODE, n_trials=HPO_N_TRIALS, updates_per_trial=HPO_UPDATES_TRIAL,
-            n_seeds_per_trial=HPO_SEEDS_TRIAL, k_restringido=K_RESTRINGIDO,
-        )
-        hpo_optuna.aplicar_hiperparametros(hps)
-        print("Hiperparámetros PPO del entrenamiento:")
-        for k, v in hps.items():
-            print(f"  {k:30s} = {v}")
-        set_seeds(SEED)
-    else:
-        print("\nHPO desactivado: se entrena con los hiperparámetros de config.py.")
-
     fallidos = []
     for NUM_NODES in NODE_SIZES:
         try:
             _run_one_size(
                 NUM_NODES, cwd,
                 EVAL_ONLY, USE_TRANSFER, EVAL_BEST_CHECKPOINT, USE_MARKET_PROCESS,
-                EVAL_SET, K_RESTRINGIDO,
+                EVAL_SET, K_RESTRINGIDO, REPLICA_TAG,
             )
         except Exception:
             fallidos.append(NUM_NODES)

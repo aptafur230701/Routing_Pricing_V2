@@ -17,7 +17,6 @@ import torch
 
 import am_training
 from model.agent import AMRoutingAgent
-from baselines.politicas import calcular_ev_pronostico
 from config import AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, DEVICE
 from model.critic_head import CriticHead
 from market_process import MarketProcess, asegurar_parametros
@@ -33,11 +32,11 @@ def data():
     asegurar_parametros()
     (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
      ltr_stack, avail_expected_arr, reward_global_p95) = load_matrices(NUM_NODES)
-    ev = calcular_ev_pronostico(MarketProcess(NUM_NODES), distance_arr, diesel_arr)
+    est = MarketProcess(NUM_NODES).estadisticas_dow(distance_arr, diesel_arr)
     return dict(
         args=(time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, NUM_NODES),
         kwargs=dict(ltr_stack=ltr_stack,
-                    reward_global_p95=reward_global_p95, ev_esperado=ev),
+                    reward_global_p95=reward_global_p95, est_lane=est),
     )
 
 

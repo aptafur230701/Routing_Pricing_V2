@@ -3,7 +3,7 @@ transfer_learning.py
 ====================
 Transfer learning estandarizado para la cadena de escalado:
 
-    10 → 20 → 50 → 75 → 100 nodos
+    20 → 35 → 50 → 75 nodos
 
 Por qué el transfer es siempre 100% en este modelo
 ---------------------------------------------------
@@ -44,7 +44,7 @@ from config import DEVICE
 # Secuencia canónica de escalado
 # ─────────────────────────────────────────────────────────────────────────────
 
-NODE_SEQUENCE = [20, 35, 50, 75, 100]
+NODE_SEQUENCE = [20, 35, 50, 75]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,10 +123,22 @@ def _tiene_cabeza_de_precio(checkpoint: dict) -> bool:
     return "decoder.precio.log_tau" in agente and salida is not None and salida.shape[0] == N_NIVELES + 1
 
 
+def _tiene_entradas_actuales(checkpoint: dict) -> bool:
+    """El encoder del checkpoint tiene las columnas de nodo actuales (model.encoder.N_NODE_FEATURES). Un checkpoint con
+    menos columnas (p. ej. el de antes del 2026-11-27, con 34) NO se expande: sus columnas de continuación significan
+    otra cosa y `_reconcile_state_dict` las copiaría desalineadas en silencio."""
+    from model.encoder import N_NODE_FEATURES
+    pesos = checkpoint["agent"].get("encoder.input_proj.proj.weight")
+    return pesos is not None and pesos.shape[1] == N_NODE_FEATURES
+
+
 def es_checkpoint_con_cotizacion(checkpoint_path: str) -> bool:
-    """True si el .pt existe y trae la cabeza de precio actual (ver `_tiene_cabeza_de_precio`); un checkpoint
-    anterior al 2026-11-25 da False."""
-    return os.path.exists(checkpoint_path) and _tiene_cabeza_de_precio(torch.load(checkpoint_path, map_location="cpu"))
+    """True si el .pt existe, trae la cabeza de precio actual (ver `_tiene_cabeza_de_precio`) y las columnas de nodo
+    actuales (ver `_tiene_entradas_actuales`); un checkpoint anterior al 2026-11-25 o al 2026-11-27 da False."""
+    if not os.path.exists(checkpoint_path):
+        return False
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    return _tiene_cabeza_de_precio(checkpoint) and _tiene_entradas_actuales(checkpoint)
 
 
 def _instanciar_y_transferir(
@@ -155,6 +167,11 @@ def _instanciar_y_transferir(
         raise ValueError(
             f"{checkpoint_path} es anterior a la cabeza de precio actual (decoder.precio). "
             f"Bórralo o vuelve a entrenar ese tamaño."
+        )
+    if not _tiene_entradas_actuales(checkpoint):
+        raise ValueError(
+            f"{checkpoint_path} tiene otras columnas de nodo que el modelo actual (antes del 2026-11-27: otras features "
+            f"de continuación). Bórralo o vuelve a entrenar ese tamaño."
         )
 
     agent  = AMRoutingAgent(

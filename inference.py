@@ -29,7 +29,6 @@ from config import (
 )
 from model.agent import AMRoutingAgent
 from model.encoder import COT_COLS
-from baselines.politicas import calcular_ev_pronostico
 from evaluation import make_replay_env
 from greedy_rollout import construir_features, contexto_agente
 from market_process import MarketProcess, asegurar_parametros
@@ -87,10 +86,10 @@ def load_latest_day():
         time_matrix, rate_stack[last:], loads_stack[last:], distance_arr, diesel_arr, NUM_NODES,
         day_offset=last, market=market,
     )
-    ev_esperado = calcular_ev_pronostico(market, distance_arr, diesel_arr)   # una vez
+    est_lane = market.estadisticas_dow(distance_arr, diesel_arr)   # una vez
     return dict(
         env=env,
-        ev_esperado=ev_esperado,
+        est_lane=est_lane,
         time_matrix_arr=np.asarray(time_matrix, dtype=float),
         distance_arr=distance_arr,
         diesel_arr=diesel_arr,
@@ -124,7 +123,7 @@ def _rollout(agent, start_node, day) -> tuple:
         for _ in range(env.max_steps):
             i = int(env.current_node[0])
             feats = construir_features(env, starts, T, dist, day["ltr_stack"], day["reward_global_p95"], NUM_NODES,
-                                       day["avail_expected_arr"], day["ev_esperado"], MAX_DURATION)
+                                       day["avail_expected_arr"], day["est_lane"], MAX_DURATION)
             h_t, emb = contexto_agente(agent, feats, env.current_node, DEVICE)
             a_t, o_t = agent.decoder.greedy_cotizacion(h_t, emb, torch.from_numpy(masks).to(DEVICE),
                                                        torch.from_numpy(feats["opciones"]).to(DEVICE),

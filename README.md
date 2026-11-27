@@ -13,27 +13,18 @@ dentro de una ventana de duración máxima.
 
 ```bash
 pip install -r requirements.txt
-python main.py          # HPO (si hace falta) → entrena → evalúa cada tamaño; resultados en results/<N>nodes/
+python main.py          # entrena → evalúa cada tamaño; resultados en results/<N>nodes/
 python inference.py     # inferencia interactiva con un checkpoint ya entrenado
 ```
 
 Todo lo que hay que tocar para un run distinto está al principio de
-`main()` en [main.py](main.py): `NODE_SIZES` (tamaños a correr en orden, por defecto `[20, 35, 50]`),
-`EVAL_ONLY`, `USE_TRANSFER`, `USE_MARKET_PROCESS`, `K_RESTRINGIDO` y los parámetros del HPO
-(`HPO_N_TRIALS`, `HPO_UPDATES_TRIAL`, `HPO_SEEDS_TRIAL`). Los hiperparámetros del modelo y del PPO están
+`main()` en [main.py](main.py): `NODE_SIZES` (tamaños a correr en orden, por defecto `[20, 35, 50, 75]`),
+`EVAL_ONLY`, `USE_TRANSFER`, `USE_MARKET_PROCESS`, `K_RESTRINGIDO` Los hiperparámetros del modelo y del PPO están
 todos en [config.py](config.py).
 
-**HPO de PPO (paso 0).** Antes de entrenar, `main.py` obtiene los hiperparámetros de PPO con Optuna
-([hpo_optuna.py](hpo_optuna.py), en 20 nodos) y los usa en todos los tamaños. Se controla con la
-variable de entorno `HPO`:
-
-| `HPO` | Comportamiento |
-|---|---|
-| `auto` (default) | Reusa `results/20nodes/best_ppo_hyperparams.json` si existe; si no, corre el HPO. |
-| `force` | Corre (o continúa: el estudio en SQLite es resumible) el HPO aunque el JSON exista. |
-| `off` | No corre el HPO: entrena con los valores de `config.py`. |
-
-Con `EVAL_ONLY=1` no se corre el HPO. Por eso `HP_POR_NODOS[20]` en `config.py` no tiene overrides.
+**Hiperparámetros de PPO.** Son fijos en [config.py](config.py) y salen de un HPO con Optuna que se corrió una
+sola vez en 20 nodos ([hpo_optuna.py](hpo_optuna.py); los resultados están en `results/20nodes/`). `main.py` ya no
+corre el HPO; los mismos valores se usan en todos los tamaños. Para rehacerlo: `python hpo_optuna.py`.
 
 Si `DRL_Routing_Summary_AM.xlsx` o `mundos_AM.csv` están abiertos en otro programa (Excel en Windows),
 `main.py` se detiene antes de evaluar, así no se pierde la evaluación al final.
@@ -73,16 +64,22 @@ problem_data.py ──► matrices (tiempo, tarifa, carga, distancia, diesel, LT
 
 **Reglas del entorno**: el objetivo es el margen total del ciclo. El camión puede volver a pasar por un nodo intermedio (no hay registro de visitados). En cada nodo, casa incluida antes de salir, puede cotizar una lane con carga, **esperar** al siguiente día de mercado (el self-loop) o **reposicionarse vacío** a un nodo a ≤ `REPOSICION_MAX_MILLAS` (300 mi); desde un intermedio, además, volver a casa vacío a cualquier distancia. La máscara excluye los destinos desde los que no se alcanza a volver a casa dentro de `MAX_DURATION`; volver a casa termina el episodio y con K activo el último arco es el retorno. Si desde casa no hay ninguna jugada al inicio, el camión no sale (margen 0, válido); si se queda sin jugadas después, el ciclo falla. Esperar abre una visita nueva (tablero nuevo, rechazos en cero).
 
-**Features por nodo** (`model/encoder.py`): 6 base + 4 de continuación + 1 de índice de mercado + 23 de
-cotización = 34. Las de cotización de la lane i→j son dispersión del precio, break-even relativo a la mediana,
+**Features por nodo** (`model/encoder.py`): 6 base + 8 de continuación + 1 de índice de mercado + 23 de
+cotización = 38. Las 8 de continuación son el tiempo de j a casa, la holgura después de j y 6 estadísticas de las
+lanes que SALEN de j por día de la semana de llegada (`MarketProcess.estadisticas_dow`, solo días de entrenamiento):
+margen y cargas esperadas de la lane de regreso a casa, valor de la mejor lane saliente factible, cargas medias y
+fracción de lanes salientes factibles, y los competidores m medios del hub. Son la media del generador del mercado
+(la misma que promedia la DP de B3), no la salida de ningún baseline: el DRL no importa nada de `baselines`
+para sus entradas. Las de cotización de la lane i→j son dispersión del precio, break-even relativo a la mediana,
 intentos que quedan (/ `COTIZACIONES_MAX_POR_NODO`), y por nivel el valor esperado `v_k = P_k·(p_k·d − c)/p95`
 y `P_k` (2 × 9), más el valor de la lane con todos sus intentos (`pricing.valor_reintentos`) si perderlos vale 0
 o si es volver vacío. La fila j = i es la espera: su tiempo son las horas hasta el siguiente día de mercado
 (`routing_env.fin_espera`) y la continuación es la que se tiene desde i mañana.
 
-**Por qué el modelo escala sin reentrenar desde cero**: ninguna capa de `AMRoutingAgent` ni de `CriticHead` (`model/`) depende de `num_nodes` — el Transformer opera sobre conjuntos de tamaño variable. Esto es lo que permite el transfer learning en `transfer_learning.py` (cadena 20 → 35 → 50 → 75 → 100 nodos, ver `NODE_SEQUENCE`). Un checkpoint anterior a la cabeza de precio
+**Por qué el modelo escala sin reentrenar desde cero**: ninguna capa de `AMRoutingAgent` ni de `CriticHead` (`model/`) depende de `num_nodes` — el Transformer opera sobre conjuntos de tamaño variable. Esto es lo que permite el transfer learning en `transfer_learning.py` (cadena 20 → 35 → 50 → 75 nodos, ver `NODE_SEQUENCE`). Un checkpoint anterior a la cabeza de precio
 actual (sin `decoder.precio.log_tau`, o con otro número de opciones de precio, es decir, los de antes del
-2026-11-25) se rechaza en vez de cargarse a medias.
+2026-11-25) se rechaza en vez de cargarse a medias; lo mismo pasa con los de antes del 2026-11-27 (34 features de nodo, con otra
+continuación: están archivados en `checkpoints/antes_2026-11-27/`), así que la cadena parte de cero en su primer tamaño.
 
 ## Estructura de archivos
 
@@ -136,13 +133,13 @@ los mismos mundos simulados (mismo `world_seed`), paso a paso en `VectorRoutingE
 | B2 | Reoptimización determinista con valores esperados de los arcos futuros; ejecuta solo el primer arco. En la tesis se reporta con K libre (CFA); también admite K = 5. Recursión memoizada sobre (nodo, franja de 15 min, k restante) por (casa, día de salida); el camión puede revisitar nodos. | [baselines/politicas.py](baselines/politicas.py) |
 | B2P | B2 con pronósticos del índice de mercado: los arcos futuros j→l a h días de hoy usan `tarifa_media_empírica(j→l) + b_h · índice(j, hoy)`, con `b_h = f + (1 − f) · ρ^h` (f = fracción de varianza lenta, ρ = persistencia del rápido, ambas del ajuste del índice). Un arco futuro vale lo que rinde cotizarlo con la regla miope sobre los cuantiles medios del día de la semana, `prob · P̄_k*(p̄_k* d − c) − (1 − prob) c` (`calcular_ev_esperado`/`_valor_cotizado_por_dow`, promedio directo sobre los días de entrenamiento reales). Está en el arnés de evaluación como un baseline más (fila en el Resumen y comparación pareada del DRL), y [evaluar_b2p.py](evaluar_b2p.py) la compara con B2 sin entrenar (salida en `results/b2p/`). La tabla de valores esperados (`calcular_ev_pronostico`) también alimenta las features de continuación del DRL ([resumen_semillas.py](resumen_semillas.py) resume varias semillas). | [baselines/politicas.py](baselines/politicas.py) |
 | B3 | Política de un paso sobre la tabla V de la DP de UB-DP con los cuatro intentos de cotización (VFA de tabla); cotiza con el óptimo de su tabla. | [baselines/politicas.py](baselines/politicas.py) |
-| UB-DP | Valor aproximado de la política que ignora el estado del mercado (no es cota; el DRL, que observa el índice, puede superarlo): DP en (hogar, día de salida, nodo, franja de 15 min, k), con revisitas permitidas, espera al día siguiente (también en casa antes de salir), reposicionamiento vacío y `COTIZACIONES_MAX_POR_NODO` = 4 intentos de cotización sobre el mismo tablero (salvo la discretización y el muestreo con S = 5000). Tabla en `baselines/datos/ubdp_tabla_<N>nodos.npz`, se recarga si coincide con los datos; se puede calcular aparte con `python -m baselines.dp_relajada --num-nodes N`. Por encima de `UBDP_MAX_NODOS` = 35 nodos no se calcula; y si a 35 o menos supera `UBDP_TIEMPO_MAX_HORAS` o la memoria, deja `ubdp_tabla_<N>nodos.no_tratable.json`. En ambos casos B3 / UB-DP se reportan "no tratable". | [baselines/dp_relajada.py](baselines/dp_relajada.py) |
+| UB-DP | Valor aproximado de la política que ignora el estado del mercado (no es cota; el DRL, que observa el índice, puede superarlo): DP en (hogar, día de salida, nodo, franja de 15 min, k), con revisitas permitidas, espera al día siguiente (también en casa antes de salir), reposicionamiento vacío y `COTIZACIONES_MAX_POR_NODO` = 4 intentos de cotización sobre el mismo tablero (salvo la discretización y el muestreo con S = 5000). Tabla en `baselines/datos/ubdp_tabla_<N>nodos.npz`, se recarga si coincide con los datos; se puede calcular aparte con `python -m baselines.dp_relajada --num-nodes N`. Por encima de `UBDP_MAX_NODOS` = 75 nodos no se intenta; y si a 75 o menos el cálculo supera `UBDP_TIEMPO_MAX_HORAS` (24 h) o la memoria de la GPU, deja `ubdp_tabla_<N>nodos.no_tratable.json` (con las horas, la fracción completada y el total estimado). En ambos casos B3 / UB-DP se reportan "no tratable". | [baselines/dp_relajada.py](baselines/dp_relajada.py) |
 | UB-PI | Cota con información perfecta: mejor ruta con el mundo completo conocido, incluido el competidor (cotiza en cada arco el nivel más alto que gana; `sample_world` + DP hacia atrás con franjas de 1 min). Debe quedar por encima de UB-DP y del DRL. | [evaluation.py](evaluation.py), [baselines/ub_pi.py](baselines/ub_pi.py) |
 
 | Archivo | Rol |
 |---|---|
 | [evaluation.py](evaluation.py) | Arnés único (`ejecutar_politica`), `evaluar_mundos_simulados` (M mundos con K libre — `K_RESTRINGIDO = False` en main.py; con True también K = 5 —, nodo y día de la semana balanceados), `evaluar_replay` (días reales de prueba, oct 2026, fuera de muestra), `resumen_metodos`, diagnósticos. |
-| [excel_report.py](excel_report.py) | Excel de resultados (hojas Resumen, Rutas y Precios por arco; stats_analysis agrega Comparación) y `mundos_AM.csv` con los datos por mundo. |
+| [excel_report.py](excel_report.py) | Excel de resultados (hojas Resumen y Rutas y precios; stats_analysis agrega Comparación) y `mundos_AM.csv` con los datos por mundo. |
 | [stats_analysis.py](stats_analysis.py) | Diferencia pareada DRL − método con IC 95 % por bootstrap, Wilcoxon pareado de una cola con Holm en dos familias (ruteo: B1–B3; precio: comparación B), y gaps contra UB-DP y UB-PI. |
 | [tests/test_baselines.py](tests/test_baselines.py) | Tabla V vs enumeración ingenua de los intentos, marcador "no tratable", máscara, determinismo, UB-PI ≥ políticas, B3 ≤ UB-DP ≤ UB-PI, UB-PI alineado con el entorno, comparación pareada, y limpieza de nombres borrados (todo a 10 nodos o menos). |
 | [tests/test_escalera.py](tests/test_escalera.py) | Rango de precio por arco del DRL (`evaluation.banda_precio`, `precios_por_arco`): la banda crece hacia el vecino más probable hasta el 80 %, ignora VACÍO y contiene el nivel elegido. |
@@ -167,7 +164,7 @@ el DRL.
 |---|---|
 | `datos/` | `distance.csv`/`duration.csv` (matrices fijas por par de hubs), `fuel_cost_hub_jun_oct_2026.csv` (diésel por hub), `datos_finales_jun_oct_2026/` (153 CSV, uno por día jun–oct 2026, con cargas, cuantiles de tarifa y LTR por lane REEFER), `market_params.npz` (ajuste de `fit_market_process.py`, generado). |
 | `checkpoints/` | Pesos entrenados (`am_checkpoint_<N>nodes.pt`), compartidos entre tamaños para transfer learning. Ignorado por git (`.gitignore`). |
-| `results/<N>nodes/` | Salida de cada run: `DRL_Routing_Summary_AM.xlsx` (Resumen, Comparación, Rutas, Precios por arco), `mundos_AM.csv`, diagnósticos PPO/training (`.png`), `training_log_<N>nodes.pkl`/`.xlsx`, `pricing_val/`. En `results/20nodes/` además el HPO: `best_ppo_hyperparams.json`, `optuna_study.db` (resumible) y `optuna_trials.csv`. |
+| `results/<N>nodes/` | Salida de cada run: `DRL_Routing_Summary_AM.xlsx` (Resumen, Comparación, Rutas y precios), `mundos_AM.csv`, diagnósticos PPO/training (`.png`), `training_log_<N>nodes.pkl`/`.xlsx`, `pricing_val/`. En `results/20nodes/` además el HPO: `best_ppo_hyperparams.json`, `optuna_study.db` (resumible) y `optuna_trials.csv`. |
 | `results/market_validation/<N>nodos/` | Tablas y figuras de `validate_market_process.py`. |
 
 ## Pricing: cotización conjunta con el ruteo
@@ -213,15 +210,16 @@ tiempo restante e índice de mercado de origen y destino, con Spearman; (b) sens
 con el DRL entrenado en κ = 1 y la regla miope como referencia. La comparación B la hace la evaluación.
 
 **Limitaciones.** (1) La aceptación es un modelo (no hay datos de cargas ganadas y perdidas): κ fija qué tanto
-pesa el LTR, y por eso se reporta la sensibilidad. (2) UB-DP cuesta unas 20 veces más que sin precio: a 50, 75 y 100 nodos
-(más de `UBDP_MAX_NODOS`) no se calcula, y B3 y UB-DP se reportan "no tratable".
+pesa el LTR, y por eso se reporta la sensibilidad. (2) UB-DP cuesta unas 20 veces más que sin precio y su costo crece como N³ · S: de 35 a 50 nodos
+es ≈ 2.9× y de 35 a 75 nodos ≈ 9.8×. Se intenta hasta `UBDP_MAX_NODOS` = 75 con un tope de
+`UBDP_TIEMPO_MAX_HORAS` = 24 h; si un tamaño lo excede o se queda sin memoria (a 75 nodos es lo más probable),
+B3 y UB-DP se reportan "no tratable" bajo ese presupuesto, no como una imposibilidad teórica.
 
 ## Flujo de trabajo típico
 
 1. **Entrenar uno o varios tamaños**: fijar `NODE_SIZES` en `main.py` (p. ej. `[20]` o
    `list(NODE_SEQUENCE)`), dejar `USE_TRANSFER = True` para partir del checkpoint del tamaño anterior en
-   `NODE_SEQUENCE` (o `False` para pesos aleatorios). `python main.py` (con `HPO=off` para saltarse el HPO,
-   `HPO=force` para rehacerlo). Si un tamaño falla, se imprime el error y se sigue con el siguiente.
+   `NODE_SEQUENCE` (o `False` para pesos aleatorios). `python main.py`. Si un tamaño falla, se imprime el error y se sigue con el siguiente.
 2. **Solo evaluar** un checkpoint existente sin reentrenar: `EVAL_ONLY=1 python main.py`.
 3. **Comparar contra baselines**: `main.py` calcula (o recarga) la tabla V de UB-DP,
    evalúa en mundos simulados y en replay, e imprime el resumen.

@@ -13,7 +13,6 @@ import torch
 
 import am_training
 from model.agent import AMRoutingAgent
-from baselines.politicas import calcular_ev_pronostico
 from config import TRAIN_DAYS, K_MAX, PPO_LR, LR_FINAL_FRAC, CKPT_WINDOW, DEVICE
 import evaluation as ev
 from market_process import MarketProcess, asegurar_parametros

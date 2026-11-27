@@ -55,7 +55,6 @@ from model.agent import AMRoutingAgent
 from model.encoder import COT_COLS
 from model.critic_head import CriticHead
 from baselines.dp_relajada import PENALIZACION_USD
-from baselines.politicas import calcular_ev_pronostico
 from model.debug_utils import check_tensor
 from evaluation import dias_de_salida, disenar_mundos
 from market_process import MarketProcess, asegurar_parametros
@@ -294,7 +293,7 @@ def _evaluate_greedy(
     num_nodes:        int,
     eval_k_levels:    list = None,   # niveles de K por episodio (None ⇒ todos libres)
     avail_expected_arr: np.ndarray = None,
-    ev_esperado:      np.ndarray = None,   # EvEsperado (calcular_ev_pronostico) para las features de continuación
+    est_lane:         object = None,       # EstadisticasLane (MarketProcess.estadisticas_dow) para las features de continuación
     world_seeds:      np.ndarray = None,   # (B,) semillas del competidor (fijas entre llamadas)
 ) -> tuple:
     """
@@ -324,7 +323,7 @@ def _evaluate_greedy(
         reward_global_p95, num_nodes,
         k_max_arr=eval_k_levels,
         avail_expected_arr=avail_expected_arr,
-        ev_esperado=ev_esperado,
+        est_lane=est_lane,
         world_seeds=world_seeds,
     )
     avg_reward = float(res.raw_reward[res.valid].mean()) if res.valid.any() else 0.0
@@ -347,7 +346,7 @@ class ValidacionSimulada:
 
     def __init__(self, market_process, time_matrix, num_dias, distance_arr, diesel_arr,
                  num_nodes, time_matrix_arr, ltr_stack, reward_global_p95, avail_expected_arr,
-                 ev_esperado=None):
+                 est_lane=None):
         M = get_val_worlds(num_nodes)
         dis = disenar_mundos(num_nodes, M, market_process, num_dias=num_dias, semilla=MARKET_SEED_VAL)
         self.niveles = list(K_TRAINING_LEVELS)
@@ -358,7 +357,7 @@ class ValidacionSimulada:
         self.k_arr = [K for K in self.niveles for _ in range(M)]
         self.args = (time_matrix_arr, distance_arr, ltr_stack, reward_global_p95, num_nodes)
         self.avail = avail_expected_arr
-        self.ev = ev_esperado
+        self.est_lane = est_lane
         self.env = VectorRoutingEnv(
             time_matrix, num_nodes, distance_arr, diesel_arr, num_dias,
             max_duration=MAX_DURATION, market_process=market_process,
@@ -369,7 +368,7 @@ class ValidacionSimulada:
         res = greedy_rollout(
             agent, self.env, self.nodos, self.dias, *self.args,
             k_max_arr=self.k_arr, avail_expected_arr=self.avail, world_seeds=self.semillas,
-            ev_esperado=self.ev,
+            est_lane=self.est_lane,
         )
         margen = np.where(res.valid, res.raw_reward, res.raw_reward + PENALIZACION_USD)   # como en la evaluación
         out = {"por_k": {}}
@@ -392,14 +391,14 @@ class ValidacionSimulada:
 
 def _paso_rollout(agent, critic, env, masks, start_nodes, active, ep_bufs, fases,
                      time_matrix_arr, distance_arr, ltr_stack, reward_global_p95, num_nodes,
-                     avail_expected_arr, ev_esperado) -> tuple:
+                     avail_expected_arr, est_lane) -> tuple:
     """Un paso del rollout muestreado: features, (destino, opción) muestreados, env.step y
     transiciones de las filas activas. Retorna (next_masks, terminated)."""
     B = len(start_nodes)
     cur_nodes = env.current_node.copy()
     with fases("rollout_features"):
         feats = construir_features(env, start_nodes, time_matrix_arr, distance_arr, ltr_stack,
-                                   reward_global_p95, num_nodes, avail_expected_arr, ev_esperado, MAX_DURATION)
+                                   reward_global_p95, num_nodes, avail_expected_arr, est_lane, MAX_DURATION)
     with fases("rollout_gpu"):
         feats_t = {k: torch.from_numpy(v).to(DEVICE) for k, v in feats.items()}
         cur_t = torch.tensor(cur_nodes, dtype=torch.long, device=DEVICE)
@@ -449,7 +448,7 @@ def run_am_training(
                                        # (True = detener el entrenamiento ya, p.ej. Optuna pruning).
                                        # Solo se invoca en los updates de log_freq (donde greedy_reward
                                        # está disponible). No acopla este módulo a Optuna.
-    ev_esperado: np.ndarray = None,   # EvEsperado, calcular_ev_pronostico. Para las features de continuación;
+    est_lane: object = None,       # EstadisticasLane (MarketProcess.estadisticas_dow). Para las features de continuación;
                                        # si es None se calcula una vez desde market_process (obligatorio
                                        # en ese caso con USE_CONTINUATION_FEATURES).
 ) -> tuple:
@@ -550,11 +549,11 @@ def run_am_training(
         else np.asarray(time_matrix, dtype=float)
     )
 
-    # ── Valor esperado por lane (features de continuación): una sola vez, fuera de los loops ──
-    if ev_esperado is None and USE_CONTINUATION_FEATURES:
+    # ── Estadísticas por lane y día de la semana (features de continuación): una sola vez, fuera de los loops ──
+    if est_lane is None and USE_CONTINUATION_FEATURES:
         if market_process is None:
-            raise ValueError("USE_CONTINUATION_FEATURES requiere ev_esperado o market_process")
-        ev_esperado = calcular_ev_pronostico(market_process, distance_arr, diesel_arr)
+            raise ValueError("USE_CONTINUATION_FEATURES requiere est_lane o market_process")
+        est_lane = market_process.estadisticas_dow(distance_arr, diesel_arr)
 
     # ── Entornos (una sola instancia de cada uno, reutilizada en cada update) ──
     # Entrenamiento: mundos simulados (market_process) o replay de los días reales de entrenamiento.
@@ -604,7 +603,7 @@ def run_am_training(
         val = ValidacionSimulada(
             market_process, time_matrix, num_train_days, distance_arr, diesel_arr, num_nodes,
             time_matrix_arr, ltr_stack, reward_global_p95, avail_expected_arr,
-            ev_esperado=ev_esperado,
+            est_lane=est_lane,
         )
         print(f"Validación: {val.M} episodios fijos (hub, día inicial y δ sorteados una vez, semilla "
               f"{MARKET_SEED_VAL}) "
@@ -680,7 +679,7 @@ def run_am_training(
                 masks, terminated = _paso_rollout(
                     agent, critic, vec_env, masks, start_nodes_arr, active, ep_bufs, fases,
                     time_matrix_arr, distance_arr, ltr_stack, reward_global_p95, num_nodes,
-                    avail_expected_arr, ev_esperado,
+                    avail_expected_arr, est_lane,
                 )
                 active = active & ~terminated
 
@@ -705,7 +704,7 @@ def run_am_training(
                     k_max_arr=k_max_arr,
                     avail_expected_arr=avail_expected_arr,
                     world_seeds=world_seeds,
-                    ev_esperado=ev_esperado,
+                    est_lane=est_lane,
                 ).env_reward
         else:
             greedy_ep_rewards = None
@@ -1096,7 +1095,7 @@ def run_am_training(
                         reward_global_p95, num_nodes,
                         eval_k_levels=eval_k_levels,
                         avail_expected_arr=avail_expected_arr,
-                        ev_esperado=ev_esperado, world_seeds=eval_seeds,
+                        est_lane=est_lane, world_seeds=eval_seeds,
                     )
                     log_entry["greedy_reward"]     = greedy_reward
                     log_entry["greedy_valid_rate"] = greedy_valid_rate

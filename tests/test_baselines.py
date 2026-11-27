@@ -456,7 +456,7 @@ def test_marca_de_ub_dp_floja_y_cotas_separadas():
         for i in range(10):
             for metodo, m in (("DRL", 50.0), ("B3", 60.0)):
                 filas.append(dict(modo="simulado", K=k, mundo=i, metodo=metodo, margen=m, violacion=False,
-                                  frac_millas_cargadas=1.0, n_cargas=2, duracion=50.0, ms_decision=1.0,
+                                  frac_millas_cargadas=1.0, millas_totales=500.0, millas_cargadas=500.0, n_cargas=2, duracion=50.0, ms_decision=1.0,
                                   ruta=[0, 1, 0], n_cotizaciones=3, n_ganadas=2, horas_rechazo=0.25,
                                   niveles=[1, 4, 2], usd_mi_sobre_mediana=0.1, dinero_en_la_mesa=30.0,
                                   n_esperas=1, horas_espera=5.0, n_reposiciones=0, n_bajo_be=1, usd_bajo_be=-20.0,
@@ -558,3 +558,44 @@ def test_ciclo_fallido_se_reporta_con_la_penalizacion(sim10):
     assert (f["margen"] <= PENALIZACION_USD + 1e-6).all()
     sin_salir = sim10[(sim10["duracion"] == 0) & ~sim10["violacion"]]
     assert (sin_salir["margen"] == 0).all()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Diagnóstico "rutas del DRL + precio de la tabla de B3" (DRL-dest+dp)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_precio_en_de_b3_coincide_con_su_opcion_y_dp_respeta_la_mascara(inst10):
+    i = inst10
+    ctx = ev.ContextoEval(i.agent, i.market, i.tabla, i.tm, i.dist, i.diesel, i.n, i.ltr, i.avail, i.p95)
+    env = ev.make_sim_env(i.tm, i.rate[:TRAIN_DAYS], i.loads[:TRAIN_DAYS], i.dist, i.diesel, i.n, i.market)
+    b3 = ctx.politicas["B3"]
+    dis = ev.disenar_mundos(i.n, 6, i.market, semilla=7)
+
+    class Espia:
+        """B3 con una aserción: fijar desde afuera el destino que B3 elegiría da la misma opción de precio."""
+        nombre = "espia"
+        pasos = 0
+
+        def actuar(self, obs):
+            a = b3.actuar(obs)
+            assert b3.precio_en(obs, a) == b3._opcion
+            Espia.pasos += 1
+            return a
+
+        def cotizar(self, obs, j):
+            return b3._opcion
+
+    for m in range(6):
+        args = (env, int(dis["nodo"][m]), int(dis["start_day"][m]), None, int(dis["world_seed"][m]),
+                i.dist, i.diesel, int(dis["dow"][m]))
+        ev.ejecutar_politica(Espia(), args[0], *args[1:])
+    assert Espia.pasos > 0
+
+    # DRL-dest+dp pasa por el arnés (que lanza si la opción queda fuera de la máscara) y existe solo con tabla
+    dp = ctx.politica_dp(env)
+    assert dp is not None and dp.nombre == "DRL-dest+dp"
+    for m in range(6):
+        ev.ejecutar_politica(dp, env, int(dis["nodo"][m]), int(dis["start_day"][m]), None,
+                             int(dis["world_seed"][m]), i.dist, i.diesel, int(dis["dow"][m]))
+    sin_tabla = ev.ContextoEval(i.agent, i.market, None, i.tm, i.dist, i.diesel, i.n, i.ltr, i.avail, i.p95)
+    assert sin_tabla.politica_dp(env) is None
