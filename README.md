@@ -19,8 +19,33 @@ python inference.py     # inferencia interactiva con un checkpoint ya entrenado
 
 Todo lo que hay que tocar para un run distinto está al principio de
 `main()` en [main.py](main.py): `NODE_SIZES` (tamaños a correr en orden, por defecto `[20, 35, 50, 75]`),
-`EVAL_ONLY`, `USE_TRANSFER`, `USE_MARKET_PROCESS`, `K_RESTRINGIDO` Los hiperparámetros del modelo y del PPO están
+`EVAL_ONLY`, `USE_TRANSFER`, `K_RESTRINGIDO`. Los hiperparámetros del modelo y del PPO están
 todos en [config.py](config.py).
+
+**GPU y CPU.** El código está escrito para la GPU: los mundos (cargas, competidores y δ) se sortean en la GPU, el
+entorno, las features, el rollout, el buffer de PPO, GAE y la evaluación del DRL son tensores de torch en el
+dispositivo, y a la CPU solo vuelven los escalares del log y las filas de resultados. El mismo código corre en CPU.
+El dispositivo se detecta solo (`config.DEVICE`) y de él salen los tamaños de corrida (`config.EN_GPU`):
+
+| | GPU (servidor, A100) | CPU (computador personal) |
+|---|---|---|
+| Episodios por update (`PPO_N_EPISODES_PER_UPDATE`) | 700 | 256 |
+| Transiciones por minibatch (`PPO_BATCH_SIZE`) | 512 | 256 |
+| Mundos de evaluación por nivel de K (`MARKET_M_EVAL_WORLDS`) | 1000 | 100 |
+
+El número de updates por tamaño (`config.get_n_updates`) es el mismo en los dos. En CPU son pruebas chicas del mismo
+código (idealmente 10 nodos), para revisar que todo corra de punta a punta; los resultados de la tesis salen de la GPU.
+Los baselines B1, B2, B2P y B3 y la cota UB-PI también deciden para todo el lote a la vez en el dispositivo (se
+calculan una vez y se cachean en `datos/cache_eval/`).
+
+**Tests.** `python -m pytest tests` (en CPU, a 10 nodos o menos; unos 12 min, la mayor parte la tabla de UB-DP de
+10 nodos, que se calcula una sola vez). Un archivo por módulo:
+[test_pricing.py](tests/test_pricing.py) (modelo de mercado de la cotización y sus versiones en torch),
+[test_market_process.py](tests/test_market_process.py) (mundos y ajuste), [test_env.py](tests/test_env.py) (entorno),
+[test_modelo.py](tests/test_modelo.py) (features, decoder, rollout greedy y transfer),
+[test_baselines.py](tests/test_baselines.py) (UB-DP, UB-PI, B1–B3 y estadística),
+[test_evaluacion.py](tests/test_evaluacion.py) (arnés) y [test_entrenamiento.py](tests/test_entrenamiento.py) (PPO y
+validación). [tests/conftest.py](tests/conftest.py) tiene los datos de 10 nodos y un mercado sintético.
 
 **Hiperparámetros de PPO.** Son fijos en [config.py](config.py) y salen de un HPO con Optuna que se corrió una
 sola vez en 20 nodos ([hpo_optuna.py](hpo_optuna.py); los resultados están en `results/20nodes/`). `main.py` ya no
@@ -91,32 +116,32 @@ continuación: están archivados en `checkpoints/antes_2026-11-27/`), así que l
 | [config.py](config.py) | Todas las constantes globales e hiperparámetros (arquitectura, PPO, reward shaping). |
 | [hpo_optuna.py](hpo_optuna.py) | HPO de PPO con Optuna (TPE + MedianPruner) en 20 nodos: LR, clip, λ de GAE, entropías del destino y del precio, grad clip, batch, coeficiente self-critical y weight decay. Cada trial entrena en mundos simulados y se mide con el `val_score` de validación (nunca con los mundos de test). Se puede correr solo: `python hpo_optuna.py [--n-trials N] [--sampler random]`. |
 | [problem_data.py](problem_data.py) | Carga de `datos/` y construcción de matrices de recompensa por día. |
-| [routing_env.py](routing_env.py) | Entorno vectorizado (`VectorRoutingEnv`) del DVRP estocástico con cotización: en cada nodo la acción es (destino, nivel de precio) y la carga se gana o se pierde frente al mejor competidor. |
+| [routing_env.py](routing_env.py) | Entorno vectorizado (`VectorRoutingEnv`) del DVRP estocástico con cotización, en tensores de torch en el dispositivo: en cada nodo la acción es (destino, nivel de precio) y la carga se gana o se pierde frente al mejor competidor. |
 | [model/encoder.py](model/encoder.py) | `AttentionEncoder` (Transformer) + `ContextNetwork`. |
 | [model/decoder.py](model/decoder.py) | `AttentionDecoder` (pointer network) con glimpse + pointer attention para el destino, y `PriceHead` para el nivel de precio del destino elegido (`act/greedy/evaluate_cotizacion`). |
 | [model/critic_head.py](model/critic_head.py) | `CriticHead`: estima V(s_t) para la ventaja PPO. |
 | [pricing.py](pricing.py) | Niveles de precio por percentil, competidores efectivos m(LTR), aceptación `(1 − u)^m` y reglas fijas de precio (mediana, break-even + margen, miope). |
 | [validate_pricing.py](validate_pricing.py) | Validación de la decisión de precio del DRL: nivel según el estado y sensibilidad a κ (main.py la corre al final de cada tamaño). |
 | [model/agent.py](model/agent.py) | `AMRoutingAgent`: combina encoder + contexto + decoder; el rollout se ejecuta paso a paso sobre el entorno. |
-| [am_training.py](am_training.py) | Loop de entrenamiento PPO-Clip + GAE. |
-| [greedy_rollout.py](greedy_rollout.py) | Rollout greedy (argmax por nodo) sobre `VectorRoutingEnv`: evaluación del DRL en replay de días reales o en mundos simulados, baseline self-critical y monitor de entrenamiento. |
+| [am_training.py](am_training.py) | Loop de entrenamiento PPO-Clip + GAE, todo en el dispositivo (mundos, rollout, transiciones, GAE y minibatches). |
+| [greedy_rollout.py](greedy_rollout.py) | Features del agente desde el estado del entorno (`construir_features`, tensores) y rollout greedy (argmax por nodo) sobre `VectorRoutingEnv`: baseline self-critical y validación del entrenamiento. |
 | [model/debug_utils.py](model/debug_utils.py) | `check_tensor`: verificación de NaN/Inf en el forward pass (falla rápido en vez de silenciar con `nan_to_num`). Usado en producción por el encoder/decoder/training, no es un script de debug puntual. |
 | [transfer_learning.py](transfer_learning.py) | Warm-start de pesos entre tamaños de grafo (`NODE_SEQUENCE`). |
-| [baselines/ub_pi.py](baselines/ub_pi.py) | DP hacia atrás de UB-PI (`solve_ub_pi`), único solver que se conserva: mejor ruta con el mundo completo conocido, estado (nodo, franja de 1 min, k). |
+| [baselines/ub_pi.py](baselines/ub_pi.py) | DP hacia atrás de UB-PI (`solve_ub_pi_lote`, muchos mundos a la vez en el dispositivo): valor de la mejor ruta con el mundo completo conocido, estado (nodo, franja de 1 min, k). |
 | [inference.py](inference.py) | Inferencia standalone: carga el checkpoint y genera la ruta del DRL desde un nodo dado, con el nivel y el precio cotizados, la mediana, P(ganar) y si se ganó en cada paso. |
 
 ### Generador de realizaciones diarias
 
-Cada episodio recorre días REALES consecutivos de jun–oct 2026 (nunca un día inventado), y cada uno se convierte en una realización sintética de cargas y tarifas por lane con (a) binomial negativa centrada en la media de 6 días vecinos, (b) interpolación inversa sobre los cuantiles reales de precio de ese día/lane, y (c) un corrimiento de nivel nacional δ, fijo por episodio. Con `USE_MARKET_PROCESS = False` se usa el replay literal de los días reales. La evaluación usa ambos esquemas: mundos simulados (con δ) y replay de los días de prueba (oct 2026, fuera de muestra).
+Cada episodio recorre días REALES consecutivos de jun–oct 2026 (nunca un día inventado), y cada uno se convierte en una realización sintética de cargas y tarifas por lane con (a) binomial negativa centrada en la media de 6 días vecinos, (b) interpolación inversa sobre los cuantiles reales de precio de ese día/lane, y (c) un corrimiento de nivel nacional δ, fijo por episodio. El entrenamiento usa siempre los mundos simulados de los días de entrenamiento. La evaluación usa dos esquemas: mundos simulados (con δ) y replay de los días de prueba (oct 2026, fuera de muestra).
 
 El índice de mercado por nodo (nivel lento + rápido AR(1), feature del agente y usado por B2P para pronosticar) no se simula: al recorrer siempre días reales, es un dato observado (lookup) para cualquier día, no una trayectoria generada.
 
 | Archivo | Rol |
 |---|---|
 | [fit_market_process.py](fit_market_process.py) | Estima f_w (factor de día de semana) y r por grupo de volumen (cargas, Paso 4b), el índice de mercado (media por lane, escenarios del nivel lento con `VENTANA_LENTO_DIAS`, ρ y σ_i del rápido) y s (dispersión de δ, Paso 3), con los primeros `TRAIN_DAYS` días de `datos/datos_finales_jun_oct_2026` y los 194 nodos, sin los de prueba, y guarda `datos/market_params.npz`. `main.py` lo corre solo si el archivo no existe. |
-| [market_process.py](market_process.py) | `MarketProcess`: `sample_arrivals` (lotes con un Generator, sin estado de mercado ni memoria del día real: la política que ignora el mercado de la DP y B2), `sample_arrivals_por_mundo` (usado por el entorno; determinista por semilla de episodio, nodo y día real), `sample_world` (mundo completo [D, N, N] para baselines), `indice_mundo` e `indice_historico` (ambos son el índice observado del día real; `indice_mundo` conserva el parámetro de semilla por compatibilidad pero lo ignora). |
+| [market_process.py](market_process.py) | `MarketProcess`: `sortear_mundos` (B mundos sorteados de una vez en la GPU: cargas por lane y día, competidores de cada carga y δ; `Mundos`), `mundos_replay` (cargas reales de los días de prueba, solo se sortea el competidor), `tensores` (tablas por día en el dispositivo: precios por nivel, cuantiles, m, índice, LTR), `sortear_cargas` (la política que ignora el mercado de la DP y B2) e `indice_historico` (índice observado del día real). |
 | [validate_market_process.py](validate_market_process.py) | Paso 6 de la metodología: cuantiles de precios sorteados vs. archivo, dispersión y fracción de ceros de las cargas por grupo de volumen, δ vs. el factor nacional real, y persistencia del índice (pendiente empírica vs. la que implica el ajuste AR(1)). Tablas en `results/market_validation/<N>nodos/`. |
-| [tests/test_market_process.py](tests/test_market_process.py) | Reproducibilidad, independencia de las acciones, formas, equivalencia con `market_process=None`, recompensa compartida, ajuste y smoke de entrenamiento. |
+| [tests/test_market_process.py](tests/test_market_process.py) | Mundos en el dispositivo (formas, reproducibles con la semilla), cargas vs. histórico por grupo de volumen, replay con cargas reales, tablas por día, estadísticas del agente, firma, índice y ajuste. |
 
 Constantes (`FECHA_INICIO`, `DIAS_EXCLUIDOS`, `MARKET_R_MAX`, `MARKET_N_GRUPOS`, semillas, M) en
 [config.py](config.py). La fórmula de recompensa del paso es `lane_reward` en
@@ -125,31 +150,31 @@ Constantes (`FECHA_INICIO`, `DIAS_EXCLUIDOS`, `MARKET_R_MAX`, `MARKET_N_GRUPOS`,
 ### Baselines y evaluación
 
 El DRL se compara contra tres políticas no anticipativas y dos cotas superiores, todas sobre
-los mismos mundos simulados (mismo `world_seed`), paso a paso en `VectorRoutingEnv`:
+los mismos mundos simulados (el mismo `Mundos`), todos los episodios a la vez en `VectorRoutingEnv`:
 
 | Id | Baseline | Archivo |
 |---|---|---|
 | B1 | Greedy miope: jugada válida (cotizar, esperar o moverse vacío) de mayor valor inmediato esperado `max_k P_k (p_k d − c)` (PFA). | [baselines/politicas.py](baselines/politicas.py) |
-| B2 | Reoptimización determinista con valores esperados de los arcos futuros; ejecuta solo el primer arco. En la tesis se reporta con K libre (CFA); también admite K = 5. Recursión memoizada sobre (nodo, franja de 15 min, k restante) por (casa, día de salida); el camión puede revisitar nodos. | [baselines/politicas.py](baselines/politicas.py) |
-| B2P | B2 con pronósticos del índice de mercado: los arcos futuros j→l a h días de hoy usan `tarifa_media_empírica(j→l) + b_h · índice(j, hoy)`, con `b_h = f + (1 − f) · ρ^h` (f = fracción de varianza lenta, ρ = persistencia del rápido, ambas del ajuste del índice). Un arco futuro vale lo que rinde cotizarlo con la regla miope sobre los cuantiles medios del día de la semana, `prob · P̄_k*(p̄_k* d − c) − (1 − prob) c` (`calcular_ev_esperado`/`_valor_cotizado_por_dow`, promedio directo sobre los días de entrenamiento reales). Está en el arnés de evaluación como un baseline más (fila en el Resumen y comparación pareada del DRL), y [evaluar_b2p.py](evaluar_b2p.py) la compara con B2 sin entrenar (salida en `results/b2p/`). La tabla de valores esperados (`calcular_ev_pronostico`) también alimenta las features de continuación del DRL ([resumen_semillas.py](resumen_semillas.py) resume varias semillas). | [baselines/politicas.py](baselines/politicas.py) |
+| B2 | Reoptimización determinista con valores esperados de los arcos futuros; ejecuta solo el primer arco. En la tesis se reporta con K libre (CFA); también admite K = 5. Tabla hacia atrás sobre (casa, día de salida, nodo, franja de 15 min, k restante), calculada una vez en el dispositivo; el camión puede revisitar nodos. | [baselines/politicas.py](baselines/politicas.py) |
+| B2P | B2 con pronósticos del índice de mercado: los arcos futuros j→l a h días de hoy usan `tarifa_media_empírica(j→l) + b_h · índice(j, hoy)`, con `b_h = f + (1 − f) · ρ^h` (f = fracción de varianza lenta, ρ = persistencia del rápido, ambas del ajuste del índice). Un arco futuro vale lo que rinde cotizarlo con la regla miope sobre los cuantiles medios del día de la semana, `prob · P̄_k*(p̄_k* d − c) − (1 − prob) c` (`calcular_ev_esperado`/`_valor_cotizado_por_dow`, promedio directo sobre los días de entrenamiento reales). Está en el arnés de evaluación como un baseline más (fila en el Resumen y comparación pareada del DRL), y [evaluar_b2p.py](evaluar_b2p.py) la compara con B2 sin entrenar (salida en `results/b2p/`). La tabla de valores esperados (`calcular_ev_pronostico`) también alimenta las features de continuación del DRL. | [baselines/politicas.py](baselines/politicas.py) |
 | B3 | Política de un paso sobre la tabla V de la DP de UB-DP con los cuatro intentos de cotización (VFA de tabla); cotiza con el óptimo de su tabla. | [baselines/politicas.py](baselines/politicas.py) |
 | UB-DP | Valor aproximado de la política que ignora el estado del mercado (no es cota; el DRL, que observa el índice, puede superarlo): DP en (hogar, día de salida, nodo, franja de 15 min, k), con revisitas permitidas, espera al día siguiente (también en casa antes de salir), reposicionamiento vacío y `COTIZACIONES_MAX_POR_NODO` = 4 intentos de cotización sobre el mismo tablero (salvo la discretización y el muestreo con S = 5000). Tabla en `baselines/datos/ubdp_tabla_<N>nodos.npz`, se recarga si coincide con los datos; se puede calcular aparte con `python -m baselines.dp_relajada --num-nodes N`. Por encima de `UBDP_MAX_NODOS` = 75 nodos no se intenta; y si a 75 o menos el cálculo supera `UBDP_TIEMPO_MAX_HORAS` (24 h) o la memoria de la GPU, deja `ubdp_tabla_<N>nodos.no_tratable.json` (con las horas, la fracción completada y el total estimado). En ambos casos B3 / UB-DP se reportan "no tratable". | [baselines/dp_relajada.py](baselines/dp_relajada.py) |
-| UB-PI | Cota con información perfecta: mejor ruta con el mundo completo conocido, incluido el competidor (cotiza en cada arco el nivel más alto que gana; `sample_world` + DP hacia atrás con franjas de 1 min). Debe quedar por encima de UB-DP y del DRL. | [evaluation.py](evaluation.py), [baselines/ub_pi.py](baselines/ub_pi.py) |
+| UB-PI | Cota con información perfecta: mejor ruta con el mundo completo conocido, incluido el competidor (cotiza en cada arco el nivel más alto que gana; `evaluation.mundos_ub_pi` + DP hacia atrás con franjas de 1 min). Debe quedar por encima de UB-DP y del DRL. | [evaluation.py](evaluation.py), [baselines/ub_pi.py](baselines/ub_pi.py) |
 
 | Archivo | Rol |
 |---|---|
-| [evaluation.py](evaluation.py) | Arnés único (`ejecutar_politica`), `evaluar_mundos_simulados` (M mundos con K libre — `K_RESTRINGIDO = False` en main.py; con True también K = 5 —, nodo y día de la semana balanceados), `evaluar_replay` (días reales de prueba, oct 2026, fuera de muestra), `resumen_metodos`, diagnósticos. |
+| [evaluation.py](evaluation.py) | Arnés único en lote (`ejecutar_lote`: una política sobre todos los episodios a la vez), `evaluar_mundos_simulados` (M mundos con K libre — `K_RESTRINGIDO = False` en main.py; con True también K = 5 —, nodo y día de la semana balanceados), `evaluar_replay` (días reales de prueba, oct 2026, fuera de muestra), `resumen_metodos`, diagnósticos. |
 | [excel_report.py](excel_report.py) | Excel de resultados (hojas Resumen y Rutas y precios; stats_analysis agrega Comparación) y `mundos_AM.csv` con los datos por mundo. |
 | [stats_analysis.py](stats_analysis.py) | Diferencia pareada DRL − método con IC 95 % por bootstrap, Wilcoxon pareado de una cola con Holm en dos familias (ruteo: B1–B3; precio: comparación B), y gaps contra UB-DP y UB-PI. |
-| [tests/test_baselines.py](tests/test_baselines.py) | Tabla V vs enumeración ingenua de los intentos, marcador "no tratable", máscara, determinismo, UB-PI ≥ políticas, B3 ≤ UB-DP ≤ UB-PI, UB-PI alineado con el entorno, comparación pareada, y limpieza de nombres borrados (todo a 10 nodos o menos). |
-| [tests/test_escalera.py](tests/test_escalera.py) | Rango de precio por arco del DRL (`evaluation.banda_precio`, `precios_por_arco`): la banda crece hacia el vecino más probable hasta el 80 %, ignora VACÍO y contiene el nivel elegido. |
-| [tests/test_revisit.py](tests/test_revisit.py) | Revisitas: la máscara de `VectorRoutingEnv` permite un intermedio ya recorrido, `max_pasos`, UB-PI vs fuerza bruta y B2 memoizado vs enumeración ingenua. |
+| [tests/test_baselines.py](tests/test_baselines.py) | Tabla V de UB-DP vs enumeración ingenua, marcador "no tratable", UB-PI vs fuerza bruta (revisitas, esperas, retrasos), B2 vs enumeración ingenua de rutas, B2P con índice cero = B2, máscara, determinismo, UB-PI ≥ políticas, B3 ≈ UB-DP, comparación pareada y limpieza de nombres borrados (todo a 10 nodos o menos). |
+| [tests/test_evaluacion.py](tests/test_evaluacion.py) | Rango de precio por arco del DRL, métricas por episodio, caché de baselines y replay. |
 
 Las políticas solo leen la máscara, el tablero observado (`current_loads_row`, la mediana `rate_row_obs`, los
 precios por nivel `precios_row`, m y las opciones válidas), el nodo, la hora, `k_remaining` y los rechazos de la
 visita, más los parámetros del proceso; ninguna ve la semilla del mundo ni el competidor. El margen es la suma de
-`lane_reward` con el precio cotizado en las cargas ganadas (USD), no la recompensa escalada del entorno. Los tiempos por decisión se miden en CPU con un solo hilo, también para
-el DRL.
+`lane_reward` con el precio cotizado en las cargas ganadas (USD), no la recompensa escalada del entorno. El tiempo por
+decisión (`ms_decision`) es el de cada paso del lote dividido por las filas activas: es el tiempo
+amortizado del lote en el dispositivo (la GPU en el servidor), para el DRL y para los baselines.
 
 ### Validación final del modelo
 
@@ -229,9 +254,8 @@ B3 y UB-DP se reportan "no tratable" bajo ese presupuesto, no como una imposibil
    arco (el rango típico de cada lane frente a la mediana publicada y el break-even). La referencia es el precio
    al que el DRL ganó la carga (el del margen de la ruta); el rango, los niveles contiguos alrededor del elegido
    que juntan el 80% (`BANDA_PRECIO_MASA`) de la probabilidad de la cabeza de precio en esa decisión.
-4. **Entrenar con el generador de realizaciones diarias**: `USE_MARKET_PROCESS = True` en
-   `main.py` (si falta `datos/market_params.npz` corre `fit_market_process.py`).
-   Validar el generador con `python validate_market_process.py`.
+4. **Generador de realizaciones diarias**: si falta `datos/market_params.npz`, `main.py` corre
+   `fit_market_process.py`. Validar el generador con `python validate_market_process.py`.
 5. **Inferencia puntual**: `python inference.py` con un checkpoint `am_checkpoint_<N>nodes.pt` ya
    guardado en `checkpoints/`.
 6. **Validar el precio**: `python validate_pricing.py --num-nodes N` sobre ese checkpoint.

@@ -5,15 +5,13 @@ Evaluación del agente paso a paso en el entorno: en cada nodo se elige el argma
 destino, el argmax de la cabeza de precio (especificacion_fase0_ruteo_pricing.md §5), siempre sobre las
 opciones válidas del entorno.
 
-No hay búsqueda: una sola ruta por episodio. El mismo rollout sirve para
-  · mundos simulados  (env con market_process, un mundo por `world_seeds[b]`),
-  · replay de días reales (env con mercado_replay, `start_day_idxs[b]`),
-y para el baseline self-critical y el monitor de entrenamiento (am_training.py),
-de modo que recompensa, máscara y disponibilidad de lanes son SIEMPRE las del
+No hay búsqueda: una sola ruta por episodio. El mismo rollout sirve para mundos simulados y replay de días
+reales (los dos son un `market_process.Mundos`), para el baseline self-critical y para la validación del
+entrenamiento (am_training.py), de modo que recompensa, máscara y disponibilidad de lanes son SIEMPRE las del
 entorno que se usó para entrenar.
 
-`construir_features` arma las entradas del agente desde el estado del entorno y la usan también los
-rollouts muestreados del entrenamiento.
+Todo corre en el dispositivo del entorno (la GPU en el servidor): las features se arman con tensores
+(`construir_features`) y nada vuelve a la CPU hasta el final.
 """
 
 from dataclasses import dataclass
@@ -21,7 +19,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from config import MAX_DURATION, DEVICE
+from config import MAX_DURATION
 from model.encoder import (
     COT_COLS,
     build_node_features_batch,
@@ -35,180 +33,163 @@ from model.encoder import (
 
 
 @dataclass
+class EntradasAgente:
+    """Lo fijo de las entradas del agente para un tamaño de grafo, en el dispositivo del entorno."""
+    avail: torch.Tensor          # (N, N) E[loads] histórico (feature [4]) o None
+    est: object                  # EstadisticasLane en el dispositivo (features de continuación)
+    p95: float                   # REWARD_GLOBAL_P95 (normaliza los márgenes)
+    max_duration: float = MAX_DURATION
+
+    @staticmethod
+    def crear(env, avail_expected_arr, est_lane, reward_global_p95, max_duration=MAX_DURATION) -> "EntradasAgente":
+        dev = env.device
+        avail = (None if avail_expected_arr is None
+                 else torch.as_tensor(np.asarray(avail_expected_arr), dtype=torch.float32, device=dev))
+        est = None if est_lane is None else est_lane.a(dev)
+        return EntradasAgente(avail=avail, est=est, p95=float(reward_global_p95), max_duration=max_duration)
+
+
+@dataclass
 class GreedyResult:
-    """Resultado de un rollout greedy sobre B episodios.
+    """Resultado de un rollout greedy sobre B episodios (tensores en el dispositivo del entorno).
 
     env_reward : (B,) recompensa del entorno (escalada por REWARD_SCALE_FACTOR, con la penalización
-                 terminal por violar el tiempo y, solo con USE_REWARD_SHAPING, los bonos de retorno) — la que compara el self-critical con el rollout muestreado.
-    raw_reward : (B,) suma de las recompensas de las lanes recorridas, en unidades
-                 originales (las de los solvers). Solo significativa si valid[b].
-    routes     : list[list[int]] — nodos visitados, desde start_node hasta donde terminó
-                 el episodio (solo los viajes: un rechazo o una espera no agregan nodo).
+                 terminal por violar el tiempo) — la que compara el self-critical con el rollout muestreado.
+    raw_reward : (B,) suma de las recompensas de las lanes recorridas, en USD. Solo significativa si valid[b].
     duration   : (B,) horas acumuladas al terminar.
     valid      : (B,) bool — el episodio cerró el ciclo en start_node dentro de max_duration, o no salió
                  de casa porque no tenía ninguna jugada (env.sin_salida, margen 0).
     n_cotizaciones, n_ganadas : (B,) cotizaciones hechas y cargas ganadas.
-    niveles    : list[list[int]] — nivel cotizado en cada cotización.
+    suma_niveles : (B,) suma de los niveles cotizados (nivel medio = suma / n_cotizaciones).
+    pasos      : con registrar=True, dict de tensores (P, B) por paso: actions, opciones, activo, cotizo, gano,
+                 espero, viajo, raw (las rutas se arman en la CPU solo cuando se piden, ver `rutas`).
     """
-    env_reward: np.ndarray
-    raw_reward: np.ndarray
-    routes:     list
-    duration:   np.ndarray
-    valid:      np.ndarray
-    n_cotizaciones: np.ndarray
-    n_ganadas:      np.ndarray
-    niveles:        list
+    env_reward: torch.Tensor
+    raw_reward: torch.Tensor
+    duration:   torch.Tensor
+    valid:      torch.Tensor
+    n_cotizaciones: torch.Tensor
+    n_ganadas:      torch.Tensor
+    suma_niveles:   torch.Tensor
+    start_nodes:    torch.Tensor
+    pasos:          dict = None
+
+    def rutas(self) -> list:
+        """list[list[int]] — nodos visitados por episodio (solo los viajes: un rechazo o una espera no agregan nodo)."""
+        if self.pasos is None:
+            raise ValueError("greedy_rollout(..., registrar=True) para tener las rutas")
+        a = self.pasos["actions"].cpu().numpy()
+        v = self.pasos["viajo"].cpu().numpy()
+        return [[int(s)] + [int(x) for x in a[v[:, b], b]] for b, s in enumerate(self.start_nodes.cpu().numpy())]
 
 
-def construir_features(
-    env, start_nodes, time_matrix_arr, distance_arr, ltr_stack, reward_global_p95, num_nodes,
-    avail_expected_arr=None, est_lane=None, max_duration=MAX_DURATION,
-) -> dict:
-    """Entradas del agente (numpy) para el estado actual de cada fila de `env`.
+def construir_features(env, entradas: EntradasAgente) -> dict:
+    """Entradas del agente (tensores en el dispositivo del entorno) para el estado actual de cada fila de `env`.
 
-    Claves: node_feats (B, N, F) (sus últimas columnas, COT_COLS, entran también a la cabeza de precio), temporal (B, 3), market (B, 1), budget (B, 2), dow (B, 7),
-    cot (B, N_COT_CONTEXT) y opciones (B, N, K+1) bool.
+    Claves: node_feats (B, N, F) (sus últimas columnas, COT_COLS, entran también a la cabeza de precio), temporal (B, 3),
+    market (B, 1), budget (B, 2), dow (B, 7), cot (B, N_COT_CONTEXT) y opciones (B, N, K+1) bool.
     """
-    B = len(start_nodes)
-    cur_nodes = env.current_node
-    day_idx = env.current_day_idx
+    cur = env.current_node
     cot_nodo = build_cotizacion_node_features_batch(
-        cur_nodes, env.precios_row, env.opciones_validas, env.dist_rows, env.cost_rows,
-        env.competencia, env.intentos, reward_global_p95,
+        cur, env.precios_row, env.opciones_validas, env.dist_rows, env.cost_rows,
+        env.competencia, env.intentos, entradas.p95,
     )
     node_feats = build_node_features_batch(
-        cur_nodes, start_nodes,
-        time_matrix_arr, distance_arr,
-        day_idx, num_nodes, max_duration,
-        reward_global_p95=reward_global_p95,
-        avail_expected_arr=avail_expected_arr,
-        reward_rows=env.reward_rows,
-        est=est_lane, time_elapsed=env.time_elapsed, dow0=env.start_dow,
-        market_index=env.market_index, index_std=env.index_std,
+        cur, env.start_node, env.T, env.dist, entradas.max_duration, entradas.p95, entradas.avail,
+        env.reward_rows, entradas.est, env.time_elapsed, env.start_dow, env.market_index, env.index_std,
         cotizacion_feats=cot_nodo,
     )
     return dict(
         node_feats=node_feats,
-        temporal=build_temporal_features_batch(env.time_elapsed, env.step_count, max_duration, num_nodes),
-        market=build_market_features_batch(cur_nodes, day_idx, ltr_stack) if ltr_stack is not None
-        else np.zeros((B, 1), dtype=np.float32),
+        temporal=build_temporal_features_batch(env.time_elapsed, env.step_count, entradas.max_duration, env.num_nodes),
+        market=build_market_features_batch(env.ltr_actual),
         budget=build_budget_features_batch(env.k_remaining, env.k_restricted),
         dow=build_dow_features_batch(env.current_dow),
         cot=build_cotizacion_context_batch(env.competencia, env.n_rechazos),
-        opciones=env.opciones_validas.copy(),
+        opciones=env.opciones_validas,
+        current_node=cur,
     )
 
 
-def contexto_agente(agent, feats: dict, cur_nodes, device) -> tuple:
+def contexto_agente(agent, feats: dict) -> tuple:
     """encoder + ContextNetwork: (h_t (B, d_h), embeddings (B, N, d_h))."""
-    t = {k: torch.from_numpy(v).to(device) for k, v in feats.items() if k != "opciones"}
-    B = t["node_feats"].shape[0]
-    embeddings, graph_emb = agent.encoder(t["node_feats"])
-    cur_t = torch.as_tensor(np.asarray(cur_nodes), dtype=torch.long, device=device)
-    current_emb = embeddings[torch.arange(B, device=device), cur_t, :]
-    h_t = agent.context_net(graph_emb, current_emb, t["temporal"], t["market"], t["budget"], t["dow"], t["cot"])
+    nf = feats["node_feats"]
+    B = nf.shape[0]
+    embeddings, graph_emb = agent.encoder(nf)
+    current_emb = embeddings[torch.arange(B, device=nf.device), feats["current_node"], :]
+    h_t = agent.context_net(graph_emb, current_emb, feats["temporal"], feats["market"], feats["budget"],
+                            feats["dow"], feats["cot"])
     return h_t, embeddings
 
 
 def greedy_rollout(
     agent,
     env,
-    start_nodes:        np.ndarray,          # (B,) int64
-    start_day_idxs:     np.ndarray,          # (B,) int64
-    time_matrix_arr:    np.ndarray,
-    distance_arr:       np.ndarray,
-    ltr_stack:          np.ndarray,
-    reward_global_p95:  float,
-    num_nodes:          int,
-    k_max_arr:          list       = None,   # length-B list of (int | None); None ⇒ todos libres
-    avail_expected_arr: np.ndarray = None,
-    world_seeds:        np.ndarray = None,   # (B,) — solo con market_process; las MISMAS que el
-                                             # rollout muestreado hacen que ambos vean el mismo mundo
-    max_duration:       float      = MAX_DURATION,
-    device:             torch.device = None,   # dispositivo del agente (default: DEVICE de config)
-    est_lane:           object     = None,   # EstadisticasLane (MarketProcess.estadisticas_dow); obligatorio con
-                                             # USE_CONTINUATION_FEATURES (features de continuación [6-13])
-    step_hook:          callable   = None,   # fn(dict) invocada en cada paso ANTES de env.step, para inspeccionar la
-                                             # decisión sin alterarla (p. ej. la ruta por arco en inference.py).
-                                             # Claves: env, h_t (B, d_h), embeddings (B, N, d_h), masks (B, N),
-                                             # actions (B,), opciones (B,), active (B,) bool, cur_nodes (B,)
+    mundos,                               # market_process.Mundos de los B episodios
+    start_nodes,                          # (B,) nodos de inicio
+    entradas:   EntradasAgente,
+    k_max                = None,          # lista de (int | None) o None ⇒ todos libres
+    registrar:  bool     = False,         # True: guarda (P, B) por paso para armar rutas y detalle por arco
+    step_hook:  callable = None,          # fn(dict) invocada en cada paso ANTES de env.step, para inspeccionar la
+                                          # decisión sin alterarla. Claves: env, h_t, embeddings, masks, actions,
+                                          # opciones, active, feats
 ) -> GreedyResult:
-    """Rollout greedy (argmax por nodo) vectorizado sobre un VectorRoutingEnv.
+    """Rollout greedy (argmax por nodo) vectorizado sobre un VectorRoutingEnv, en su dispositivo.
 
-    `env` fija el mundo (mundos simulados o replay, ver routing_env.py) y las semillas fijan los tableros
-    y el competidor de cada episodio.
-
-    No samplea ni consume RNG global (greedy_cotizacion es argmax puro). Deja el
-    agente en el modo (train/eval) en que estaba.
+    No samplea ni consume RNG (greedy_cotizacion es argmax puro). Deja el agente en el modo (train/eval) en que
+    estaba.
     """
-    device = device or DEVICE
-    B = len(start_nodes)
-    start_nodes = np.asarray(start_nodes, dtype=np.int64)
-
-    env_reward = np.zeros(B, dtype=np.float32)
-    raw_reward = np.zeros(B, dtype=np.float64)
-    valid      = np.zeros(B, dtype=bool)
-    routes     = [[int(s)] for s in start_nodes]
-    n_cot = np.zeros(B, dtype=np.int64)
-    n_gan = np.zeros(B, dtype=np.int64)
-    niveles = [[] for _ in range(B)]
-
-    masks  = env.reset(start_nodes, start_day_idxs, k_max_arr=k_max_arr, world_seeds=world_seeds)
-    active = env.active.copy()                     # sin ninguna jugada desde casa: no sale (margen 0, válido)
-    techo = env.max_steps
+    dev = env.device
+    masks = env.reset(mundos, start_nodes, k_max)
+    B = env.B
+    active = env.active.clone()                    # sin ninguna jugada desde casa: no sale (margen 0, válido)
+    env_reward = torch.zeros(B, dtype=torch.float32, device=dev)
+    raw_reward = torch.zeros(B, dtype=torch.float64, device=dev)
+    valid = torch.zeros(B, dtype=torch.bool, device=dev)
+    n_cot = torch.zeros(B, dtype=torch.long, device=dev)
+    n_gan = torch.zeros(B, dtype=torch.long, device=dev)
+    suma_niv = torch.zeros(B, dtype=torch.long, device=dev)
+    log = {k: [] for k in ("actions", "opciones", "activo", "cotizo", "gano", "espero", "viajo", "raw")} if registrar else None
 
     was_training = agent.training
     agent.eval()
     try:
         with torch.no_grad():
-            for _ in range(techo):   # techo defensivo (ver max_pasos_cotizacion)
-                if not active.any():
+            for _ in range(env.max_steps):   # techo defensivo (ver max_pasos_cotizacion)
+                if not bool(active.any()):
                     break
-
-                cur_nodes = env.current_node.copy()
-                feats = construir_features(
-                    env, start_nodes, time_matrix_arr, distance_arr, ltr_stack, reward_global_p95, num_nodes,
-                    avail_expected_arr, est_lane, max_duration,
-                )
-                h_t, embeddings = contexto_agente(agent, feats, cur_nodes, device)
-                mask_t = torch.from_numpy(masks).to(device)
-                opciones_t = torch.from_numpy(feats["opciones"]).to(device)
-                feats_cot = torch.from_numpy(feats["node_feats"][..., COT_COLS]).to(device)
-                a_t, o_t = agent.decoder.greedy_cotizacion(
-                    h_t, embeddings, mask_t, opciones_t, feats_cot)
-                actions, opciones = a_t.cpu().numpy(), o_t.cpu().numpy()
-
+                feats = construir_features(env, entradas)
+                h_t, embeddings = contexto_agente(agent, feats)
+                actions, opciones = agent.decoder.greedy_cotizacion(
+                    h_t, embeddings, masks, feats["opciones"], feats["node_feats"][..., COT_COLS])
                 if step_hook is not None:
                     step_hook(dict(env=env, h_t=h_t, embeddings=embeddings, masks=masks, actions=actions,
-                                   opciones=opciones, active=active.copy(), cur_nodes=cur_nodes))
+                                   opciones=opciones, active=active.clone(), feats=feats))
 
                 rewards, terminated, masks = env.step(actions, opciones)
                 cotizo = active & env.last_cotizo
+                gano = cotizo & env.last_gano
                 viajo = active & ~(env.last_cotizo & ~env.last_gano) & ~env.last_espero
-                n_cot += cotizo
-                n_gan += cotizo & env.last_gano
-                for b in np.flatnonzero(cotizo):
-                    niveles[b].append(int(opciones[b]))
-
-                for b in np.flatnonzero(viajo):
-                    routes[b].append(int(actions[b]))
-                env_reward += np.where(active, rewards, 0.0)
-                raw_reward += np.where(active, env.last_raw_reward, 0.0)
+                n_cot += cotizo.long()
+                n_gan += gano.long()
+                suma_niv += torch.where(cotizo, opciones, torch.zeros_like(opciones))
+                env_reward += torch.where(active, rewards, torch.zeros_like(rewards))
+                raw_reward += torch.where(active, env.last_raw_reward.double(), torch.zeros_like(raw_reward))
                 # Éxito: este paso viajó a start_node y cerró el ciclo sin violar el tiempo.
-                valid |= viajo & terminated & (actions == start_nodes) & ~env.last_time_violation
-
+                valid |= viajo & terminated & (actions == env.start_node) & ~env.last_time_violation
+                if registrar:
+                    for k, x in (("actions", actions), ("opciones", opciones), ("activo", active), ("cotizo", cotizo),
+                                 ("gano", gano), ("espero", active & env.last_espero), ("viajo", viajo),
+                                 ("raw", torch.where(active, env.last_raw_reward, torch.zeros_like(rewards)))):
+                        log[k].append(x)
                 active = active & ~terminated
     finally:
         agent.train(was_training)
     valid |= env.sin_salida                         # no salió de casa: ciclo válido con margen 0
 
     return GreedyResult(
-        env_reward=env_reward,
-        raw_reward=raw_reward,
-        routes=routes,
-        duration=np.asarray(env.time_elapsed, dtype=np.float64),
-        valid=valid,
-        n_cotizaciones=n_cot,
-        n_ganadas=n_gan,
-        niveles=niveles,
+        env_reward=env_reward, raw_reward=raw_reward, duration=env.time_elapsed.double(), valid=valid,
+        n_cotizaciones=n_cot, n_ganadas=n_gan, suma_niveles=suma_niv, start_nodes=env.start_node,
+        pasos=None if log is None else {k: torch.stack(v) if v else torch.zeros((0, B), device=dev)
+                                         for k, v in log.items()},
     )

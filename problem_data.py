@@ -23,6 +23,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+import torch  # noqa: F401  (antes que pandas: en Windows, pandas primero rompe la carga de las DLL de torch)
 import pandas as pd
 
 from config import (

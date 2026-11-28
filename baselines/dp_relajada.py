@@ -6,7 +6,7 @@ programación dinámica sobre el estado (nodo, hora, k) con la decisión de prec
 nodos intermedios, así que el estado no lleva el conjunto de visitados.
 
 En cada llegada a i se sortea un tablero b: un día de entrenamiento al azar con el día de la semana de la
-llegada (`MarketProcess.tablero_sin_memoria`) y sus cargas; los precios por nivel p_jk y m_i son los de ese
+llegada (`MarketProcess.sortear_cargas` sobre un día de entrenamiento al azar del mismo día de la semana) y sus cargas; los precios por nivel p_jk y m_i son los de ese
 día real. Con P_k = (1 − u_k)^m_i:
 
     G_jk(s)  = r_jk + V_{k−1}(j, s + f_ij)          r_jk = lane_reward(p_jk, carga, d_ij, c_ij); V(casa) = 0
@@ -182,7 +182,7 @@ def _sortear_tableros(market, distance_arr, diesel_arr, S, seed) -> dict:
     """Tableros sin memoria de S sorteos por (día de la semana, nodo) y las tablas por día real.
 
     Por cada día de la semana: un día de entrenamiento al azar con ese día de la semana y las cargas
-    sorteadas de ese día (lo mismo que `MarketProcess.tablero_sin_memoria`, δ = 0). Devuelve
+    sorteadas de ese día (un día de entrenamiento al azar del mismo día de la semana, δ = 0). Devuelve
       A   (7, N, S, N) int8    — cargas cotizables de la lane: min(cargas, COTIZACIONES_MAX_POR_NODO)
       D   (7, N, S) int64      — índice local del día sorteado (en dias[dow])
       Rk  (7, Dmax, N, N, K)   — lane_reward cobrando el nivel k con carga, por día real (float32)

@@ -12,6 +12,7 @@ Los datos por mundo van aparte en un CSV (guardar_mundos), no en el Excel.
 """
 
 import numpy as np
+import torch  # noqa: F401  (antes que pandas: en Windows, pandas primero rompe la carga de las DLL de torch)
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -212,7 +213,7 @@ def _build_summary(wb, sim_df, replay_df, summary_rows):
 
 
 def guardar_mundos(sim_df: pd.DataFrame, replay_df: pd.DataFrame, path: str) -> None:
-    """Una fila por (modo, K, mundo, método) en CSV: los datos crudos de la evaluación (resumen_semillas.py los lee)."""
+    """Una fila por (modo, K, mundo, método) en CSV: los datos crudos de la evaluación."""
     partes = [sim_df] if replay_df is None or replay_df.empty else [sim_df, replay_df]
     df = pd.concat(partes, ignore_index=True)
     df.drop(columns=[c for c in ("pasos", "cotizaciones") if c in df.columns]).to_csv(path, index=False)

@@ -2,19 +2,20 @@
 evaluation.py
 =============
 Evaluación posterior al entrenamiento (baselines_drl_ruteo_estocastico.md, especificacion_fase0_ruteo_pricing.md §7-8):
-  · rollout_drl_env              — rollout greedy del agente en el entorno (destino y precio)
+  · ejecutar_lote                — corre una política sobre B episodios a la vez en el entorno (GPU)
   · evaluar_mundos_simulados     — DRL, comparación B y B1, B2, B2P, B3 sobre los mismos mundos simulados,
                                    + UB-PI (cota) y UB-DP (referencia de la DP)
   · evaluar_replay               — el mismo arnés sobre los días reales de evaluación
   · resumen_metodos              — márgenes, gaps, aceptación y métricas operativas por método
   · save_results, plot_*         — Excel y figuras
 
-Arnés único: todas las políticas se ejecutan paso a paso en `VectorRoutingEnv` (B = 1), con
-cotización: la política elige el destino (`actuar`) y el precio (`cotizar`); si la carga se pierde,
-vuelve a decidir en el mismo nodo con la lane enmascarada. Una política solo lee la `Observacion`
-(máscara, tablero observado, nodo, hora y k restante) y, el DRL, el estado observable del entorno;
-nadie ve el competidor. La misma semilla da los mismos tableros y competidores a todos los métodos
-(números aleatorios comunes).
+Arnés único: cada política corre sobre TODOS los episodios (mundos × niveles de K) a la vez en
+`VectorRoutingEnv`, en el dispositivo (la GPU en el servidor). En cada paso la política elige destino y precio
+para las filas activas; si la carga se pierde, vuelve a decidir en el mismo nodo con la lane enmascarada. El DRL
+decide en un solo forward batcheado y los baselines (B1, B2, B2P, B3, baselines/politicas.py) también deciden para
+todas las filas a la vez, con la `ObsLote` del entorno (máscara, tablero observado, nodo, hora y k restante). Nadie
+ve el competidor. Todos los métodos corren sobre el MISMO `Mundos` (los
+mismos tableros y competidores: números aleatorios comunes).
 
 Métodos (comparación B, §7.1):
   · DRL                  — destino y precio del DRL.
@@ -27,33 +28,30 @@ El margen de una ruta es la suma del reward de cada lane en USD con el precio co
 (env.last_raw_reward: p·d − c si se ganó la carga, −c si fue VACÍO, 0 en un rechazo o una espera).
 """
 
-import copy
 import hashlib
 import os
 import pickle
 import time
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
 import torch
+import matplotlib.pyplot as plt
+import pandas as pd
 from config import (
-    MAX_DURATION, K_MAX, TRAIN_DAYS, MARKET_DIAS_EPISODIO,
+    DEVICE, MAX_DURATION, K_MAX, TRAIN_DAYS, MARKET_DIAS_EPISODIO,
     MARKET_SEED_EVAL, MARKET_M_EVAL_WORLDS, REPLAY_MAX_CASOS, REGLA_PRECIO_BASELINES, REPOSICION_MAX_MILLAS,
 )
 from baselines.politicas import (
-    Observacion, PoliticaB1, PoliticaB2, PoliticaB2P, PoliticaB3, calcular_ev_pronostico, cotizar_regla,
+    ObsLote, PoliticaB1, PoliticaB2, PoliticaB2P, PoliticaB3, calcular_ev_pronostico, cotizar_regla,
 )
-from greedy_rollout import greedy_rollout, construir_features, contexto_agente
+from greedy_rollout import EntradasAgente, construir_features, contexto_agente
 from model.encoder import COT_COLS
-from market_process import Tablero
-from pricing import REGLAS_PRECIO, U_NIVELES_ARR, N_NIVELES, gana, prob_ganar
+from pricing import REGLAS_PRECIO, U_NIVELES_ARR, N_NIVELES, prob_ganar
 from routing_env import VectorRoutingEnv
 from baselines.dp_relajada import PENALIZACION_USD
 from config import COTIZACIONES_MAX_POR_NODO, BANDA_PRECIO_MASA, BE_MARGEN
-from baselines.ub_pi import solve_ub_pi
+from baselines.ub_pi import solve_ub_pi_lote
 from stats_analysis import gap_pct, ic_bootstrap_media, ub_dp_floja, NOTA_UB_DP_FLOJA
 
-_DIAS_SIMULADOS_UB_PI = MARKET_DIAS_EPISODIO   # días del mundo que cubren cualquier ruta (6: 77 h = 5,5 días de mercado)
 _BASELINES = ("B1", "B2", "B2P", "B3")   # no dependen del agente: se calculan una vez y se cachean
 _DRL_REGLAS = tuple(f"DRL-dest+{r}" for r in REGLAS_PRECIO)   # comparación B
 _METODOS = ("DRL",) + _DRL_REGLAS + _BASELINES
@@ -107,110 +105,54 @@ def _describir(metodo: str) -> dict:
 NOTA_NO_TRATABLE = ("no se calcula: con este número de ciudades el cálculo es demasiado largo o no cabe en memoria")
 
 
-# ── Entornos ─────────────────────────────────────────────────
-def make_replay_env(time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes,
-                    day_offset=0, market=None):
-    """Entorno de replay de los días reales: cargas y cuantiles del propio día, competidor sorteado.
-
-    rate_stack / loads_stack solo fijan el número de días. day_offset : índice absoluto del día 0
-    (TRAIN_DAYS para los días de evaluación). market : MarketProcess del que salen los tableros reales
-    (`tablero_real`) y el índice de mercado observado de cada día.
-    """
-    if market is None:
-        raise ValueError("make_replay_env requiere market (MarketProcess)")
-    return VectorRoutingEnv(
-        time_matrix, num_nodes, distance_arr, diesel_arr, rate_stack.shape[0],
-        max_duration=MAX_DURATION, mercado_replay=market, day_offset=day_offset,
-    )
+def _sync():
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
 
 
-def make_sim_env(time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, num_nodes, market):
-    """Entorno de mundos simulados (tablero sorteado al llegar a cada nodo).
+# ── Políticas del arnés ──────────────────────────────────────
 
-    rate_stack / loads_stack solo fijan el último día con datos; como en el entrenamiento, los días de
-    entrenamiento.
-    """
-    return VectorRoutingEnv(
-        time_matrix, num_nodes, distance_arr, diesel_arr, rate_stack.shape[0],
-        max_duration=MAX_DURATION, market_process=market,
-    )
+class PoliticaBaseline:
+    """Una política baseline (B1, B2, B2P, B3) sobre el lote: lee la `ObsLote` del entorno y decide destino y precio de
+    todas las filas a la vez, en el dispositivo."""
 
+    def __init__(self, politica, nombre: str):
+        self.p, self.nombre = politica, nombre
+        self.precio = "regla"
 
-def rollout_drl_env(
-    agent,
-    env:            VectorRoutingEnv,
-    start_node:     int,
-    start_day_idx:  int,
-    time_matrix_arr: np.ndarray,
-    distance_arr:   np.ndarray,
-    ltr_stack:      np.ndarray,
-    num_nodes:      int,
-    reward_global_p95: float      = 1.0,
-    k_max:          int        = None,
-    avail_expected_arr: np.ndarray = None,
-    world_seed:     int        = None,
-    device:         torch.device = None,
-    est_lane:       object = None,       # EstadisticasLane (MarketProcess.estadisticas_dow); obligatorio con USE_CONTINUATION_FEATURES
-) -> tuple:
-    """Una ruta del agente: paso a paso en el entorno, argmax de destino y de precio en cada nodo.
+    def decidir(self, env, masks, activo) -> tuple:
+        a, o = self.p.decidir(ObsLote.del_entorno(env, masks), activo)
+        return a, o, None
 
-    k_max : presupuesto de cardinalidad (nº de arcos, incluido el retorno); None = caso libre.
-    Retorna (route, reward, duration) con el reward en USD (suma de lanes con el precio cotizado);
-    (None, -inf, inf) si no cierra el ciclo en el depot dentro de max_duration.
-    """
-    res = greedy_rollout(
-        agent, env,
-        np.array([start_node], dtype=np.int64), np.array([start_day_idx], dtype=np.int64),
-        time_matrix_arr, distance_arr, ltr_stack,
-        reward_global_p95, num_nodes,
-        k_max_arr=[k_max],
-        avail_expected_arr=avail_expected_arr,
-        world_seeds=None if world_seed is None else np.array([world_seed], dtype=np.int64),
-        device=device,
-        est_lane=est_lane,
-    )
-    if not res.valid[0]:
-        return None, -np.inf, np.inf
-    return res.routes[0], float(res.raw_reward[0]), float(res.duration[0])
-
-
-# ── Arnés: una política, un mundo ─────────────────────────────
 
 class PoliticaDRL:
-    """El agente como política del arnés: destino con la cabeza de destino; precio con la cabeza de
-    precio (precio="drl") o con una regla fija (comparación B). Lee el estado observable del entorno
-    (las mismas features que en el entrenamiento)."""
+    """El agente como política del arnés: destino con la cabeza de destino (argmax, batcheado en el dispositivo);
+    precio con la cabeza de precio (precio="drl"), con una regla fija (comparación B) o con la tabla de B3 ("dp").
+    Lee el estado observable del entorno (las mismas features que en el entrenamiento)."""
 
-    def __init__(self, ctx, env, precio: str = "drl"):
+    def __init__(self, ctx, precio: str = "drl"):
         if precio not in ("drl", "dp") and precio not in REGLAS_PRECIO:
             raise ValueError(f"precio desconocido: {precio!r}")
         if precio == "dp" and "B3" not in ctx.politicas:
             raise ValueError('precio="dp" necesita la tabla de UB-DP (B3); a este tamaño no se calculó')
-        self.ctx, self.env, self.precio = ctx, env, precio
+        self.ctx, self.precio = ctx, precio
         self.nombre = "DRL" if precio == "drl" else f"DRL-dest+{precio}"
-        self._opcion = None
 
-    def actuar(self, obs) -> int:
-        c, env = self.ctx, self.env
+    def decidir(self, env, masks, activo) -> tuple:
+        c = self.ctx
         with torch.no_grad():
-            feats = construir_features(env, env.start_node, c.T, c.dist, c.ltr, c.p95, c.N, c.avail, c.est)
-            h_t, emb = contexto_agente(c.agent_cpu, feats, env.current_node, torch.device("cpu"))
-            mask_t = torch.from_numpy(np.asarray(obs.mascara, dtype=np.int8)[None])
-            op_t = torch.from_numpy(feats["opciones"])
-            cot_t = torch.from_numpy(feats["node_feats"][..., COT_COLS])
-            a, o = c.agent_cpu.decoder.greedy_cotizacion(h_t, emb, mask_t, op_t, cot_t)
+            feats = construir_features(env, c.entradas(env))
+            h_t, emb = contexto_agente(c.agent, feats)
+            cot = feats["node_feats"][..., COT_COLS]
+            a, o = c.agent.decoder.greedy_cotizacion(h_t, emb, masks, feats["opciones"], cot)
             # π(o | s, j) del destino elegido: el rango de precio de la evaluación (solo la cabeza de precio).
-            self.probs_precio = (c.agent_cpu.decoder.probs_precio(h_t, emb, mask_t, op_t, cot_t, a)[0].numpy()
-                                 if self.precio == "drl" and int(o[0]) < N_NIVELES else None)
-        self._opcion = int(o[0])
-        return int(a[0])
-
-    def cotizar(self, obs, j: int) -> int:
-        if self.precio == "drl":
-            return self._opcion
-        if self.precio == "dp":                       # el precio que daría la tabla de B3 en el destino del DRL
-            return self.ctx.politicas["B3"].precio_en(obs, j)
-        return cotizar_regla(obs, j, self.ctx.dist, self.ctx.diesel, self.precio)
+            probs = (c.agent.decoder.probs_precio(h_t, emb, masks, feats["opciones"], cot, a)
+                     if self.precio == "drl" else None)
+        if self.precio != "drl":
+            obs = ObsLote.del_entorno(env, masks)
+            o = (c.politicas["B3"].precio_en(obs, a) if self.precio == "dp"
+                 else cotizar_regla(obs, a, c.politicas["B1"]._est(env.device), self.precio))
+        return a, o, probs
 
 
 def banda_precio(probs, o: int, masa: float = BANDA_PRECIO_MASA) -> tuple:
@@ -233,143 +175,143 @@ def banda_precio(probs, o: int, masa: float = BANDA_PRECIO_MASA) -> tuple:
     return lo, hi
 
 
-def ejecutar_politica(politica, env, start_node, start_day_idx, k_max, world_seed,
-                      distance_arr, diesel_arr, dow0) -> dict:
-    """Corre `politica` paso a paso en `env` (B = 1) y devuelve las métricas de la ruta.
+# ── Arnés: una política, B episodios ─────────────────────────
 
-    En cada paso la política elige el destino (`actuar`) y la opción de precio (`cotizar`). Métricas:
-    margen (suma de env.last_raw_reward, más PENALIZACION_USD si el ciclo falla: la misma penalización del
+def ejecutar_lote(politica, env, mundos, nodos, k_list, distance_arr) -> list:
+    """Corre `politica` sobre los B episodios de `mundos` (nodos de inicio `nodos`, presupuesto `k_list`) y
+    devuelve una lista de B dicts con las métricas de cada ruta.
+
+    Métricas: margen (suma de env.last_raw_reward, más PENALIZACION_USD si el ciclo falla: la misma penalización del
     entrenamiento y de UB-DP), violacion (no cerró el ciclo en casa dentro de max_duration; no salir
     de casa por no tener ninguna jugada, env.sin_salida, no es violación), frac_millas_cargadas, n_cargas,
-    duracion, ms_decision (tiempo medio de actuar + cotizar), ruta (solo viajes), n_cotizaciones, n_ganadas,
-    horas_rechazo, niveles (lista), usd_mi_sobre_mediana (media de precio cobrado − mediana de la lane en las
-    cargas ganadas), dinero_en_la_mesa (Σ (p_comp − p)·d en las cargas ganadas), n_esperas, horas_espera,
-    n_reposiciones (viajes vacíos a un nodo que no es casa), n_bajo_be (cargas ganadas a un precio menor que
-    el costo por milla de la lane) y usd_bajo_be (Σ de lo que se perdió en ellas, ≤ 0).
+    duracion, ms_decision (tiempo de decisión por paso: el del lote dividido por las filas activas), ruta (solo
+    viajes), n_cotizaciones, n_ganadas, horas_rechazo, niveles (lista), usd_mi_sobre_mediana (media de precio cobrado
+    − mediana de la lane en las cargas ganadas), dinero_en_la_mesa (Σ (p_comp − p)·d en las cargas ganadas),
+    n_esperas, horas_espera, n_reposiciones (viajes vacíos a un nodo que no es casa), n_bajo_be (cargas ganadas a un
+    precio menor que el costo por milla de la lane) y usd_bajo_be (Σ de lo que se perdió en ellas, ≤ 0).
     Detalle por arco: `pasos` (una entrada por step: cotización ganada, cotización perdida, viaje vacío o
     espera, con el nivel, el percentil u, el precio cotizado, la mediana, P(ganar), el precio del competidor,
-    las millas y el reward del paso) y `ruta_precios`, la misma ruta en texto, p. ej.
-    "3→7 cotiza 2.95 USD/mi (u=0.6) ✗ | 3 espera 9.5 h | 3→5 cotiza 2.80 USD/mi (u=0.4) ✓ | 5→3 vacío".
+    las millas, el reward del paso y el estado del mercado de la decisión) y `ruta_precios`, la misma ruta en texto,
+    p. ej. "3→7 cotiza 2.95 USD/mi (u=0.6) ✗ | 3 espera 9.5 h | 3→5 cotiza 2.80 USD/mi (u=0.4) ✓ | 5→3 vacío".
     """
-    seeds = None if world_seed is None else np.array([world_seed], dtype=np.int64)
-    masks = env.reset(
-        np.array([start_node], dtype=np.int64), np.array([start_day_idx], dtype=np.int64),
-        k_max_arr=[k_max], world_seeds=seeds,
-    )
-    ruta = [int(start_node)]
-    margen = millas_carg = millas_tot = horas_rech = mesa = horas_esp = usd_bajo_be = 0.0
-    n_cargas = n_dec = n_cot = n_esp = n_repos = n_bajo_be = 0
-    niveles, sobre_mediana, pasos = [], [], []
-    cotizaciones = []                                     # rango de precio de cada cotización del DRL
-    con_rango = getattr(politica, "precio", None) == "drl"
-    t_dec = 0.0
-    cerro = bool(env.sin_salida[0])                       # sin ninguna jugada desde casa: no sale (válido)
+    masks = env.reset(mundos, nodos, k_list)
+    B = env.B
+    activo = env.active.clone()
+    sin_salida = env.sin_salida.cpu().numpy()
+    filas = torch.arange(B, device=env.device)
+    log, t_dec, n_dec = [], 0.0, 0
     for _ in range(env.max_steps):
-        mascara = masks[0]
-        if not env.active[0] or not mascara.any():
-            break                                         # no salió, o sin acción factible (no cierra el ciclo)
-        i = int(env.current_node[0])
-        obs = Observacion(
-            nodo=i, casa=int(start_node), tiempo=float(env.time_elapsed[0]),
-            k_restante=int(env.k_remaining[0]) if env.k_restricted[0] else None,
-            mascara=mascara.copy(),
-            loads_row=env.current_loads_row[0].copy(), rate_row=env.rate_row_obs[0].copy(),
-            precios=env.precios_row[0].copy(), m=float(env.competencia[0]),
-            opciones=env.opciones_validas[0].copy(), dia_semana_salida=int(dow0),
-            indice=env.market_index[0].copy() if getattr(politica, "usa_indice", False) else None,
-            n_rechazos=int(env.n_rechazos[0]), restantes=(env.current_loads_row[0] - env.perdidas[0]),
-        )
+        if not bool(activo.any()):
+            break
+        _sync()
         t0 = time.perf_counter()
-        a = int(politica.actuar(obs))
-        o = int(politica.cotizar(obs, a))
+        a, o, probs = politica.decidir(env, masks, activo)
+        _sync()
         t_dec += time.perf_counter() - t0
-        n_dec += 1
-        if not mascara[a] or not obs.opciones[a, o]:
-            raise RuntimeError(f"{getattr(politica, 'nombre', politica)} eligió ({a}, {o}), fuera de la máscara")
+        n_dec += int(activo.sum())
+        cur = env.current_node
+        antes = dict(
+            a=a, o=o, activo=activo, i=cur, t=env.time_elapsed.double(), precios_a=env.precios_row[filas, a],
+            mediana=env.rate_row_obs[filas, a].double(), m=env.competencia, dia=env.current_day, ltr=env.ltr_actual,
+            ind_i=env.market_index[filas, cur], ind_j=env.market_index[filas, a], n_rech=env.n_rechazos,
+            k_rest=torch.where(env.k_restricted, env.k_remaining, torch.full_like(env.k_remaining, -1)),
+            costo_a=env.cost_rows[filas, a],
+        )
+        if probs is not None:
+            antes["probs"] = probs
+        _, term, masks = env.step(a, o)
+        despues = dict(raw=env.last_raw_reward.double(), cotizo=env.last_cotizo, gano=env.last_gano,
+                       espero=env.last_espero, precio=env.last_precio, pcomp=env.last_precio_competidor,
+                       t2=env.time_elapsed.double(), viol=env.last_time_violation, term=term)
+        log.append({k: v.cpu().numpy() for k, v in {**antes, **despues}.items()})
+        activo = activo & ~term
+    ms = 1000.0 * t_dec / n_dec if n_dec else float("nan")
+    dur = env.time_elapsed.double().cpu().numpy()
+    nodos = env.start_node.cpu().numpy()
+    con_rango = getattr(politica, "precio", None) == "drl"
+    return [_metricas_episodio(b, log, int(nodos[b]), bool(sin_salida[b]), float(dur[b]), ms, con_rango,
+                               distance_arr) for b in range(B)]
+
+
+def _metricas_episodio(b, log, casa, sin_salida, duracion, ms, con_rango, distance_arr) -> dict:
+    """Las métricas de `ejecutar_lote` para el episodio b, a partir del registro por paso (numpy)."""
+    ruta = [casa]
+    margen = millas_carg = millas_tot = horas_rech = mesa = horas_esp = usd_bajo_be = 0.0
+    n_cargas = n_cot = n_esp = n_repos = n_bajo_be = 0
+    niveles, sobre_mediana, pasos, cotizaciones = [], [], [], []
+    cerro = sin_salida                                  # sin ninguna jugada desde casa: no sale (válido)
+    for L in log:
+        if not L["activo"][b]:
+            break
+        i, a, o = int(L["i"][b]), int(L["a"][b]), int(L["o"][b])
+        cotizo, gano, espero = bool(L["cotizo"][b]), bool(L["gano"][b]), bool(L["espero"][b])
+        raw = float(L["raw"][b])
+        t_antes, t_despues = float(L["t"][b]), float(L["t2"][b])
+        mediana = float(L["mediana"][b])
+        d_ia = float(distance_arr[i, a])
         rango = None
         if con_rango and o < N_NIVELES and a != i:
-            lo, hi = banda_precio(politica.probs_precio, o)
-            banda = obs.precios[a, lo:hi + 1]
-            rango = dict(desde=i, hacia=a, millas=float(distance_arr[i, a]), piso=float(banda.min()), tope=float(banda.max()),
-                         referencia=float(obs.precios[a, o]), nivel=int(o), nivel_piso=lo, nivel_tope=hi,
-                         break_even=float(env.cost_rows[0, a] / distance_arr[i, a]),
-                         mediana=float(obs.rate_row[a]), gano=False)
-        mediana = float(obs.rate_row[a])
-        t_antes = float(env.time_elapsed[0])
-        _, terminated, masks = env.step(np.array([a], dtype=np.int64), np.array([o], dtype=np.int64))
-        margen += float(env.last_raw_reward[0])
-        cotizo, gano, espero = bool(env.last_cotizo[0]), bool(env.last_gano[0]), bool(env.last_espero[0])
+            lo, hi = banda_precio(L["probs"][b], o)
+            banda = L["precios_a"][b, lo:hi + 1]
+            rango = dict(desde=i, hacia=a, millas=d_ia, piso=float(banda.min()), tope=float(banda.max()),
+                         referencia=float(L["precios_a"][b, o]), nivel=o, nivel_piso=lo, nivel_tope=hi,
+                         break_even=float(L["costo_a"][b] / d_ia), mediana=mediana, gano=gano)
+        margen += raw
         u = float(U_NIVELES_ARR[o]) if cotizo else float("nan")
         pasos.append(dict(
             paso=len(pasos) + 1, desde=i, hacia=a,
             accion=(("cotiza y gana" if gano else "cotiza y pierde") if cotizo
                     else "espera" if espero else "viaja vacío"),
             nivel=o if cotizo else None, u=u,
-            precio_cotizado_usd_mi=float(obs.precios[a, o]) if cotizo else float("nan"),
+            precio_cotizado_usd_mi=float(L["precios_a"][b, o]) if cotizo else float("nan"),
             mediana_usd_mi=mediana,
-            p_ganar=float(prob_ganar(u, obs.m)) if cotizo else float("nan"),
-            precio_competidor_usd_mi=float(env.last_precio_competidor[0]) if cotizo else float("nan"),
-            millas=0.0 if ((cotizo and not gano) or espero) else float(distance_arr[i, a]),
-            reward_usd=float(env.last_raw_reward[0]),
-            horas_transcurridas=t_antes,
-            horas_paso=float(env.time_elapsed[0]) - t_antes,
-            rango=rango,
+            p_ganar=float(prob_ganar(u, float(L["m"][b]))) if cotizo else float("nan"),
+            precio_competidor_usd_mi=float(L["pcomp"][b]) if cotizo else float("nan"),
+            millas=0.0 if ((cotizo and not gano) or espero) else d_ia,
+            reward_usd=raw, horas_transcurridas=t_antes, horas_paso=t_despues - t_antes, rango=rango,
+            # Estado del mercado en la decisión (validate_pricing lo usa para estudiar el precio).
+            dia_abs=int(L["dia"][b]), ltr=float(L["ltr"][b]), m=float(L["m"][b]),
+            indice_origen=float(L["ind_i"][b]), indice_destino=float(L["ind_j"][b]),
+            rechazos_previos=int(L["n_rech"][b]), k_restante=int(L["k_rest"][b]) if L["k_rest"][b] >= 0 else None,
         ))
         if rango is not None:
-            rango["gano"] = gano
             cotizaciones.append(rango)
         if cotizo:
             n_cot += 1
             niveles.append(o)
         if cotizo and not gano:
-            horas_rech += float(env.time_elapsed[0]) - t_antes
+            horas_rech += t_despues - t_antes
         elif espero:
             n_esp += 1
-            horas_esp += float(env.time_elapsed[0]) - t_antes
+            horas_esp += t_despues - t_antes
         else:                                             # viajó (ganó o VACÍO)
             ruta.append(a)
-            millas_tot += float(distance_arr[i, a])
+            millas_tot += d_ia
             if gano:
-                millas_carg += float(distance_arr[i, a])
+                millas_carg += d_ia
                 n_cargas += 1
-                p = float(env.last_precio[0])
+                p = float(L["precio"][b])
                 sobre_mediana.append(p - mediana)
-                mesa += (float(env.last_precio_competidor[0]) - p) * float(distance_arr[i, a])
-                if float(env.last_raw_reward[0]) < 0:     # ganó por debajo del costo de la lane
+                mesa += (float(L["pcomp"][b]) - p) * d_ia
+                if raw < 0:                               # ganó por debajo del costo de la lane
                     n_bajo_be += 1
-                    usd_bajo_be += float(env.last_raw_reward[0])
-            elif a != start_node:
+                    usd_bajo_be += raw
+            elif a != casa:
                 n_repos += 1
-        if terminated[0]:
-            cerro = (len(ruta) > 1 and ruta[-1] == start_node) and not bool(env.last_time_violation[0])
+        if L["term"][b]:
+            cerro = (len(ruta) > 1 and ruta[-1] == casa) and not bool(L["viol"][b])
             break
     if not cerro:
         margen += PENALIZACION_USD
     return dict(
-        margen=margen,
-        violacion=not cerro,
+        margen=margen, violacion=not cerro,
         frac_millas_cargadas=millas_carg / millas_tot if millas_tot > 0 else float("nan"),
-        millas_totales=millas_tot,
-        millas_cargadas=millas_carg,
-        n_cargas=n_cargas,
-        duracion=float(env.time_elapsed[0]),
-        ms_decision=1000.0 * t_dec / n_dec if n_dec else float("nan"),
-        ruta=ruta,
-        n_cotizaciones=n_cot,
-        n_ganadas=n_cargas,
-        horas_rechazo=horas_rech,
-        niveles=niveles,
-        usd_mi_sobre_mediana=float(np.mean(sobre_mediana)) if sobre_mediana else float("nan"),
-        dinero_en_la_mesa=mesa,
-        n_esperas=n_esp,
-        horas_espera=horas_esp,
-        n_reposiciones=n_repos,
-        n_bajo_be=n_bajo_be,
-        usd_bajo_be=usd_bajo_be,
-        pasos=pasos,
-        ruta_precios=ruta_con_precios(pasos),
-        cotizaciones=cotizaciones,
-        precios_por_arco=precios_por_arco(pasos) if con_rango else "",
+        millas_totales=millas_tot, millas_cargadas=millas_carg, n_cargas=n_cargas, duracion=duracion,
+        ms_decision=ms, ruta=ruta, n_cotizaciones=n_cot, n_ganadas=n_cargas, horas_rechazo=horas_rech,
+        niveles=niveles, usd_mi_sobre_mediana=float(np.mean(sobre_mediana)) if sobre_mediana else float("nan"),
+        dinero_en_la_mesa=mesa, n_esperas=n_esp, horas_espera=horas_esp, n_reposiciones=n_repos,
+        n_bajo_be=n_bajo_be, usd_bajo_be=usd_bajo_be, pasos=pasos, ruta_precios=ruta_con_precios(pasos),
+        cotizaciones=cotizaciones, precios_por_arco=precios_por_arco(pasos) if con_rango else "",
     )
 
 
@@ -406,89 +348,44 @@ def ruta_con_precios(pasos) -> str:
     return " | ".join(partes)
 
 
-class _UnHilo:
-    """Contexto: fija torch en un solo hilo (tiempos en CPU comparables) y lo restaura."""
-
-    def __enter__(self):
-        self._prev = torch.get_num_threads()
-        torch.set_num_threads(1)
-
-    def __exit__(self, *exc):
-        torch.set_num_threads(self._prev)
-
-
 class ContextoEval:
-    """Datos y políticas comunes de una evaluación (simulada o replay)."""
+    """Datos, entorno y políticas comunes de una evaluación (simulada o replay)."""
 
     def __init__(self, agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
-                 ltr_stack, avail_expected_arr, reward_global_p95):
-        self.agent_cpu = None if agent is None else copy.deepcopy(agent).to("cpu").eval()   # DRL en CPU, un hilo
+                 avail_expected_arr, reward_global_p95):
+        self.agent = None if agent is None else agent.to(DEVICE).eval()
         self.market, self.tabla = market, tabla
         self.T = np.asarray(time_matrix, dtype=float)
         self.dist, self.diesel, self.N = distance_arr, diesel_arr, num_nodes
-        self.ltr = ltr_stack
         self.avail, self.p95 = avail_expected_arr, reward_global_p95
         self.est = market.estadisticas_dow(distance_arr, diesel_arr)            # entrada del DRL, una vez por evaluación
         self.ev = calcular_ev_pronostico(market, distance_arr, diesel_arr)   # la tabla de B2/B2P (solo entra a la huella del caché)
+        self.env = VectorRoutingEnv(time_matrix, distance_arr, diesel_arr, market, device=DEVICE)
+        self._entradas = None
         self.politicas = {
-            "B1": PoliticaB1(distance_arr, diesel_arr),
+            "B1": PoliticaB1(self.T, distance_arr, diesel_arr),
             "B2": PoliticaB2(market, self.T, distance_arr, diesel_arr),
             "B2P": PoliticaB2P(market, self.T, distance_arr, diesel_arr),
         }
         if tabla is not None:                      # None: UB-DP "no tratable" ⇒ sin B3
-            self.politicas["B3"] = PoliticaB3(tabla, distance_arr, diesel_arr)
+            self.politicas["B3"] = PoliticaB3(tabla, self.T, distance_arr, diesel_arr)
         self.baselines = tuple(b for b in _BASELINES if b in self.politicas)
 
-    def politica_dp(self, env):
-        """Diagnóstico (fuera de la comparación B): las rutas del DRL con el precio óptimo de la tabla de B3. None si la
-        tabla no existe a este tamaño. Mide cuánto margen de mejora le queda al precio del DRL, a ruta fija."""
-        return PoliticaDRL(self, env, "dp") if "B3" in self.politicas else None
+    def entradas(self, env) -> EntradasAgente:
+        if self._entradas is None:
+            self._entradas = EntradasAgente.crear(env, self.avail, self.est, self.p95)
+        return self._entradas
 
-    def politicas_drl(self, env) -> dict:
-        """DRL completo y destino del DRL con cada regla de precio (comparación B), sobre `env`."""
-        return {"DRL": PoliticaDRL(self, env, "drl"),
-                **{f"DRL-dest+{r}": PoliticaDRL(self, env, r) for r in REGLAS_PRECIO}}
-
-
-# ── UB-PI ─────────────────────────────────────────────────────
-
-def mundo_ub_pi(tablero: Tablero) -> tuple:
-    """(loads, tarifas) para solve_ub_pi a partir de un Tablero (D, N, N, ...): con los competidores conocidos, en
-    cada lane se toma la mejor de las cargas cotizables (a lo sumo COTIZACIONES_MAX_POR_NODO) y se cotiza el nivel
-    más alto que gana. No cobra los 15 min de las cargas que habría que perder antes: sigue siendo cota. Si ningún
-    nivel gana en ninguna, la lane queda sin carga: solo se puede recorrer vacía, si las reglas lo permiten."""
-    C = tablero.u_comp.shape[-1]
-    existe = np.arange(C) < np.asarray(tablero.loads)[..., None]                  # (D, N, N, C)
-    u_mejor = np.where(existe, tablero.u_comp, 0.0).max(axis=-1)                  # la carga con el competidor más caro
-    gana_k = gana(U_NIVELES_ARR, u_mejor[..., None])                              # (D, N, N, K)
-    k_mejor = (N_NIVELES - 1) - np.argmax(gana_k[..., ::-1], axis=-1)            # el más alto que gana
-    tarifa = np.take_along_axis(tablero.precios, k_mejor[..., None], axis=-1)[..., 0]
-    loads = np.where(gana_k.any(axis=-1), tablero.loads, 0)
-    return loads, tarifa
+    def politica(self, nombre: str):
+        """La política del arnés para el método `nombre` (DRL, DRL-dest+<regla>, DRL-dest+dp o un baseline)."""
+        if nombre == "DRL":
+            return PoliticaDRL(self, "drl")
+        if nombre.startswith("DRL-dest+"):
+            return PoliticaDRL(self, nombre.split("+", 1)[1])
+        return PoliticaBaseline(self.politicas[nombre], nombre)
 
 
-def tablero_replay(market, semilla: int, dias_abs) -> Tablero:
-    """Tablero (D, N, N, ...) de los días reales `dias_abs` con el competidor de la semilla del caso: el mismo
-    que ve el entorno de replay en cada (nodo, día)."""
-    N = market.num_nodes
-    nodos = np.arange(N)
-    return Tablero.apilar([market.tablero_real(nodos, np.full(N, int(d)), np.full(N, semilla)) for d in dias_abs])
-
-
-def ub_pi(time_matrix, distance_arr, diesel_arr, start_node, K, mundo, start_day_idx=0) -> tuple:
-    """UB-PI: mejor ruta con el mundo completo conocido, vía DP hacia atrás (baselines.ub_pi.solve_ub_pi).
-
-    mundo = (loads [D, N, N], tarifa [D, N, N]) de `mundo_ub_pi` (tarifa = la del nivel más alto que gana).
-    Estado (nodo, franja de UBPI_DT_HORAS, k): el camión puede revisitar nodos. Devuelve (margen, ruta);
-    (nan, None) si no hay ruta factible.
-    """
-    loads, rates = mundo
-    valor, ruta = solve_ub_pi(
-        start_node, np.asarray(time_matrix, dtype=float), rates, loads,
-        distance_arr, diesel_arr, MAX_DURATION, start_day_idx=start_day_idx, k_max=K,
-    )
-    return (float(valor), ruta) if ruta is not None else (float("nan"), None)
-
+# ── Mundos de evaluación ─────────────────────────────────────
 
 def _etiqueta_k(K) -> str:
     return "libre" if K is None else str(int(K))
@@ -508,11 +405,12 @@ def dias_de_salida(num_dias: int) -> int:
 
 def disenar_mundos(num_nodes: int, M: int, market, num_dias: int = TRAIN_DAYS,
                    semilla: int = MARKET_SEED_EVAL) -> dict:
-    """Diseño de M mundos de evaluación a partir de MARKET_SEED_EVAL.
+    """Diseño de M episodios de evaluación a partir de `semilla`.
 
     Cada nodo aparece ⌊M/N⌋ o ⌈M/N⌉ veces y cada día de la semana ⌊M/7⌋ o ⌈M/7⌉ veces; los
-    dos se barajan por separado, así que el día no queda atado al nodo. start_day_idx es un
-    día del histórico (de los `num_dias` primeros) con ese día de la semana.
+    dos se barajan por separado, así que el día no queda atado al nodo. start_day es un
+    día del histórico (de los `num_dias` primeros) con ese día de la semana. Los mundos (cargas, competidores y δ)
+    se sortean después en el dispositivo con la misma semilla (`mundos_eval`).
     """
     rng = np.random.default_rng(semilla)
     nodos = _asignacion_balanceada(num_nodes, M, rng)
@@ -520,22 +418,83 @@ def disenar_mundos(num_nodes: int, M: int, market, num_dias: int = TRAIN_DAYS,
     dias = np.arange(dias_de_salida(num_dias))
     dow_dia = market.dia_semana(dias)
     inicio = np.array([rng.choice(dias[dow_dia == d]) for d in dows], dtype=np.int64)
-    semillas = rng.integers(0, 2**31 - 1, size=M, dtype=np.int64)
-    return dict(nodo=nodos.astype(np.int64), dow=dows.astype(np.int64),
-                start_day=inicio, world_seed=semillas)
+    return dict(nodo=nodos.astype(np.int64), dow=dows.astype(np.int64), start_day=inicio)
 
+
+def casos_replay(num_nodes: int, num_dias: int, max_casos: int = REPLAY_MAX_CASOS,
+                 semilla: int = MARKET_SEED_EVAL + 1) -> tuple:
+    """Casos (nodo, día de evaluación): todos los pares si caben en `max_casos`; si no, un subconjunto balanceado
+    (cada nodo y cada día aparecen ⌊·⌋ o ⌈·⌉ veces, barajados por separado). Los competidores del replay se sortean
+    en el dispositivo con la misma semilla (`mundos_eval`)."""
+    rng = np.random.default_rng(semilla)
+    num_dias = dias_de_salida(num_dias)
+    if num_nodes * num_dias <= max_casos:
+        nodos, dias = np.meshgrid(np.arange(num_nodes), np.arange(num_dias), indexing="ij")
+        nodos, dias = nodos.ravel(), dias.ravel()
+    else:
+        nodos = _asignacion_balanceada(num_nodes, max_casos, rng)
+        dias = _asignacion_balanceada(num_dias, max_casos, rng)
+    return nodos.astype(np.int64), dias.astype(np.int64)
+
+
+def mundos_eval(market, dia0_abs, dia_max_abs: int, semilla: int, replay: bool = False):
+    """Los mundos de los episodios de evaluación (uno por día de salida `dia0_abs`), sorteados en el dispositivo con
+    `semilla`: simulados (cargas, competidores y δ del proceso) o replay (cargas reales, solo el competidor)."""
+    g = torch.Generator(device=DEVICE).manual_seed(int(semilla))
+    f = market.mundos_replay if replay else market.sortear_mundos
+    return f(np.asarray(dia0_abs), MARKET_DIAS_EPISODIO, dia_max_abs, g)
+
+
+# ── UB-PI ─────────────────────────────────────────────────────
+
+def mundos_ub_pi(market, mundos, bloque: int = 64) -> tuple:
+    """(loads, tarifas) (M, D, N, N) para solve_ub_pi a partir de los mundos: el día d es el tablero que ve el entorno
+    al llegar el día dia0 + d (recortado al último día con datos). Con los competidores conocidos, en cada lane se toma
+    la mejor de las cargas cotizables (a lo sumo COTIZACIONES_MAX_POR_NODO) y se cotiza el nivel más alto que gana. No
+    cobra los 15 min de las cargas que habría que perder antes: sigue siendo cota. Si ningún nivel gana en ninguna, la
+    lane queda sin carga: solo se puede recorrer vacía, si las reglas lo permiten."""
+    tab = market.tensores(mundos.loads.device)
+    dev = mundos.loads.device
+    D, C, K = mundos.loads.shape[1], mundos.u.shape[-1], N_NIVELES
+    u_niv = torch.as_tensor(U_NIVELES_ARR, dtype=torch.float64, device=dev)
+    L_out, R_out = [], []
+    for ini in range(0, mundos.B, bloque):
+        b = torch.arange(ini, min(ini + bloque, mundos.B), device=dev)
+        dias = (mundos.dia0[b, None] + torch.arange(D, device=dev)[None, :]).clamp(max=mundos.dia_max)   # (b, D)
+        slot = dias - mundos.dia0[b, None]
+        loads = mundos.loads[b[:, None], slot]                                              # (b, D, N, N)
+        m = tab["m"][dias][..., None, None]                                                 # (b, D, N, 1, 1)
+        u_comp = 1.0 - torch.pow(1.0 - mundos.u[b[:, None], slot].double(), 1.0 / m)       # (b, D, N, N, C)
+        existe = torch.arange(C, device=dev) < loads[..., None]
+        u_mejor = torch.where(existe, u_comp, torch.zeros_like(u_comp)).amax(dim=-1)       # competidor más caro
+        gana_k = u_niv < u_mejor[..., None]                                                 # (b, D, N, N, K)
+        k_mejor = (K - 1) - gana_k.flip(-1).long().argmax(dim=-1)                          # el más alto que gana
+        precios = tab["precios"][dias] * torch.exp(mundos.delta[b])[:, None, None, None, None]
+        tarifa = torch.gather(precios, -1, k_mejor[..., None])[..., 0]
+        L_out.append(torch.where(gana_k.any(dim=-1), loads, torch.zeros_like(loads)).cpu().numpy())
+        R_out.append(tarifa.cpu().numpy())
+    return np.concatenate(L_out), np.concatenate(R_out)
+
+
+def ub_pi(time_matrix, distance_arr, diesel_arr, start_nodes, K, loads, rates) -> np.ndarray:
+    """UB-PI de M mundos: valor de la mejor ruta con el mundo completo conocido, vía DP hacia atrás en el dispositivo
+    (baselines.ub_pi.solve_ub_pi_lote). loads, rates : (M, D, N, N) de `mundos_ub_pi` (tarifa = la del nivel más alto
+    que gana), día 0 = salida. Estado (nodo, franja de UBPI_DT_HORAS, k): el camión puede revisitar nodos."""
+    return solve_ub_pi_lote(start_nodes, np.asarray(time_matrix, dtype=float), rates, loads, distance_arr, diesel_arr,
+                            MAX_DURATION, k_max=K)
+
+
+# ── Filas, caché y combinación ────────────────────────────────
 
 _COLS_METRICAS = ("margen", "violacion", "frac_millas_cargadas", "millas_totales", "millas_cargadas", "n_cargas", "duracion", "ms_decision", "ruta",
                   "ruta_precios", "precios_por_arco", "cotizaciones", "pasos", "n_cotizaciones", "n_ganadas", "horas_rechazo", "niveles", "usd_mi_sobre_mediana",
                   "dinero_en_la_mesa", "n_esperas", "horas_espera", "n_reposiciones", "n_bajo_be", "usd_bajo_be")
 
 
-def _fila(modo, K, mundo, nodo, dia_abs, start_day, world_seed, dow, metodo, m, ub_dp, ub_pi_val) -> dict:
+def _fila(modo, K, mundo, nodo, dia_abs, start_day, dow, metodo, m, ub_dp, ub_pi_val) -> dict:
     fila = {
         "modo": modo, "K": _etiqueta_k(K), "mundo": mundo, "nodo_inicio": int(nodo),
-        "dia_abs": int(dia_abs), "start_day_idx": int(start_day),
-        "dia_semana": int(dow), "world_seed": -1 if world_seed is None else int(world_seed),
-        "metodo": metodo,
+        "dia_abs": int(dia_abs), "start_day_idx": int(start_day), "dia_semana": int(dow), "metodo": metodo,
     }
     fila.update({c: m[c] for c in _COLS_METRICAS})
     if modo != "simulado":
@@ -546,8 +505,8 @@ def _fila(modo, K, mundo, nodo, dia_abs, start_day, world_seed, dow, metodo, m, 
 
 def _firma_cache(ctx, *partes) -> str:
     """Huella de lo que determina los baselines y las cotas: los parámetros del mercado, el ev, la tabla V
-    de UB-DP, la regla de precio de los baselines y el diseño de la evaluación. Si cambia algo de eso, el
-    caché no se reutiliza."""
+    de UB-DP, la regla de precio de los baselines, el diseño de la evaluación y el dispositivo (los mundos se
+    sortean con el generador del dispositivo). Si cambia algo de eso, el caché no se reutiliza."""
     h = hashlib.sha1(ctx.market.firma_params().encode())
     h.update(np.ascontiguousarray(ctx.ev.ev).tobytes())   # q y b salen de los parámetros del mercado (ya en firma_params)
     if ctx.tabla is None:
@@ -555,8 +514,8 @@ def _firma_cache(ctx, *partes) -> str:
     else:
         h.update(np.ascontiguousarray(ctx.tabla.V_k).tobytes())
         h.update(np.ascontiguousarray(ctx.tabla.V_libre).tobytes())
-    h.update(repr((partes, MAX_DURATION, REGLA_PRECIO_BASELINES, "cotizacion", "pasos por arco",
-                   "esperar-reposicionar", "perder cuesta", "fallas penalizadas", "varias cargas, vuelta, dias de salida", "millas totales", COTIZACIONES_MAX_POR_NODO, PENALIZACION_USD, REPOSICION_MAX_MILLAS, tuple(U_NIVELES_ARR))).encode())
+    h.update(repr((partes, DEVICE.type, MAX_DURATION, REGLA_PRECIO_BASELINES, "mundos en el dispositivo", "lote",
+                   COTIZACIONES_MAX_POR_NODO, PENALIZACION_USD, REPOSICION_MAX_MILLAS, tuple(U_NIVELES_ARR))).encode())
     return h.hexdigest()
 
 
@@ -615,167 +574,138 @@ def _combinar(base: pd.DataFrame, drl: pd.DataFrame, k_levels) -> pd.DataFrame:
     return df.iloc[clave.sort_values(["m", "k", "n"], kind="stable").index].reset_index(drop=True)
 
 
-def _filas_drl(ctx, env, casos, k_levels, cota, modo, verbose) -> list:
-    """Filas del DRL y de la comparación B para cada caso (m, nodo, día del env, día abs, semilla, dow)."""
-    pols = ctx.politicas_drl(env)
+# ── Evaluación: mundos simulados y replay ─────────────────────
+
+class _Casos:
+    """Los episodios de una evaluación: un mundo por caso, repetido por cada nivel de K (lote = casos × K)."""
+
+    def __init__(self, nodos, dia0_abs, dows, dias_reporte, mundos, k_levels):
+        self.nodos, self.dia0, self.dows, self.dias_reporte = nodos, dia0_abs, dows, dias_reporte
+        self.M, self.k_levels = len(nodos), list(k_levels)
+        self.mundos = mundos
+        self.lote_mundos = mundos.tomar(np.tile(np.arange(self.M), len(self.k_levels)))
+        self.lote_nodos = np.tile(nodos, len(self.k_levels))
+        self.lote_k = [K for K in self.k_levels for _ in range(self.M)]
+
+    def filas(self, modo, metodo, res, cota) -> list:
+        """Filas del DataFrame para los resultados `res` (lista del lote) de `metodo`; cota[(K, m)] = (ub_dp, ub_pi)."""
+        out = []
+        for n, K in enumerate(self.k_levels):
+            for m in range(self.M):
+                dp, pi = cota[(_etiqueta_k(K), m)]
+                out.append(_fila(modo, K, m, self.nodos[m], self.dias_reporte[m], self.dia0[m] - (TRAIN_DAYS if modo == "replay" else 0),
+                                 self.dows[m], metodo, res[n * self.M + m], dp, pi))
+        return out
+
+
+def _correr_baselines(ctx, casos, modo, nombres_k=None, verbose=True) -> dict:
+    """{método: resultados del lote} de los baselines (todos, o solo los pares (K, método) de `nombres_k`)."""
+    out = {}
+    for nombre in ctx.baselines:
+        if nombres_k is not None and not any(n == nombre for _, n in nombres_k):
+            continue
+        t0 = time.perf_counter()
+        out[nombre] = ejecutar_lote(ctx.politica(nombre), ctx.env, casos.lote_mundos, casos.lote_nodos, casos.lote_k,
+                                    ctx.dist)
+        if verbose:
+            print(f"  {modo}: {nombre} en {time.perf_counter() - t0:.1f} s", flush=True)
+    return out
+
+
+def _cotas(ctx, casos, modo, verbose=True) -> dict:
+    """{(K, m): (ub_dp, ub_pi)} de cada caso y nivel de K. UB-DP solo en mundos simulados."""
+    loads, rates = mundos_ub_pi(ctx.market, casos.mundos)
+    cota = {}
+    t0 = time.perf_counter()
+    for K in casos.k_levels:
+        pi = ub_pi(ctx.T, ctx.dist, ctx.diesel, casos.nodos, K, loads, rates)
+        for m in range(casos.M):
+            dp = (ctx.tabla.ub_dp(int(casos.nodos[m]), int(casos.dows[m]), K)
+                  if modo == "simulado" and ctx.tabla is not None and (K is None or 2 <= K <= ctx.tabla.K)
+                  else float("nan"))
+            cota[(_etiqueta_k(K), m)] = (dp, float(pi[m]))
+    if verbose:
+        print(f"  {modo}: UB-PI en {time.perf_counter() - t0:.1f} s", flush=True)
+    return cota
+
+
+def _evaluar(ctx, casos, modo, cache_path, firma, verbose) -> pd.DataFrame:
+    """Baselines y cotas (con caché) + DRL y comparación B, sobre los mismos episodios."""
+    def baselines(faltan=None, cota_previa=None):
+        if faltan is None:
+            cota = _cotas(ctx, casos, modo, verbose)
+        else:
+            cota = {(k, m): tuple(v) for (k, m), v in cota_previa[["ub_dp", "ub_pi"]].iterrows()}
+        res = _correr_baselines(ctx, casos, modo, faltan, verbose)
+        filas = []
+        for nombre, r in res.items():
+            filas += [f for f in casos.filas(modo, nombre, r, cota)
+                      if faltan is None or (None if f["K"] == "libre" else int(f["K"]), nombre) in faltan]
+        return pd.DataFrame(filas)
+
+    def completar(df):
+        return _completar_con_baselines(df, casos.k_levels, baselines, ctx.baselines)
+
+    base = _filas_con_cache(cache_path, firma, baselines, verbose, completar)
+    cg = base.groupby(["K", "mundo"])[["ub_dp", "ub_pi"]].first()
+    cota = {(k, m): (float(v["ub_dp"]), float(v["ub_pi"])) for (k, m), v in cg.iterrows()}
     filas = []
-    with _UnHilo():
-        # Calentamiento de torch (primera llamada) fuera de la medición.
-        m0, nodo0, dia0, _, ws0, dow0 = casos[0]
-        ejecutar_politica(pols["DRL"], env, nodo0, dia0, k_levels[0], ws0, ctx.dist, ctx.diesel, dow0)
-        for n, (m, nodo, dia, dia_abs, ws, dow) in enumerate(casos):
-            for K in k_levels:
-                dp, pi = cota.loc[(_etiqueta_k(K), m)]
-                for nombre, pol in pols.items():
-                    res = ejecutar_politica(pol, env, nodo, dia, K, ws, ctx.dist, ctx.diesel, dow)
-                    filas.append(_fila(modo, K, m, nodo, dia_abs, dia, ws, dow, nombre, res, dp, pi))
-            if verbose and (n + 1) % 100 == 0:
-                print(f"  {modo} (DRL y sus rutas con precio fijo): {n + 1}/{len(casos)}", flush=True)
-    return filas
+    for nombre in ("DRL",) + _DRL_REGLAS:
+        t0 = time.perf_counter()
+        res = ejecutar_lote(ctx.politica(nombre), ctx.env, casos.lote_mundos, casos.lote_nodos, casos.lote_k, ctx.dist)
+        filas += casos.filas(modo, nombre, res, cota)
+        if verbose:
+            print(f"  {modo}: {nombre} en {time.perf_counter() - t0:.1f} s", flush=True)
+    df = _combinar(base, pd.DataFrame(filas), casos.k_levels)
+    df.attrs["ub_dp_no_tratable"] = ctx.tabla is None
+    _avisar_si_supera_cota(df)
+    return df
 
 
-def evaluar_mundos_simulados(agent, market, tabla, time_matrix, rate_train, loads_train,
-                             distance_arr, diesel_arr, num_nodes, ltr_stack,
-                             avail_expected_arr, reward_global_p95,
+def evaluar_mundos_simulados(agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
+                             avail_expected_arr, reward_global_p95, num_dias=TRAIN_DAYS,
                              M=MARKET_M_EVAL_WORLDS, k_levels=(K_MAX, None), verbose=True,
                              cache_path=None, semilla_eval=MARKET_SEED_EVAL) -> pd.DataFrame:
     """DRL, comparación B y B1, B2, B2P, B3 sobre los mismos M mundos simulados, por nivel de K.
 
-    Los mismos mundos (nodo, día, world_seed) se usan en todos los niveles de K y todos los métodos.
-    Devuelve un DataFrame largo: una fila por (K, mundo, método) con el margen en USD, la factibilidad,
-    las métricas de cotización y operativas y las cotas ub_dp / ub_pi del mundo.
+    Los mismos mundos se usan en todos los niveles de K y todos los métodos. Devuelve un DataFrame largo: una fila
+    por (K, mundo, método) con el margen en USD, la factibilidad, las métricas de cotización y operativas y las
+    cotas ub_dp / ub_pi del mundo.
 
-    semilla_eval : semilla del diseño de los M mundos (MARKET_SEED_EVAL = conjunto de desarrollo;
+    semilla_eval : semilla del diseño y del sorteo de los M mundos (MARKET_SEED_EVAL = conjunto de desarrollo;
         MARKET_SEED_EVAL_FINAL = conjunto B, test final). Usar un cache_path distinto por semilla.
     cache_path : B1, B2, B2P, B3, UB-PI y UB-DP no dependen del DRL, así que con una ruta se calculan una
         sola vez y se reusan entre corridas (mientras no cambie el proceso, la tabla V ni el diseño).
     """
     ctx = ContextoEval(agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
-                       ltr_stack, avail_expected_arr, reward_global_p95)
-    env = make_sim_env(time_matrix, rate_train, loads_train, distance_arr, diesel_arr, num_nodes, market)
-    dis = disenar_mundos(num_nodes, M, market, num_dias=rate_train.shape[0], semilla=semilla_eval)
-
-    def cotas(nodo, dow, K, mundo_pi):
-        pi, _ = ub_pi(time_matrix, distance_arr, diesel_arr, nodo, K, mundo_pi)
-        dp = (tabla.ub_dp(nodo, dow, K) if tabla is not None and (K is None or 2 <= K <= tabla.K)
-              else float("nan"))
-        return dp, pi
-
-    def baselines(faltan=None, cota_previa=None):
-        """faltan None: todo (cotas y baselines). Con un conjunto de (K, método): solo esos
-        baselines, con las cotas ya calculadas (`cota_previa`)."""
-        filas = []
-        with _UnHilo():
-            for m in range(M):
-                nodo, dow = int(dis["nodo"][m]), int(dis["dow"][m])
-                dia, ws = int(dis["start_day"][m]), int(dis["world_seed"][m])
-                mundo_pi = (mundo_ub_pi(market.mundo_cotizacion(ws, _DIAS_SIMULADOS_UB_PI, dia))
-                            if faltan is None else None)
-                for K in k_levels:
-                    if faltan is None:
-                        dp, pi = cotas(nodo, dow, K, mundo_pi)
-                    else:
-                        dp, pi = cota_previa.loc[(_etiqueta_k(K), m)]
-                    for nombre in ctx.baselines:
-                        if faltan is not None and (K, nombre) not in faltan:
-                            continue
-                        res = ejecutar_politica(ctx.politicas[nombre], env, nodo, dia, K, ws,
-                                                distance_arr, diesel_arr, dow)
-                        filas.append(_fila("simulado", K, m, nodo, dia, dia, ws, dow, nombre, res, dp, pi))
-                if verbose and (m + 1) % 100 == 0:
-                    print(f"  mundos simulados (baselines y cotas): {m + 1}/{M}", flush=True)
-        return pd.DataFrame(filas)
-
-    def completar(df):
-        return _completar_con_baselines(df, k_levels, baselines, ctx.baselines)
-
-    firma = _firma_cache(ctx, "simulado", num_nodes, M, semilla_eval, tuple(k_levels), rate_train.shape[0])
-    base = _filas_con_cache(cache_path, firma, baselines, verbose, completar)
-    cota = base.groupby(["K", "mundo"])[["ub_dp", "ub_pi"]].first()
-
-    casos = [(m, int(dis["nodo"][m]), int(dis["start_day"][m]), int(dis["start_day"][m]),
-              int(dis["world_seed"][m]), int(dis["dow"][m])) for m in range(M)]
-    df = _combinar(base, pd.DataFrame(_filas_drl(ctx, env, casos, k_levels, cota, "simulado", verbose)), k_levels)
-    df.attrs["ub_dp_no_tratable"] = tabla is None
-    _avisar_si_supera_cota(df)
-    return df
+                       avail_expected_arr, reward_global_p95)
+    dis = disenar_mundos(num_nodes, M, market, num_dias=num_dias, semilla=semilla_eval)
+    mundos = mundos_eval(market, dis["start_day"], num_dias - 1, semilla_eval)
+    casos = _Casos(dis["nodo"], dis["start_day"], dis["dow"], dis["start_day"], mundos, k_levels)
+    firma = _firma_cache(ctx, "simulado", num_nodes, M, semilla_eval, tuple(k_levels), num_dias)
+    return _evaluar(ctx, casos, "simulado", cache_path, firma, verbose)
 
 
-def casos_replay(num_nodes: int, num_dias: int, max_casos: int = REPLAY_MAX_CASOS,
-                 semilla: int = MARKET_SEED_EVAL + 1) -> tuple:
-    """Casos (nodo, día de evaluación, semilla del competidor): todos los pares si caben en `max_casos`; si
-    no, un subconjunto balanceado (cada nodo y cada día aparecen ⌊·⌋ o ⌈·⌉ veces, barajados por separado).
-    La semilla de cada caso fija el competidor que enfrentan todos los métodos en ese caso."""
-    rng = np.random.default_rng(semilla)
-    num_dias = dias_de_salida(num_dias)
-    if num_nodes * num_dias <= max_casos:
-        nodos, dias = np.meshgrid(np.arange(num_nodes), np.arange(num_dias), indexing="ij")
-        nodos, dias = nodos.ravel(), dias.ravel()
-    else:
-        nodos = _asignacion_balanceada(num_nodes, max_casos, rng)
-        dias = _asignacion_balanceada(num_dias, max_casos, rng)
-    semillas = rng.integers(0, 2**31 - 1, size=len(nodos), dtype=np.int64)
-    return nodos, dias, semillas
+def evaluar_replay(agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
+                   avail_expected_arr, reward_global_p95, k_levels=(K_MAX, None), max_casos=REPLAY_MAX_CASOS,
+                   verbose=True, cache_path=None) -> pd.DataFrame:
+    """El mismo arnés sobre los días reales de prueba (los días después de TRAIN_DAYS, fuera de muestra): cargas y
+    cuantiles reales del día, competidor sorteado.
 
-
-def evaluar_replay(agent, market, tabla, time_matrix, rate_eval, loads_eval,
-                   distance_arr, diesel_arr, num_nodes, ltr_eval,
-                   avail_expected_arr, reward_global_p95,
-                   k_levels=(K_MAX, None), max_casos=REPLAY_MAX_CASOS, verbose=True,
-                   cache_path=None) -> pd.DataFrame:
-    """El mismo arnés sobre los días reales de prueba (oct 2026, fuera de muestra): cargas y cuantiles reales
-    del día, competidor sorteado con la semilla del caso.
-
-    Fuera de muestra respecto del proceso (se ajusta solo con los TRAIN_DAYS de entrenamiento). ltr_eval
-    debe estar recortado a los mismos días que rate_eval. UB-PI se resuelve sobre los tableros reales con
-    el competidor del caso; UB-DP no aplica (es la referencia del proceso simulado).
+    Fuera de muestra respecto del proceso (se ajusta solo con los TRAIN_DAYS de entrenamiento). UB-PI se resuelve
+    sobre los tableros reales con el competidor del caso; UB-DP no aplica (es la referencia del proceso simulado).
     cache_path : como en evaluar_mundos_simulados, para B1, B2, B2P, B3 y UB-PI.
     """
     ctx = ContextoEval(agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
-                       ltr_eval, avail_expected_arr, reward_global_p95)
-    env = make_replay_env(time_matrix, rate_eval, loads_eval, distance_arr, diesel_arr, num_nodes,
-                          day_offset=TRAIN_DAYS, market=market)
-    nodos, dias, semillas = casos_replay(num_nodes, rate_eval.shape[0], max_casos)
-    D = rate_eval.shape[0]
-
-    def baselines(faltan=None, cota_previa=None):
-        filas = []
-        with _UnHilo():
-            for c, (nodo, dia, ws) in enumerate(zip(nodos, dias, semillas)):
-                nodo, dia, ws = int(nodo), int(dia), int(ws)
-                dow = int(market.dia_semana(TRAIN_DAYS + dia))
-                mundo_pi = (mundo_ub_pi(tablero_replay(market, ws, TRAIN_DAYS + np.arange(D)))
-                            if faltan is None else None)
-                for K in k_levels:
-                    if faltan is None:
-                        pi, _ = ub_pi(time_matrix, distance_arr, diesel_arr, nodo, K, mundo_pi, start_day_idx=dia)
-                    else:
-                        pi = cota_previa.loc[(_etiqueta_k(K), c), "ub_pi"]
-                    for nombre in ctx.baselines:
-                        if faltan is not None and (K, nombre) not in faltan:
-                            continue
-                        res = ejecutar_politica(ctx.politicas[nombre], env, nodo, dia, K, ws,
-                                                distance_arr, diesel_arr, dow)
-                        filas.append(_fila("replay", K, c, nodo, TRAIN_DAYS + dia, dia, ws, dow,
-                                           nombre, res, float("nan"), pi))
-                if verbose and (c + 1) % 100 == 0:
-                    print(f"  replay (baselines y cotas): {c + 1}/{len(nodos)}", flush=True)
-        return pd.DataFrame(filas)
-
-    def completar(df):
-        return _completar_con_baselines(df, k_levels, baselines, ctx.baselines)
-
-    firma = _firma_cache(ctx, "replay", num_nodes, max_casos, tuple(k_levels), rate_eval.shape[0],
-                         loads_eval.shape, float(loads_eval.sum()), float(rate_eval.sum()))
-    base = _filas_con_cache(cache_path, firma, baselines, verbose, completar)
-    cota = base.groupby(["K", "mundo"])[["ub_dp", "ub_pi"]].first()
-
-    casos = [(c, int(n), int(d), TRAIN_DAYS + int(d), int(ws), int(market.dia_semana(TRAIN_DAYS + int(d))))
-             for c, (n, d, ws) in enumerate(zip(nodos, dias, semillas))]
-    df = _combinar(base, pd.DataFrame(_filas_drl(ctx, env, casos, k_levels, cota, "replay", verbose)), k_levels)
-    df.attrs["ub_dp_no_tratable"] = tabla is None
-    _avisar_si_supera_cota(df)
-    return df
+                       avail_expected_arr, reward_global_p95)
+    D = market.num_dias_total - TRAIN_DAYS
+    nodos, dias = casos_replay(num_nodes, D, max_casos)
+    dia0 = TRAIN_DAYS + dias
+    mundos = mundos_eval(market, dia0, market.num_dias_total - 1, MARKET_SEED_EVAL + 1, replay=True)
+    dows = market.dia_semana(dia0).astype(np.int64)
+    casos = _Casos(nodos, dia0, dows, dia0, mundos, k_levels)
+    firma = _firma_cache(ctx, "replay", num_nodes, max_casos, tuple(k_levels), D)
+    return _evaluar(ctx, casos, "replay", cache_path, firma, verbose)
 
 
 def _avisar_si_supera_cota(df: pd.DataFrame, tol: float = 1e-6) -> None:

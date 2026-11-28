@@ -20,10 +20,11 @@ Salida
 import argparse
 import os
 
+import torch  # noqa: F401  (antes que pandas: en Windows, pandas primero rompe la carga de las DLL de torch)
 import pandas as pd
 
 from config import (
-    SEED, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, K_MAX, TRAIN_DAYS, MARKET_M_EVAL_WORLDS, set_seeds,
+    SEED, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, K_MAX, MARKET_M_EVAL_WORLDS, set_seeds,
 )
 from baselines.dp_relajada import cargar_o_calcular_tabla
 from evaluation import evaluar_mundos_simulados, resumen_metodos
@@ -50,8 +51,7 @@ def run(num_nodes: int, k_levels, n_worlds: int, checkpoint_dir: str = None,
     )
     agent.eval()
 
-    time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
-        ltr_stack, avail_expected_arr, reward_global_p95 = load_matrices(num_nodes)
+    time_matrix, _, _, distance_arr, diesel_arr, _, avail_expected_arr, reward_global_p95 = load_matrices(num_nodes)
 
     asegurar_parametros()
     market = MarketProcess(num_nodes)
@@ -59,9 +59,8 @@ def run(num_nodes: int, k_levels, n_worlds: int, checkpoint_dir: str = None,
     tabla = cargar_o_calcular_tabla(market, time_matrix, distance_arr, diesel_arr, K=k_tabla)
 
     df = evaluar_mundos_simulados(
-        agent, market, tabla, time_matrix,
-        rate_stack[:TRAIN_DAYS], loads_stack[:TRAIN_DAYS], distance_arr, diesel_arr, num_nodes,
-        ltr_stack, avail_expected_arr, reward_global_p95,
+        agent, market, tabla, time_matrix, distance_arr, diesel_arr, num_nodes,
+        avail_expected_arr, reward_global_p95,
         M=n_worlds, k_levels=tuple(k_levels),
     )
     resumen = resumen_metodos(df)

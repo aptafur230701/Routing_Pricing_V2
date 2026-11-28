@@ -12,6 +12,34 @@ import random
 import numpy as np
 import torch
 
+# ── Device ───────────────────────────────────────────────────
+GPU_PREFERIDA = ""   # Subcadena del nombre de la GPU a preferir (p.ej. "3070 Ti");
+                      # vacío = usar la GPU por defecto (cuda:0) de la máquina.
+
+
+def _elegir_device() -> torch.device:
+    """Si GPU_PREFERIDA está vacío, usa la GPU por defecto (cuda:0). Si se especifica,
+    busca una GPU cuyo nombre la contenga (por nombre, no por índice: el orden de CUDA
+    puede diferir del de nvidia-smi). Se fija además como dispositivo por defecto, para que
+    torch.cuda.manual_seed y current_device() apunten a la misma GPU."""
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    if not GPU_PREFERIDA:
+        torch.cuda.set_device(0)
+        return torch.device("cuda:0")
+    for i in range(torch.cuda.device_count()):
+        if GPU_PREFERIDA in torch.cuda.get_device_name(i):
+            torch.cuda.set_device(i)
+            return torch.device(f"cuda:{i}")
+    import warnings
+    warnings.warn(f"GPU '{GPU_PREFERIDA}' no visible (CUDA_VISIBLE_DEVICES="
+                  f"{os.environ.get('CUDA_VISIBLE_DEVICES')!r}); usando {torch.cuda.get_device_name(0)}.")
+    return torch.device("cuda:0")
+
+
+DEVICE = _elegir_device()
+EN_GPU = DEVICE.type == "cuda"   # los tamaños de corrida salen de aquí (ver "Tamaños de corrida" más abajo)
+
 # ── Problem identity ──────────────────────────────────────────
 MPG             = 6.5
 MARGINAL_COST_SIN_DIESEL = 1.73
@@ -49,12 +77,14 @@ AM_DROPOUT  = 0.0   # Dropout en las sublayers del encoder (nunca en el path de 
                     # se calculan con distinto modo train/eval.
 
 # ── PPO hyperparameters ───────────────────────────────────────
-PPO_N_EPISODES_PER_UPDATE = 700    # Episodios recolectados antes de cada update PPO
+# Tamaños de corrida: se eligen solos según el dispositivo. En GPU (el servidor, A100) son los de la tesis; en CPU (el
+# computador personal) son pruebas chicas del mismo código, idealmente a 10 nodos, que no sirven como resultado.
+# Episodios por update y minibatch en GPU: los del HPO (700 y 512; results/20nodes/best_ppo_hyperparams.json), con los
+# que están calibrados el LR, las entropías y el clip. Todos los episodios corren en paralelo en la GPU (un solo rollout
+# batcheado). El número de updates por tamaño (get_n_updates) no depende del dispositivo.
+PPO_N_EPISODES_PER_UPDATE = 700 if EN_GPU else 256
 PPO_N_EPOCHS              = 4      # Épocas de entrenamiento PPO por rollout
-PPO_BATCH_SIZE            = 512    # Tamaño de batch para entrenamiento PPO. Subido de 64: la GPU
-                                    # está dominada por overhead de lanzamiento de kernels a batch
-                                    # pequeño (tiempo/batch ~constante de 64 a 700), así que un batch
-                                    # mayor da ~3.4x más rápido por update con caída mínima de EV.
+PPO_BATCH_SIZE            = 512 if EN_GPU else 256    # transiciones por minibatch de PPO
 PPO_LR                    = 0.0001027303916436541   # Learning rate para el actor. Subido de 1e-5: la KL media
                                     # iba muy por debajo del target 0.02 con clip < 0.10,
                                     # indicando under-stepping. knob: subir hacia 5e-5 si KL se
@@ -162,7 +192,7 @@ LTR_CLIP           = 200.0   # techo seguro para el load_to_truck_ratio diario d
 LOADS_EXPECTED_CLIP = 100.0  # p95 de E[loads] por lane (train, excl. diagonal) es ~66; 100 es techo seguro
 
 # ── Reproducibility ───────────────────────────────────────────
-SEED = int(os.environ.get("SEED", 42))   # torch/numpy del entrenamiento; variable de entorno SEED para variar por corrida
+SEED = 42   # torch/numpy del entrenamiento (una sola semilla: no se corren réplicas)
 
 
 def set_seeds(seed: int) -> None:
@@ -198,7 +228,7 @@ MARKET_SEED_EVAL_FINAL = 777003  # semilla de un segundo conjunto de mundos de e
                                   # distinta de entrenamiento, validación y MARKET_SEED_EVAL. MARKET_SEED_EVAL es el
                                   # conjunto de desarrollo (con él se decidieron cosas, p. ej. el checkpoint); el B se
                                   # usa UNA vez, con la configuración congelada. main.py: EVAL_SET=final.
-MARKET_M_EVAL_WORLDS = 1000    # M: nº de mundos de evaluación simulados por nivel de K (eran 100). Con
+MARKET_M_EVAL_WORLDS = 1000 if EN_GPU else 100   # M: nº de mundos de evaluación simulados por nivel de K. Con
                                 # MARKET_SEED_EVAL fija, todas las corridas y baselines ven los MISMOS mundos.
 
 # ── Validación durante el entrenamiento (mundos simulados) ───
@@ -263,40 +293,14 @@ CHECK_TENSORS = os.environ.get("CHECK_TENSORS", "0") == "1"   # True: valida NaN
                                   # ~200 syncs/update dentro de ppo_calculo (el 77% del tiempo/update
                                   # del log). Activar con CHECK_TENSORS=1 solo para diagnosticar NaN/Inf.
 
-# ── Device ───────────────────────────────────────────────────
-GPU_PREFERIDA = ""   # Subcadena del nombre de la GPU a preferir (p.ej. "3070 Ti");
-                      # vacío = usar la GPU por defecto (cuda:0) de la máquina.
 
 
-def _elegir_device() -> torch.device:
-    """Si GPU_PREFERIDA está vacío, usa la GPU por defecto (cuda:0). Si se especifica,
-    busca una GPU cuyo nombre la contenga (por nombre, no por índice: el orden de CUDA
-    puede diferir del de nvidia-smi). Se fija además como dispositivo por defecto, para que
-    torch.cuda.manual_seed y current_device() apunten a la misma GPU."""
-    if not torch.cuda.is_available():
-        return torch.device("cpu")
-    if not GPU_PREFERIDA:
-        torch.cuda.set_device(0)
-        return torch.device("cuda:0")
-    for i in range(torch.cuda.device_count()):
-        if GPU_PREFERIDA in torch.cuda.get_device_name(i):
-            torch.cuda.set_device(i)
-            return torch.device(f"cuda:{i}")
-    import warnings
-    warnings.warn(f"GPU '{GPU_PREFERIDA}' no visible (CUDA_VISIBLE_DEVICES="
-                  f"{os.environ.get('CUDA_VISIBLE_DEVICES')!r}); usando {torch.cuda.get_device_name(0)}.")
-    return torch.device("cuda:0")
-
-
-DEVICE = _elegir_device()
-
-
-def get_episodes_per_node(num_nodes: int) -> int:
-    # Episodios por nodo de inicio del entrenamiento completo (updates = nodos x episodios / 700)
-    if num_nodes <= 10:  return 20000   # ~285 updates
-    if num_nodes <= 20:  return 25000   # ~714 updates
-    if num_nodes <= 35:  return 26000   # ~1300 updates
-    if num_nodes <= 50:  return 14000   # ~1000 updates
-    if num_nodes <= 75:  return 10000   # ~1070 updates
-    return 9000                         # ~1290 updates (100 nodos)
-
+def get_n_updates(num_nodes: int) -> int:
+    """Updates PPO del entrenamiento completo por tamaño (los mismos que daba el presupuesto de episodios anterior
+    con 700 episodios por update). Los episodios totales son n_updates × PPO_N_EPISODES_PER_UPDATE."""
+    if num_nodes <= 10:  return 285
+    if num_nodes <= 20:  return 714
+    if num_nodes <= 35:  return 1300
+    if num_nodes <= 50:  return 1000
+    if num_nodes <= 75:  return 1070
+    return 1290                         # 100 nodos

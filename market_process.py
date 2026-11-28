@@ -16,44 +16,39 @@ sale del nodo:
   3. δ (Paso 4a): un único corrimiento de nivel nacional por "mundo" (episodio), δ ~ N(0, s²),
      fijo durante todo el episodio — la única pieza de aleatorización por semilla del generador.
 
-El índice de mercado por nodo (lento/rápido/ρ/f, usado por `routing_env.market_index` y por B2P) ya
-NO se simula con AR(1): como los episodios recorren siempre días reales, el índice de cualquier día
-es un lookup directo (`indice_mundo` conserva la firma `(semilla, dia)` por compatibilidad con los
-~30 llamadores existentes, pero ignora `semilla`). δ no entra al índice ni a las tablas de B2P.
+El índice de mercado por nodo (lento/rápido/ρ/f, usado por `routing_env.market_index` y por B2P) no
+se simula: como los episodios recorren siempre días reales, el índice de cualquier día es el observado
+(`tensores()["indice"]`, `indice_historico`). δ no entra al índice ni a las tablas de B2P.
 
-El proceso NO depende de las acciones del agente. Tres modos de uso, igual que antes:
+El proceso NO depende de las acciones del agente. Modos de uso:
 
-  · Entrenamiento : `sample_arrivals_por_mundo(nodos, días, semillas)` — cada sorteo es función pura
-    de (semilla del "mundo" = episodio, nodo, día), así que no depende del resto del lote ni de las
-    decisiones del agente.
-  · Evaluación / baselines : `sample_world(semilla, num_días, día_inicial)` genera un mundo completo
-    [D, N, N] con esa misma semilla.
-  · Política que ignora el mercado (DP de UB-DP y B2) : `sample_arrivals(nodos, días, rng)` sortea,
-    en cada llegada, un día de ENTRENAMIENTO al azar del mismo día de la semana (sin memoria, sin
-    anclar al día real del episodio, δ = 0) y le aplica el mismo generador — representa una
-    política que conoce la distribución (con su estacionalidad semanal) pero ignora el estado del
-    mercado y el día real concreto.
+  · Entrenamiento y evaluación (en el dispositivo, la GPU en el servidor): `sortear_mundos(dia0, D, dia_max,
+    generator)` sortea de una vez, para B episodios, las cargas de cada lane y día (Gamma-Poisson = NegBin, o
+    Poisson si m < 1), los uniformes de los competidores de cada carga y δ (`Mundos`). `mundos_replay` hace lo
+    mismo con las cargas reales de los días de prueba (solo se sortea el competidor). El entorno completa cada
+    tablero con las tablas por día de `tensores()`.
+  · Política que ignora el mercado (DP de UB-DP y B2): `sortear_cargas(nodos, días, rng)` con un día de
+    ENTRENAMIENTO al azar del mismo día de la semana (sin anclar al día real del episodio, δ = 0): representa una
+    política que conoce la distribución (con su estacionalidad semanal) pero ignora el estado del mercado.
 
-Cotización conjunta (especificacion_fase0_ruteo_pricing.md §3): `tablero_sin_memoria`,
-`tablero_por_mundo`, `mundo_cotizacion` y `tablero_real` (replay) devuelven un `Tablero` con los
-precios de cada nivel (F⁻¹(u_k)·e^δ), el número efectivo de competidores m del nodo de origen (LTR
-del día) y el percentil del mejor competidor u_comp = 1 − (1 − U)^(1/m), donde U es el MISMO uniforme
-de la tarifa sorteada: las cargas y la tarifa no cambian y, con m = 1, el competidor cotiza la tarifa
-del modelo anterior. Los 6 cuantiles se ordenan al cargar (vienen desordenados en ~0.09 % de las
-lane-días con carga).
+Cotización conjunta (especificacion_fase0_ruteo_pricing.md §3): los precios de cada nivel son F⁻¹(u_k)·e^δ con
+los cuantiles del día, m es el número efectivo de competidores del nodo de origen (LTR del día) y el percentil
+del mejor competidor de cada carga es u_comp = 1 − (1 − U)^(1/m), con U el uniforme de esa carga en `Mundos`.
+Los 6 cuantiles se ordenan al cargar (vienen desordenados en ~0.09 % de las lane-días con carga).
 
-Toda la aleatoriedad sale de numpy Generators propios (nunca del estado global).
+Toda la aleatoriedad sale de generadores propios (torch.Generator del dispositivo o numpy Generator), nunca
+del estado global.
 """
 
 import hashlib
 import os
-from collections import OrderedDict
 from dataclasses import dataclass
 
 import numpy as np
+import torch
 
 from config import (
-    MARKET_N_GRUPOS, TRAIN_DAYS, U_NIVELES, COMPETENCIA_KAPPA, COMPETENCIA_M_MAX, COTIZACIONES_MAX_POR_NODO,
+    TRAIN_DAYS, U_NIVELES, COMPETENCIA_KAPPA, COMPETENCIA_M_MAX, COTIZACIONES_MAX_POR_NODO,
 )
 from fit_market_process import (
     params_path, estimar_m, indice_observado, dia_de_semana as _dia_de_semana_fi,
@@ -61,46 +56,13 @@ from fit_market_process import (
 from fit_market_process import main as _ajustar
 from pricing import (
     interp_cuantiles as _interp_cuantiles,      # alias: validate_market_process lo importa con este nombre
-    PCT_CUANTILES as _PCT,
-    competidores_efectivos, indice_nivel, lane_cost_row, percentil_competidor, precios_niveles,
+    competidores_efectivos, indice_nivel, lane_cost_row, precios_niveles,
 )
 from problem_data import cargar_dias_mercado
 
-# Etiqueta de la clave del generador de δ ([semilla, _TAG_DELTA]); distinta de la de las filas
-# [semilla, nodo, día] para no coincidir nunca con ellas.
-_TAG_DELTA = 1_000_000_007
-_CACHE_DELTAS_MAX = 200_000          # tope de semillas de δ cacheadas (LRU)
-_TAG_REPLAY = 1_000_000_009         # clave del competidor en replay ([semilla, nodo, día, _TAG_REPLAY])
 _CLAVES_AJUSTE = ("f_w", "grupo_lane", "cortes_grupo", "r", "media_lane", "lento_escenarios",
                   "rho", "sigma", "indice_std", "frac_var_lento", "s_delta")
 _COLS_Q = ("min", "q1", "q2", "q3", "p90", "max")
-
-
-@dataclass
-class Tablero:
-    """Lo que trae una llegada a un nodo para la cotización conjunta (especificación §3).
-
-    Formas para un lote de B llegadas con N lanes salientes y K niveles (en `sample_world`, B = D días
-    y la segunda dimensión es el nodo de origen: loads (D, N, N), precios (D, N, N, K), m (D, N)):
-      loads             (B, N) int64    cargas por lane
-      precios           (B, N, K) f64   USD/milla de cada nivel: F⁻¹(u_k) · e^δ
-      u_comp            (B, N, C) f64   percentil del mejor competidor de cada carga de la lane (el agente no lo
-                                        ve); C = COTIZACIONES_MAX_POR_NODO cargas, la que se cotiza en el intento c
-      precio_competidor (B, N, C) f64   F⁻¹(u_comp) · e^δ
-      m                 (B,) f64        competidores efectivos del nodo de origen ese día
-      tarifa            (B, N) f32      la tarifa sorteada del modelo anterior (= precio del competidor si m = 1)
-    """
-    loads: np.ndarray
-    precios: np.ndarray
-    u_comp: np.ndarray
-    precio_competidor: np.ndarray
-    m: np.ndarray
-    tarifa: np.ndarray
-
-    @staticmethod
-    def apilar(tableros) -> "Tablero":
-        return Tablero(*(np.stack([getattr(t, c) for t in tableros])
-                         for c in ("loads", "precios", "u_comp", "precio_competidor", "m", "tarifa")))
 
 
 @dataclass(frozen=True, eq=False)
@@ -110,7 +72,7 @@ class EstadisticasLane:
     Todo sale de los días de ENTRENAMIENTO y de las mismas piezas que usa el generador (la media `m` de las
     cargas, la binomial negativa / Poisson, los cuantiles de la lane y el LTR del hub), así que es lo que el
     agente "sabe" del mercado promedio de cada día de la semana: la misma media que promedia la DP de B3
-    (`tablero_sin_memoria`), sin usar el día real ni el índice.
+    (un día de entrenamiento al azar del mismo día de la semana), sin usar el día real ni el índice.
 
       L  (7, N, N)  cargas publicadas esperadas de la lane j→l (media de m)
       P1 (7, N, N)  P(al menos una carga) con la distribución del generador
@@ -121,6 +83,42 @@ class EstadisticasLane:
     P1: np.ndarray
     G:  np.ndarray
     M:  np.ndarray
+
+    def a(self, device) -> "EstadisticasLane":
+        """Las mismas estadísticas como tensores float32 en `device` (las features se arman en el dispositivo)."""
+        return EstadisticasLane(*(torch.as_tensor(getattr(self, c), dtype=torch.float32, device=device)
+                                  for c in ("L", "P1", "G", "M")))
+
+
+@dataclass
+class Mundos:
+    """Los mundos de B episodios, ya sorteados y en el dispositivo (especificación §3).
+
+    El tablero que ve el camión al llegar al nodo i el día absoluto dia0[b] + d (d < D, recortado a dia_max) es la
+    fila [b, d, i] de cada tensor. Todo lo que no depende del episodio (precios por nivel, cuantiles, m) lo pone el
+    entorno a partir de `MarketProcess.tensores`. Como el mundo está sorteado de antemano, el tablero no depende de
+    las decisiones del agente y todos los métodos evaluados sobre el mismo `Mundos` enfrentan lo mismo.
+
+      loads (B, D, N, N) int32    cargas publicadas de la lane i→j
+      u     (B, D, N, N, C) f32   un uniforme por carga cotizable; el competidor es u_comp = 1 − (1 − u)^(1/m)
+      delta (B,) f64              corrimiento nacional de precios del episodio (0 en replay)
+      dia0  (B,) int64            día absoluto de salida
+      dia_max                     último día absoluto con datos: los días de llegada se recortan ahí
+    """
+    loads: torch.Tensor
+    u: torch.Tensor
+    delta: torch.Tensor
+    dia0: torch.Tensor
+    dia_max: int
+
+    @property
+    def B(self) -> int:
+        return int(self.loads.shape[0])
+
+    def tomar(self, idx) -> "Mundos":
+        """Subconjunto (o repetición) de episodios: idx es un tensor/array de índices."""
+        idx = torch.as_tensor(idx, dtype=torch.long, device=self.loads.device)
+        return Mundos(self.loads[idx], self.u[idx], self.delta[idx], self.dia0[idx], self.dia_max)
 
 
 class MarketProcess:
@@ -203,10 +201,9 @@ class MarketProcess:
             mean_rate_full, media_lane_full, universo_indice_full,
         )[:, :n]                                                              # (D, N)
 
-        self._deltas = OrderedDict()           # semilla → δ (caché LRU)
         self._cols = np.arange(n)
 
-        # Días de train por día de la semana (para `sample_arrivals`, el modo sin memoria).
+        # Días de train por día de la semana (el modo sin memoria de la DP y B2).
         self.num_train_days = min(TRAIN_DAYS, self.num_dias_total)
         dow_train = self.dia_semana(np.arange(self.num_train_days))
         self._dias_train_por_dow = [np.flatnonzero(dow_train == k) for k in range(7)]
@@ -271,47 +268,84 @@ class MarketProcess:
             M[k] = competidores_efectivos(self.ltr_hub[dias], self.ltr_ref, COMPETENCIA_KAPPA).mean(axis=0)
         return EstadisticasLane(L=L, P1=P1, G=G, M=M)
 
+    # ── En el dispositivo: tablas por día y mundos sorteados (entorno de entrenamiento y evaluación) ──
+
+    def tensores(self, device) -> dict:
+        """Tablas por día absoluto que el entorno lee en cada llegada, en `device` (se calculan una vez por dispositivo
+        y κ):
+          precios (D, N, N, K) f64  USD/milla de cada nivel con δ = 0 (cuantiles del propio día o del más cercano con
+                                    cargas, `_dia_precio`); el entorno multiplica por e^δ
+          cuant   (D, N, N, 6) f64  esos mismos cuantiles (precio del competidor)
+          m       (D, N) f64        competidores efectivos del hub de origen con el κ actual (`self.kappa`)
+          m_carg  (D, N, N) f32     media del generador de cargas; r (N, N) f32 su dispersión
+          loads_reales (D, N, N)    cargas publicadas reales (replay); indice (D, N) f64; ltr (D, N) f32; dow (D,)
+        """
+        clave = (str(torch.device(device)), float(self.kappa))
+        cache = getattr(self, "_tensores", {})
+        if clave in cache:
+            return cache[clave]
+        D, N = self.num_dias_total, self.num_nodes
+        dd = np.arange(D)[:, None, None]
+        dia_p = np.where(self._con_cargas, dd, np.where(self._dia_cercano >= 0, self._dia_cercano, dd))   # (D, N, N)
+        ii, jj = np.arange(N)[None, :, None], np.arange(N)[None, None, :]
+        cuant = np.stack([self._q[c][dia_p, ii, jj] for c in _COLS_Q], axis=-1)                         # (D, N, N, 6)
+        dev = torch.device(device)
+        t = dict(
+            precios=torch.as_tensor(precios_niveles(cuant), dtype=torch.float64, device=dev),
+            cuant=torch.as_tensor(cuant, dtype=torch.float64, device=dev),
+            m=torch.as_tensor(competidores_efectivos(self.ltr_hub, self.ltr_ref, self.kappa), dtype=torch.float64, device=dev),
+            m_carg=torch.as_tensor(self._m_stack, dtype=torch.float32, device=dev),
+            r=torch.as_tensor(self._r_lane, dtype=torch.float32, device=dev),
+            loads_reales=torch.as_tensor(self.count_loads, dtype=torch.int32, device=dev),
+            indice=torch.as_tensor(self._indice_full, dtype=torch.float64, device=dev),
+            ltr=torch.as_tensor(self.ltr_hub, dtype=torch.float32, device=dev),
+            dow=torch.as_tensor(self.dia_semana(np.arange(D)), dtype=torch.long, device=dev),
+        )
+        cache[clave] = t
+        self._tensores = cache
+        return t
+
+    def sortear_mundos(self, dia0, num_dias: int, dia_max: int, generator: torch.Generator) -> Mundos:
+        """B mundos simulados en el dispositivo de `generator` (Paso 4 de la metodología): para cada día d < num_dias
+        y cada lane, cargas ~ NegBin(m, r) (Poisson(m) si m < 1, como `sortear_cargas`), C uniformes para los
+        competidores de las cargas cotizables y un δ ~ N(0, s_δ²) por mundo. dia0 (B,) días absolutos de salida."""
+        dev = generator.device
+        dia0 = torch.as_tensor(np.asarray(dia0), dtype=torch.long, device=dev)
+        B, N, C = len(dia0), self.num_nodes, COTIZACIONES_MAX_POR_NODO
+        t = self.tensores(dev)
+        loads = torch.empty((B, num_dias, N, N), dtype=torch.int32, device=dev)
+        for d in range(num_dias):
+            m = t["m_carg"][(dia0 + d).clamp(max=dia_max)].clamp_min(1e-12)                # (B, N, N)
+            r = t["r"].expand(B, N, N).contiguous()
+            gamma = torch._standard_gamma(r, generator=generator) * (m / r)               # mezcla Gamma-Poisson = NegBin
+            loads[:, d] = torch.poisson(torch.where(m < 1.0, m, gamma), generator=generator).to(torch.int32)
+        u = torch.rand((B, num_dias, N, N, C), generator=generator, device=dev)
+        return Mundos(loads=loads, u=u, delta=self.sortear_deltas(B, generator), dia0=dia0, dia_max=int(dia_max))
+
+    def sortear_deltas(self, n: int, generator: torch.Generator) -> torch.Tensor:
+        """(n,) corrimientos de nivel nacional δ ~ N(0, s_δ²) (Paso 4a), uno por mundo, en float64."""
+        return torch.randn(n, generator=generator, device=generator.device, dtype=torch.float64) * self.s_delta
+
+    def mundos_replay(self, dia0, num_dias: int, dia_max: int, generator: torch.Generator) -> Mundos:
+        """Replay de días reales (especificación §3.4): cargas reales del día, δ = 0; solo el competidor se sortea."""
+        dev = generator.device
+        dia0 = torch.as_tensor(np.asarray(dia0), dtype=torch.long, device=dev)
+        B, N, C = len(dia0), self.num_nodes, COTIZACIONES_MAX_POR_NODO
+        dias = (dia0[:, None] + torch.arange(num_dias, device=dev)[None, :]).clamp(max=dia_max)   # (B, D)
+        loads = self.tensores(dev)["loads_reales"][dias]                                          # (B, D, N, N)
+        u = torch.rand((B, num_dias, N, N, C), generator=generator, device=dev)
+        return Mundos(loads=loads, u=u, delta=torch.zeros(B, dtype=torch.float64, device=dev), dia0=dia0,
+                      dia_max=int(dia_max))
+
     def dias_train_por_dow(self, dow: int) -> np.ndarray:
-        """Días de entrenamiento con ese día de la semana (de entre ellos sortea `tablero_sin_memoria`)."""
+        """Días de entrenamiento con ese día de la semana (de entre ellos sortean la DP de UB-DP y B2)."""
         return self._dias_train_por_dow[int(dow)]
 
     # ── Índice de mercado (lookup directo del día real) ───────────────────────
 
-    def indice_mundo(self, semilla: int, dia: int) -> np.ndarray:
-        """(N,) índice de mercado de todos los nodos el día real `dia`.
-
-        `semilla` se conserva por compatibilidad de firma con los llamadores existentes
-        (routing_env.py, B2P, tests) pero se ignora: el índice ya no se simula por "mundo", es un
-        dato observado del día real (los episodios siempre recorren días reales)."""
-        dia = int(dia)
-        if not 0 <= dia < self.num_dias_total:
-            raise ValueError(f"día {dia} fuera de rango (0 … {self.num_dias_total - 1})")
-        return self._indice_full[dia]
-
-    def indice_mundo_lote(self, semillas, dias) -> np.ndarray:
-        """(B, N) índice de todos los nodos para cada día (ver `indice_mundo`; `semillas` se ignora)."""
-        return self._indice_full[np.asarray(dias, dtype=np.int64)]
-
     def indice_historico(self, dia_ini: int = 0, dia_fin: int = None) -> np.ndarray:
         """(D, N) índice observado de los días reales [dia_ini, dia_fin)."""
         return self._indice_full[dia_ini:dia_fin]
-
-    # ── δ: corrimiento de nivel nacional por episodio (Paso 4a) ───────────────
-
-    def _delta(self, semilla: int) -> float:
-        semilla = int(semilla)
-        hit = self._deltas.get(semilla)
-        if hit is not None:
-            self._deltas.move_to_end(semilla)
-            return hit
-        rng = np.random.Generator(np.random.PCG64([semilla, _TAG_DELTA]))
-        d = float(rng.normal(0.0, self.s_delta))
-        self._deltas[semilla] = d
-        if len(self._deltas) > _CACHE_DELTAS_MAX:
-            self._deltas.popitem(last=False)
-        return d
-
-    # ── Llegada a un nodo (Paso 4b) ────────────────────────────────────────────
 
     def _dia_precio(self, dia: int, nodos) -> np.ndarray:
         """(len(nodos), N) día del que se toman los cuantiles para cada lane saliente de `nodos` el
@@ -320,48 +354,6 @@ class MarketProcess:
         valido = self._con_cargas[dia, nodos]                   # (B, N)
         cercano = self._dia_cercano[dia, nodos]                  # (B, N)
         return np.where(valido, dia, np.where(cercano >= 0, cercano, dia))
-
-    def _dia_precio_filas(self, dias: np.ndarray, nodos: np.ndarray) -> np.ndarray:
-        """(B, N) como `_dia_precio`, con un día y un nodo propios por fila (sin loop sobre B)."""
-        dias = np.asarray(dias, dtype=np.int64)
-        valido = self._con_cargas[dias, nodos]                  # (B, N)
-        cercano = self._dia_cercano[dias, nodos]                 # (B, N)
-        return np.where(valido, dias[:, None], np.where(cercano >= 0, cercano, dias[:, None]))
-
-    def _sortear(self, nodos: np.ndarray, dias: np.ndarray, deltas: np.ndarray,
-                 rng: np.random.Generator) -> tuple:
-        """Llegadas (loads, rates) de forma (B, N) para (nodos[b], dias[b], deltas[b]), con un único
-        generador `rng` (consume su estado; para sorteos independientes de las decisiones del agente
-        usa un rng derivado por fila, ver `sample_arrivals_por_mundo`)."""
-        loads, cuantiles, u = self._sortear_detalle(nodos, dias, rng)
-        rate = _interp_cuantiles(u, cuantiles) * np.exp(deltas[:, None])
-        return loads, rate.astype(np.float32)
-
-    def _tablero(self, nodos: np.ndarray, dias: np.ndarray, deltas: np.ndarray,
-                 rng: np.random.Generator) -> Tablero:
-        """Como `_sortear`, con el mismo consumo de `rng` (las cargas y la tarifa salen idénticas), pero
-        devuelve el tablero de la cotización: el uniforme U de la tarifa se reutiliza para el mejor
-        competidor, u_comp = 1 − (1 − U)^(1/m), así que con m = 1 el competidor cotiza la tarifa de siempre."""
-        loads, cuantiles, u = self._sortear_detalle(nodos, dias, rng)
-        extra = rng.random((len(nodos), self.num_nodes, COTIZACIONES_MAX_POR_NODO - 1))   # las otras cargas de la lane
-        return self._armar_tablero(loads, cuantiles, np.concatenate([u[..., None], extra], axis=-1), deltas, nodos, dias)
-
-    def _armar_tablero(self, loads, cuantiles, u, deltas, nodos, dias) -> Tablero:
-        """u (B, N, C): un uniforme por carga cotizable de cada lane (el de la primera es el de la tarifa)."""
-        escala = np.exp(deltas)[:, None]                                       # (B, 1)
-        tarifa = (_interp_cuantiles(u[..., 0], cuantiles) * escala).astype(np.float32)
-        m_comp = self.competidores(nodos, dias)                               # (B,)
-        u_comp = percentil_competidor(u, m_comp[:, None, None])               # (B, N, C)
-        q = cuantiles.astype(np.float64)
-        return Tablero(
-            loads=loads,
-            precios=precios_niveles(cuantiles, deltas[:, None]),
-            u_comp=u_comp,
-            precio_competidor=np.stack([_interp_cuantiles(u_comp[..., c], q) * escala
-                                        for c in range(u_comp.shape[-1])], axis=-1),
-            m=m_comp,
-            tarifa=tarifa,
-        )
 
     def sortear_cargas(self, nodos: np.ndarray, dias: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         """Cargas (B, N) de las lanes que salen de nodos[b] el día dias[b] (Poisson o binomial negativa).
@@ -377,164 +369,6 @@ class MarketProcess:
             rng.poisson(m_pos),
             rng.negative_binomial(r, r / (r + m_pos)),
         ).astype(np.int64)
-
-    def _sortear_detalle(self, nodos: np.ndarray, dias: np.ndarray, rng: np.random.Generator) -> tuple:
-        """Cargas (B, N), cuantiles del día usado (B, N, 6) y el uniforme U de la tarifa (B, N)."""
-        B, N = len(nodos), self.num_nodes
-        loads = self.sortear_cargas(nodos, dias, rng)
-
-        dia_p = self._dia_precio_filas(dias, nodos)                                         # (B,N)
-        nodos_col = nodos[:, None]
-        cuantiles = np.stack([self._q[c][dia_p, nodos_col, self._cols[None, :]]
-                              for c in _COLS_Q], axis=-1)                           # (B,N,6)
-        u = rng.random((B, N))
-        return loads, cuantiles, u
-
-    def llegada_a_nodo(self, i: int, dia: int, rng: np.random.Generator) -> tuple:
-        """(loads_row, rate_row) para las lanes que salen del nodo i el día `dia`, sin memoria
-        (como `sample_arrivals` con un solo nodo; δ = 0)."""
-        loads, rates = self.sample_arrivals([int(i)], [int(dia)], rng)
-        return loads[0], rates[0]
-
-    # ── Política que ignora el mercado (DP y B2) ─────────────────────────────
-
-    def sample_arrivals(self, nodos, dias, rng: np.random.Generator) -> tuple:
-        """Llegadas por lotes con un único Generator, SIN estado de mercado ni memoria del día real.
-
-        En cada llegada se sortea un día de ENTRENAMIENTO al azar entre los que caen en el mismo
-        día de la semana que `dias` (se conserva la estacionalidad semanal, igual que el modelo
-        anterior) y se le aplica el mismo generador de cargas/tarifas, con δ = 0: representa una
-        política que conoce la distribución (incluida la estacionalidad semanal) pero ignora el
-        estado del mercado y el día real concreto (la que supone la DP de UB-DP y B2).
-
-        nodos, dias : (B,) nodo de llegada y día de llegada (solo se usa su día de la semana).
-        Devuelve loads (B, N) int64 y rates (B, N) float32. Depende del orden/tamaño del lote
-        (consume `rng`); para sorteos independientes de las decisiones del agente usa
-        `sample_arrivals_por_mundo`.
-        """
-        nodos = np.asarray(nodos, dtype=np.int64)
-        dow = self.dia_semana(dias)
-        dias_azar = np.array([
-            self._dias_train_por_dow[int(k)][rng.integers(0, len(self._dias_train_por_dow[int(k)]))]
-            for k in dow
-        ])
-        deltas = np.zeros(len(nodos))
-        return self._sortear(nodos, dias_azar, deltas, rng)
-
-    # ── Modo entrenamiento / evaluación con mundos ────────────────────────────
-
-    def sample_arrivals_por_mundo(self, nodos, dias, semillas) -> tuple:
-        """Llegadas por lotes, cada fila determinista dada (semilla del episodio, nodo, día).
-
-        nodos, dias, semillas : (B,). Dos filas con la misma terna ven exactamente el mismo sorteo,
-        sin importar el resto del lote, el orden de las llamadas ni las acciones del agente.
-        Devuelve loads (B, N) int64 y rates (B, N) float32.
-        """
-        nodos    = np.asarray(nodos,    dtype=np.int64)
-        dias     = np.asarray(dias,     dtype=np.int64)
-        semillas = np.asarray(semillas, dtype=np.int64)
-        B, N = len(nodos), self.num_nodes
-        loads = np.empty((B, N), dtype=np.int64)
-        rates = np.empty((B, N), dtype=np.float32)
-        for b in range(B):
-            rng = np.random.Generator(np.random.PCG64(
-                [int(semillas[b]), int(nodos[b]), int(dias[b])]
-            ))
-            delta = self._delta(int(semillas[b]))
-            l, r = self._sortear(nodos[b:b + 1], dias[b:b + 1], np.array([delta]), rng)
-            loads[b], rates[b] = l[0], r[0]
-        return loads, rates
-
-    # ── Modo evaluación / baselines ──────────────────────────────────────────
-
-    def sample_world(self, semilla: int, num_dias: int, dia_inicial: int = 0, devolver_indice: bool = False):
-        """Mundo completo: loads_sim y rate_sim de forma [D, N, N], determinista dada la semilla.
-
-        loads_sim[d, i] y rate_sim[d, i] son la fila que ve el agente al llegar al nodo i el día
-        real `dia_inicial + d`: el mismo sorteo que entrega `sample_arrivals_por_mundo` con esa
-        semilla. Con devolver_indice=True devuelve además el índice de mercado de esos días, (D, N).
-        """
-        N = self.num_nodes
-        nodos = np.arange(N)
-        loads_sim = np.empty((num_dias, N, N), dtype=np.float64)
-        rate_sim  = np.empty((num_dias, N, N), dtype=np.float64)
-        for d in range(num_dias):
-            l, r = self.sample_arrivals_por_mundo(
-                nodos, np.full(N, dia_inicial + d), np.full(N, semilla),
-            )
-            loads_sim[d], rate_sim[d] = l, r
-        if not devolver_indice:
-            return loads_sim, rate_sim
-        indice = self._indice_full[dia_inicial:dia_inicial + num_dias]
-        return loads_sim, rate_sim, indice
-
-    # ── Cotización conjunta (especificacion_fase0_ruteo_pricing.md §3) ────────
-    # Mismas tres formas de uso que arriba, pero devuelven un `Tablero` (cargas, precios por nivel,
-    # competidor, m). Las cargas y la tarifa son idénticas a las de los métodos de arriba con la misma
-    # semilla: el competidor reutiliza el uniforme de la tarifa, no consume más azar.
-
-    def tablero_sin_memoria(self, nodos, dias, rng: np.random.Generator) -> Tablero:
-        """Como `sample_arrivals` (DP de UB-DP y B2): día de train al azar del mismo día de la semana,
-        δ = 0. El LTR (y por tanto m) es el de ese día de train sorteado."""
-        nodos = np.asarray(nodos, dtype=np.int64)
-        dow = self.dia_semana(dias)
-        dias_azar = np.array([
-            self._dias_train_por_dow[int(k)][rng.integers(0, len(self._dias_train_por_dow[int(k)]))]
-            for k in dow
-        ])
-        return self._tablero(nodos, dias_azar, np.zeros(len(nodos)), rng)
-
-    def tablero_por_mundo(self, nodos, dias, semillas) -> Tablero:
-        """Como `sample_arrivals_por_mundo`: cada fila determinista dada (semilla, nodo, día)."""
-        nodos    = np.asarray(nodos,    dtype=np.int64)
-        dias     = np.asarray(dias,     dtype=np.int64)
-        semillas = np.asarray(semillas, dtype=np.int64)
-        B, N, C = len(nodos), self.num_nodes, COTIZACIONES_MAX_POR_NODO
-        # Cada fila tiene su propio generador (determinista dada la terna), así que los sorteos se hacen fila
-        # por fila y en el mismo orden de siempre (cargas, U de la tarifa, U de las otras cargas); el resto,
-        # que es aritmética elemento a elemento, se arma de una vez para todo el lote.
-        loads = np.empty((B, N), dtype=np.int64)
-        u = np.empty((B, N, C))
-        deltas = np.empty(B)
-        for b in range(B):
-            rng = np.random.Generator(np.random.PCG64([int(semillas[b]), int(nodos[b]), int(dias[b])]))
-            deltas[b] = self._delta(int(semillas[b]))
-            loads[b] = self.sortear_cargas(nodos[b:b + 1], dias[b:b + 1], rng)[0]
-            u[b, :, 0] = rng.random(N)
-            u[b, :, 1:] = rng.random((N, C - 1))
-        dia_p = self._dia_precio_filas(dias, nodos)                                         # (B, N)
-        cuantiles = np.stack([self._q[c][dia_p, nodos[:, None], self._cols[None, :]]
-                              for c in _COLS_Q], axis=-1)                                  # (B, N, 6)
-        return self._armar_tablero(loads, cuantiles, u, deltas, nodos, dias)
-
-    def mundo_cotizacion(self, semilla: int, num_dias: int, dia_inicial: int = 0) -> Tablero:
-        """Como `sample_world`: Tablero con loads (D, N, N), precios (D, N, N, K), m (D, N), etc.
-        La fila [d, i] es la que ve el agente al llegar al nodo i el día real `dia_inicial + d`."""
-        N = self.num_nodes
-        nodos = np.arange(N)
-        return Tablero.apilar([
-            self.tablero_por_mundo(nodos, np.full(N, dia_inicial + d), np.full(N, semilla))
-            for d in range(num_dias)
-        ])
-
-    def tablero_real(self, nodos, dias, semillas) -> Tablero:
-        """Replay de días reales (especificación §3.4): cargas y cuantiles del propio día, δ = 0.
-
-        Lo único sorteado es el competidor, con un Generator propio por (semilla del caso, nodo, día),
-        así que todos los métodos evaluados en el mismo caso enfrentan la misma competencia."""
-        nodos    = np.asarray(nodos,    dtype=np.int64)
-        dias     = np.asarray(dias,     dtype=np.int64)
-        semillas = np.asarray(semillas, dtype=np.int64)
-        B, N = len(nodos), self.num_nodes
-        loads = self.count_loads[dias, nodos].astype(np.int64)                    # (B, N)
-        dia_p = self._dia_precio_filas(dias, nodos)
-        cuantiles = np.stack([self._q[c][dia_p, nodos[:, None], self._cols[None, :]] for c in _COLS_Q], axis=-1)
-        u = np.stack([
-            np.random.Generator(np.random.PCG64(
-                [int(semillas[b]), int(nodos[b]), int(dias[b]), _TAG_REPLAY])).random((COTIZACIONES_MAX_POR_NODO, N)).T
-            for b in range(B)
-        ])                                                                        # (B, N, C)
-        return self._armar_tablero(loads, cuantiles, u, np.zeros(B), nodos, dias)
 
 
 def asegurar_parametros() -> None:

@@ -3,14 +3,16 @@ pricing.py
 ==========
 Cotización conjunta (especificacion_fase0_ruteo_pricing.md §3 y §6): niveles de precio por lane en
 escala de percentiles, número efectivo de competidores m(LTR), aceptación P(ganar | u_k) = (1 − u_k)^m
-y las reglas de precio fijas (mediana, break-even + margen, miope óptima). Solo numpy y config: lo
-usan market_process, el entorno, los baselines y las DP.
+y las reglas de precio fijas (mediana, break-even + margen, miope óptima). Lo usan market_process, el
+entorno, los baselines y las DP. Las funciones `*_t` son las mismas fórmulas en torch, para el entorno y
+las features en el dispositivo (GPU).
 
 El precio ya no se calcula después del ruteo: en cada nodo la política elige destino y nivel de precio
 (el precio de reserva p* con las cabezas Ṽ A/B se eliminó en la Fase 3).
 """
 
 import numpy as np
+import torch
 
 from config import (
     MPG, MARGINAL_COST_SIN_DIESEL, U_NIVELES, COMPETENCIA_KAPPA, COMPETENCIA_M_MAX, BE_MARGEN,
@@ -143,6 +145,52 @@ def nivel_regla(regla: str, precios: np.ndarray, dist, costo, m,
         valor = prob_ganar(u_niveles, m[..., None]) * (precios * dist[..., None] - costo[..., None])
         return valor.argmax(axis=-1).astype(np.int64)
     raise ValueError(f"regla de precio desconocida: {regla!r} (opciones: {REGLAS_PRECIO})")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Versiones en torch (entorno, features y entrenamiento en el dispositivo)
+# ═════════════════════════════════════════════════════════════════════════════
+# Mismas fórmulas que las de numpy de arriba, sobre tensores del dispositivo que se les pase.
+
+def interp_cuantiles_t(u: torch.Tensor, cuantiles: torch.Tensor) -> torch.Tensor:
+    """`interp_cuantiles` en torch: u (...,), cuantiles (..., 6) → (...,), en el dtype de `cuantiles`."""
+    pct = torch.as_tensor(PCT_CUANTILES, dtype=cuantiles.dtype, device=cuantiles.device)
+    u = u.to(cuantiles.dtype)
+    seg = (torch.searchsorted(pct, u.contiguous(), right=True) - 1).clamp(0, len(PCT_CUANTILES) - 2)
+    p0, p1 = pct[seg], pct[seg + 1]
+    v0 = torch.gather(cuantiles, -1, seg.unsqueeze(-1)).squeeze(-1)
+    v1 = torch.gather(cuantiles, -1, (seg + 1).unsqueeze(-1)).squeeze(-1)
+    t = (u - p0) / (p1 - p0).clamp_min(1e-12)
+    return v0 + t * (v1 - v0)
+
+
+def prob_ganar_t(u_nivel: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+    """`prob_ganar` en torch: (1 − u_k)^m."""
+    return torch.pow(1.0 - u_nivel, m)
+
+
+def percentil_competidor_t(U: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+    """`percentil_competidor` en torch: 1 − (1 − U)^(1/m)."""
+    return 1.0 - torch.pow(1.0 - U, 1.0 / m)
+
+
+def valor_reintentos_t(P: torch.Tensor, margen: torch.Tensor, base: torch.Tensor, intentos: int) -> torch.Tensor:
+    """`valor_reintentos` en torch (solo V): (intentos+1, ...) con V[a] el valor de cotizar hasta a cargas."""
+    V = [base.expand(torch.broadcast_shapes(P.shape, margen.shape)[:-1])]
+    for _ in range(intentos):
+        V.append((P * margen + (1.0 - P) * V[-1].unsqueeze(-1)).amax(dim=-1))
+    return torch.stack(V)
+
+
+def lane_cost_t(distance: torch.Tensor, diesel: torch.Tensor) -> torch.Tensor:
+    """`lane_cost_row` en torch."""
+    return distance * (diesel / MPG) + distance * MARGINAL_COST_SIN_DIESEL
+
+
+def lane_reward_t(rate: torch.Tensor, loads: torch.Tensor, distance: torch.Tensor, diesel: torch.Tensor) -> torch.Tensor:
+    """`problem_data.lane_reward` en torch: round(p·d·[loads > 0] − c). torch.round redondea al par, como np.round."""
+    revenue = torch.where(loads > 0, rate * distance, torch.zeros_like(rate))
+    return torch.round(revenue - lane_cost_t(distance, diesel))
 
 
 # ═════════════════════════════════════════════════════════════════════════════

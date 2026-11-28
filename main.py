@@ -46,7 +46,7 @@ warnings.filterwarnings("ignore")
 from config import (
     SEED, DEVICE, K_TRAINING_LEVELS, configurar_k, MARKET_SEED_EVAL, MARKET_SEED_EVAL_FINAL,
     HP_OVERRIDES, configurar_hp,
-    get_episodes_per_node, TRAIN_DAYS, set_seeds,
+    get_n_updates, PPO_N_EPISODES_PER_UPDATE, set_seeds,
     AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF,
 )
 from problem_data import load_matrices
@@ -64,37 +64,25 @@ from transfer_learning import (
 
 
 def _run_am(
-    NUM_NODES, time_matrix, rate_stack, loads_stack,
-    distance_arr, diesel_arr, cwd,
+    NUM_NODES, time_matrix, distance_arr, diesel_arr, cwd, market_process,
     pretrained_agent=None, pretrained_critic=None,
-    ltr_stack=None,
     reward_global_p95=1.0, avail_expected_arr=None,
-    market_process=None, best_checkpoint_path=None, est_lane=None,
+    best_checkpoint_path=None, est_lane=None,
 ):
-    """Pipeline AM: entrenamiento PPO → checkpoint.
-
-    market_process: MarketProcess opcional; si se pasa, el entrenamiento sortea
-    cargas y tarifas del proceso exógeno en vez de reproducir días del histórico.
-    """
+    """Pipeline AM: entrenamiento PPO (mundos simulados del proceso exógeno, en DEVICE) → checkpoint."""
     from am_training import run_am_training
 
-    episodes_per_node = get_episodes_per_node(NUM_NODES)
-    num_episodes      = episodes_per_node * NUM_NODES
-
     print(f"Device           : {DEVICE}")
-    print(f"Training episodes: {num_episodes}")
+    print(f"Training episodes: {get_n_updates(NUM_NODES) * PPO_N_EPISODES_PER_UPDATE}")
 
     set_seeds(SEED)
     t0 = time.time()
     agent_am, critic, ep_rewards, ep_losses, training_log = run_am_training(
-        time_matrix, rate_stack, loads_stack,
-        distance_arr, diesel_arr, NUM_NODES,
+        time_matrix, distance_arr, diesel_arr, NUM_NODES, market_process,
+        avail_expected_arr=avail_expected_arr,
+        reward_global_p95=reward_global_p95,
         pretrained_agent=pretrained_agent,
         pretrained_critic=pretrained_critic,
-        ltr_stack=ltr_stack,
-        reward_global_p95=reward_global_p95,
-        avail_expected_arr=avail_expected_arr,
-        market_process=market_process,
         best_checkpoint_path=best_checkpoint_path,
         est_lane=est_lane,
     )
@@ -153,10 +141,9 @@ def _tiempo_entrenamiento_previo(output_dir: str) -> float:
 
 
 def _evaluate_and_report(
-    agent, NUM_NODES, time_matrix, rate_stack, loads_stack,
+    agent, NUM_NODES, time_matrix,
     distance_arr, diesel_arr, ep_rewards, ep_losses,
     train_time, summary_rows, cwd, label,
-    ltr_stack=None,
     avail_expected_arr=None, reward_global_p95=1.0, market_process=None,
     semilla_eval=MARKET_SEED_EVAL, sufijo_cache="",
 ):
@@ -180,23 +167,21 @@ def _evaluate_and_report(
     k_tabla = max([k for k in K_TRAINING_LEVELS if k is not None], default=0)
     tabla = cargar_o_calcular_tabla(market_process, time_matrix, distance_arr, diesel_arr, K=k_tabla)
     # B1, B2, B2P, B3, UB-PI y UB-DP no dependen del DRL: se calculan una vez por nº de nodos y se reusan
-    # entre corridas (semillas, ablaciones) mientras no cambien el proceso, la tabla V ni el diseño.
+    # entre corridas mientras no cambien el proceso, la tabla V ni el diseño.
     cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos", "cache_eval")
 
     print("\n--- Evaluación en mundos simulados ---")
     sim_df = evaluar_mundos_simulados(
-        agent, market_process, tabla, time_matrix,
-        rate_stack[:TRAIN_DAYS], loads_stack[:TRAIN_DAYS], distance_arr, diesel_arr, NUM_NODES,
-        ltr_stack, avail_expected_arr, reward_global_p95,
+        agent, market_process, tabla, time_matrix, distance_arr, diesel_arr, NUM_NODES,
+        avail_expected_arr, reward_global_p95,
         k_levels=tuple(K_TRAINING_LEVELS),
         cache_path=os.path.join(cache_dir, f"baselines_simulado_{NUM_NODES}nodos{sufijo_cache}.pkl"),
         semilla_eval=semilla_eval,
     )
     print("\n--- Replay de los días reales de evaluación ---")
     replay_df = evaluar_replay(
-        agent, market_process, tabla, time_matrix,
-        rate_stack[TRAIN_DAYS:], loads_stack[TRAIN_DAYS:], distance_arr, diesel_arr, NUM_NODES,
-        ltr_stack[:, TRAIN_DAYS:], avail_expected_arr, reward_global_p95,
+        agent, market_process, tabla, time_matrix, distance_arr, diesel_arr, NUM_NODES,
+        avail_expected_arr, reward_global_p95,
         k_levels=tuple(K_TRAINING_LEVELS),
         cache_path=os.path.join(cache_dir, f"baselines_replay_{NUM_NODES}nodos.pkl"),
     )
@@ -230,8 +215,8 @@ def _evaluate_and_report(
 
     # Validación de la decisión de precio (nivel según el estado, sensibilidad a κ): results/<N>nodes/pricing_val/
     from validate_pricing import validar_pricing
-    validar_pricing(agent, NUM_NODES, time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-                    ltr_stack, avail_expected_arr, reward_global_p95, market_process, cwd, tabla=tabla)
+    validar_pricing(agent, NUM_NODES, time_matrix, distance_arr, diesel_arr,
+                    avail_expected_arr, reward_global_p95, market_process, cwd, tabla=tabla)
 
     return sim_df, replay_df
 
@@ -253,8 +238,8 @@ def _imprimir_comparacion_b(sim_df, replay_df) -> None:
 
 def _run_one_size(
     NUM_NODES, cwd,
-    EVAL_ONLY, USE_TRANSFER, EVAL_BEST_CHECKPOINT, USE_MARKET_PROCESS,
-    EVAL_SET, K_RESTRINGIDO, REPLICA_TAG="",
+    EVAL_ONLY, USE_TRANSFER, EVAL_BEST_CHECKPOINT,
+    EVAL_SET, K_RESTRINGIDO,
 ):
     """Pipeline completo (entrenamiento + evaluación) para un solo tamaño de grafo.
 
@@ -272,35 +257,26 @@ def _run_one_size(
     print(f"  AM — {NUM_NODES} nodes")
     print(f"  Niveles de K: {['libre' if k is None else k for k in K_TRAINING_LEVELS]}")
     print(f"  Hiperparámetros propios de este tamaño: {dict(HP_OVERRIDES) or 'ninguno (los de config.py)'}")
-    print(f"  Semilla de entrenamiento (SEED): {SEED}" + (f"   |   RÉPLICA '{REPLICA_TAG}'" if REPLICA_TAG else ""))
-    if REPLICA_TAG and SEED == 42:
-        print("  ⚠ SEED = 42, la misma de la corrida original: no es una réplica independiente "
-              "(lanza con SEED=43 python main.py).")
+    print(f"  Semilla de entrenamiento (SEED): {SEED}")
     print(f"{'='*60}")
 
     set_seeds(SEED)
 
-    sufijo = f"_{REPLICA_TAG}" if REPLICA_TAG else ""
-    output_dir = os.path.join(cwd, "results", f"{NUM_NODES}nodes{sufijo}")
+    output_dir = os.path.join(cwd, "results", f"{NUM_NODES}nodes")
     os.makedirs(output_dir, exist_ok=True)
 
-    # Carpeta compartida de checkpoints (para transfer learning entre ramas); una réplica usa la suya.
-    checkpoint_dir = os.path.join(cwd, "checkpoints", REPLICA_TAG) if REPLICA_TAG else os.path.join(cwd, "checkpoints")
+    # Carpeta compartida de checkpoints (para transfer learning entre tamaños).
+    checkpoint_dir = os.path.join(cwd, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
-        ltr_stack, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
+    time_matrix, _, _, distance_arr, diesel_arr, _, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
 
     # ── Proceso exógeno de cargas y tarifas ──────────────────────────────────
-    # La evaluación (UB-PI, UB-DP, B2, B2P, B3 y los mundos simulados) lo necesita siempre;
-    # el entrenamiento lo usa solo si USE_MARKET_PROCESS.
+    # El entrenamiento (mundos simulados de los TRAIN_DAYS) y la evaluación (mundos simulados, replay de los días
+    # de prueba, UB-PI, UB-DP, B2, B2P y B3) salen de él. El modelo no ve los días de prueba.
     asegurar_parametros()
     market_process = MarketProcess(NUM_NODES)
     est_lane = market_process.estadisticas_dow(distance_arr, diesel_arr)   # una vez por nº de nodos
-
-    # ── Train / eval split (temporal — el modelo no ve los días de eval) ──────
-    rate_train  = rate_stack[:TRAIN_DAYS]
-    loads_train = loads_stack[:TRAIN_DAYS]
 
     usar_best = False
     if EVAL_ONLY:
@@ -313,18 +289,15 @@ def _run_one_size(
             d_h=AM_D_H, n_heads=AM_N_HEADS, n_layers=AM_N_LAYERS, d_ff=AM_D_FF,
         )
         agent_am, critic, ep_r, ep_l, t, training_log = _run_am(
-            NUM_NODES, time_matrix, rate_train, loads_train,
-            distance_arr, diesel_arr, checkpoint_dir,
+            NUM_NODES, time_matrix, distance_arr, diesel_arr, checkpoint_dir, market_process,
             agent_pretrained, critic_pretrained,
-            ltr_stack=ltr_stack,
             reward_global_p95=reward_global_p95,
             avail_expected_arr=avail_expected_arr,
-            market_process=market_process if USE_MARKET_PROCESS else None,
             best_checkpoint_path=_checkpoint_path(checkpoint_dir, NUM_NODES, True),
             est_lane=est_lane,
         )
         best_path = _checkpoint_path(checkpoint_dir, NUM_NODES, True)
-        if EVAL_BEST_CHECKPOINT and USE_MARKET_PROCESS and os.path.exists(best_path):
+        if EVAL_BEST_CHECKPOINT and os.path.exists(best_path):
             usar_best = True
             print("Se evalúa el mejor update de validación (EVAL_BEST_CHECKPOINT).")
             agent_am, critic = _load_agent(checkpoint_dir, NUM_NODES, best=True)
@@ -345,10 +318,9 @@ def _run_one_size(
 
     label = "AM" if EVAL_SET == "dev" else "AM_final"
     _evaluate_and_report(
-        agent_am, NUM_NODES, time_matrix, rate_stack, loads_stack,
+        agent_am, NUM_NODES, time_matrix,
         distance_arr, diesel_arr, ep_r, ep_l, t,
         summary_rows, output_dir, label=label,
-        ltr_stack=ltr_stack,
         avail_expected_arr=avail_expected_arr,
         reward_global_p95=reward_global_p95,
         market_process=market_process,
@@ -365,27 +337,18 @@ def main():
     # anterior. Para correr uno solo, deja aquí un único elemento, p. ej. NODE_SIZES = [20].
     # NODE_SIZES      = list(NODE_SEQUENCE)   # cadena completa: [20, 35, 50, 75]
     # NODE_SIZES      = [75]   # solo el que falta (20, 35 y 50 ya tienen checkpoint)
-    NODE_SIZES      = [20]   # solo 20 nodos: réplica de la corrida original (ver REPLICA_TAG)
-    # Réplica: con un REPLICA_TAG, los resultados van a results/<N>nodes_<tag>/ y los checkpoints a checkpoints/<tag>/, así
-    # la corrida original (results/<N>nodes/, checkpoints/) no se sobrescribe. Los mundos de evaluación salen de las mismas
-    # semillas (MARKET_SEED_EVAL) y los baselines (B1, B2, B2P, B3, UB-PI) son deterministas, así que la réplica se compara
-    # con la original sobre los MISMOS mundos. Si no están en datos/cache_eval, se recalculan (y quedan cacheados).
-    # Para que sea una réplica independiente hay que variar la semilla de entrenamiento: SEED=43 python main.py
-    # ("" = corrida normal, sin sufijo). Se puede fijar también con la variable de entorno REPLICA_TAG.
-    REPLICA_TAG     = os.environ.get("REPLICA_TAG", "replica")
+    NODE_SIZES      = [20]   # solo 20 nodos
     EVAL_ONLY       = os.environ.get("EVAL_ONLY", "0") == "1"   # True (EVAL_ONLY=1): carga checkpoint y salta entrenamiento
     USE_TRANSFER    = True   # True: inicializa los pesos desde el checkpoint del tamaño anterior. False: entrena desde pesos aleatorios con la
                               # arquitectura de config.py.
     EVAL_BEST_CHECKPOINT = False  # False (por defecto): evalúa el último update, el modelo que dejó el
                                  # entrenamiento ya con el LR decaído. True: evalúa el update con mejor
-                                 # margen en los mundos de validación (checkpoints/am_checkpoint_<N>nodes_best.pt,
-                                 # solo si se entrenó con el proceso exógeno). Se dejó en False porque elegir
+                                 # margen en los mundos de validación (checkpoints/am_checkpoint_<N>nodes_best.pt).
+                                 # Se dejó en False porque elegir
                                  # el máximo entre ~80 validaciones de 200 mundos sobreajusta esa validación:
                                  # en 10, 20 y 35 nodos el último update rindió igual o mejor en los mundos
                                  # de test (8-32 USD). El checkpoint am_checkpoint_<N>nodes.pt (último) se
                                  # guarda siempre, y es el que usa el transfer learning.
-    USE_MARKET_PROCESS = True  # True: el entrenamiento sortea cargas y tarifas del proceso exógeno
-                                # en vez de reproducir días del histórico. False: entrena con días reales.
     EVAL_SET = os.environ.get("EVAL_SET", "dev")   # "dev": mundos de MARKET_SEED_EVAL (desarrollo, resultados de siempre).
                                                     # "final": mundos de MARKET_SEED_EVAL_FINAL (test final, un solo uso con
                                                     # la configuración congelada); escribe DRL_Routing_Summary_AM_final.xlsx.
@@ -400,8 +363,8 @@ def main():
         try:
             _run_one_size(
                 NUM_NODES, cwd,
-                EVAL_ONLY, USE_TRANSFER, EVAL_BEST_CHECKPOINT, USE_MARKET_PROCESS,
-                EVAL_SET, K_RESTRINGIDO, REPLICA_TAG,
+                EVAL_ONLY, USE_TRANSFER, EVAL_BEST_CHECKPOINT,
+                EVAL_SET, K_RESTRINGIDO,
             )
         except Exception:
             fallidos.append(NUM_NODES)

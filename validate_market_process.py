@@ -276,12 +276,12 @@ def graficar_serie_cargas(mp: MarketProcess, i: int, j: int, rng: np.random.Gene
 
 def graficar_delta(mp: MarketProcess, rng: np.random.Generator, out_dir: str, n_semillas: int = 5000) -> str:
     """Histograma del ajuste de nivel de mercado: δ sintético (un único valor por "mundo" simulado,
-    ver `MarketProcess._delta`) contra ΔF_t real (cambio diario del factor nacional, la misma
+    ver `MarketProcess.sortear_deltas`) contra ΔF_t real (cambio diario del factor nacional, la misma
     comparación de `validar_delta` pero como distribución completa en vez de una tabla de
     percentiles). Si las dos campanas tienen un ancho parecido, el tamaño típico del "día/mundo más
     caro o más barato de lo normal" que genera el simulador es realista."""
-    semillas = rng.integers(0, 2**31 - 1, size=n_semillas)
-    deltas = np.array([mp._delta(int(s)) for s in semillas])
+    g = torch.Generator().manual_seed(int(rng.integers(0, 2**31 - 1)))
+    deltas = mp.sortear_deltas(n_semillas, g).numpy()          # el mismo sorteo de δ que usan los mundos
 
     dias_full = cargar_dias_mercado()
     count_loads_full = dias_full["count_loads"][:TRAIN_DAYS]
@@ -406,8 +406,8 @@ def validar_delta(mp: MarketProcess, n_semillas: int, rng: np.random.Generator) 
     fit_market_process.estimar_dispersion_delta), no sobre los `--nodos` que se estén validando: δ
     es un único escalar nacional, compararlo contra un F_t de un subconjunto de nodos no sería
     la misma cantidad."""
-    semillas = rng.integers(0, 2**31 - 1, size=n_semillas)
-    deltas = np.array([mp._delta(int(s)) for s in semillas])
+    g = torch.Generator().manual_seed(int(rng.integers(0, 2**31 - 1)))
+    deltas = mp.sortear_deltas(n_semillas, g).numpy()          # el mismo sorteo de δ que usan los mundos
 
     dias_full = cargar_dias_mercado()
     count_loads_full = dias_full["count_loads"][:TRAIN_DAYS]

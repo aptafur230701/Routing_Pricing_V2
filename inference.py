@@ -25,16 +25,15 @@ import numpy as np
 import pandas as pd
 
 from config import (
-    DEVICE, MAX_DURATION, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, SEED,
+    DEVICE, MAX_DURATION, MARKET_DIAS_EPISODIO, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, SEED,
 )
 from model.agent import AMRoutingAgent
 from model.encoder import COT_COLS
-from evaluation import make_replay_env
-from greedy_rollout import construir_features, contexto_agente
+from greedy_rollout import EntradasAgente, construir_features, contexto_agente
 from market_process import MarketProcess, asegurar_parametros
 from pricing import U_NIVELES_ARR, lane_cost_row, prob_ganar
 from problem_data import load_matrices
-from routing_env import OPCION_VACIO
+from routing_env import OPCION_VACIO, VectorRoutingEnv
 from transfer_learning import load_checkpoint_compatible
 
 # ── Configuración ─────────────────────────────────────────────────────────────
@@ -70,32 +69,20 @@ def load_agent(checkpoint_path: str) -> AMRoutingAgent:
 # ── Carga de datos ────────────────────────────────────────────────────────────
 
 def load_latest_day():
-    """Carga las matrices y toma el último día disponible como snapshot actual.
-
-    Devuelve un entorno de replay de ese único día (day_idx 0) y las features de
-    mercado recortadas a ese mismo día, para que el índice 0 apunte a él.
-    """
-    time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr, \
-        ltr_stack, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
-
-    # Último día del stack histórico = día más reciente disponible
-    last = rate_stack.shape[0] - 1
+    """Carga las matrices y arma un entorno con el último día disponible como snapshot actual: cargas y cuantiles
+    reales de ese día (replay; los días siguientes repiten el último), competidor simulado con la semilla SEED."""
+    time_matrix, _, _, distance_arr, diesel_arr, _, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
     asegurar_parametros()
     market = MarketProcess(NUM_NODES)
-    env = make_replay_env(
-        time_matrix, rate_stack[last:], loads_stack[last:], distance_arr, diesel_arr, NUM_NODES,
-        day_offset=last, market=market,
-    )
+    last = market.num_dias_total - 1                     # último día del histórico = día más reciente disponible
+    env = VectorRoutingEnv(time_matrix, distance_arr, diesel_arr, market, device=DEVICE)
+    g = torch.Generator(device=DEVICE).manual_seed(SEED)
+    mundos = market.mundos_replay([last], MARKET_DIAS_EPISODIO, last, g)
     est_lane = market.estadisticas_dow(distance_arr, diesel_arr)   # una vez
     return dict(
-        env=env,
-        est_lane=est_lane,
-        time_matrix_arr=np.asarray(time_matrix, dtype=float),
-        distance_arr=distance_arr,
-        diesel_arr=diesel_arr,
-        ltr_stack=ltr_stack[:, last:],
-        avail_expected_arr=avail_expected_arr,
-        reward_global_p95=reward_global_p95,
+        env=env, mundos=mundos,
+        entradas=EntradasAgente.crear(env, avail_expected_arr, est_lane, reward_global_p95),
+        distance_arr=distance_arr, diesel_arr=diesel_arr,
     )
 
 
@@ -110,11 +97,8 @@ def _rollout(agent, start_node, day) -> tuple:
     no cierra el ciclo dentro de max_duration. Cada paso es una cotización (ganada o perdida), un viaje VACÍO o
     una espera (VACÍO con destino el propio nodo). Si desde casa no hay ninguna jugada, el camión no sale:
     route = [casa], reward 0."""
-    env = day["env"]
-    T, dist, diesel = day["time_matrix_arr"], day["distance_arr"], day["diesel_arr"]
-    starts = np.array([start_node], dtype=np.int64)
-    masks = env.reset(starts, np.array([0], dtype=np.int64), k_max_arr=[None],
-                      world_seeds=np.array([SEED], dtype=np.int64))
+    env, dist, diesel = day["env"], day["distance_arr"], day["diesel_arr"]
+    masks = env.reset(day["mundos"], np.array([start_node], dtype=np.int64), None)
     route, pasos, total = [int(start_node)], [], 0.0
     if bool(env.sin_salida[0]):
         return route, 0.0, 0.0, pasos
@@ -122,19 +106,17 @@ def _rollout(agent, start_node, day) -> tuple:
     with torch.no_grad():
         for _ in range(env.max_steps):
             i = int(env.current_node[0])
-            feats = construir_features(env, starts, T, dist, day["ltr_stack"], day["reward_global_p95"], NUM_NODES,
-                                       day["avail_expected_arr"], day["est_lane"], MAX_DURATION)
-            h_t, emb = contexto_agente(agent, feats, env.current_node, DEVICE)
-            a_t, o_t = agent.decoder.greedy_cotizacion(h_t, emb, torch.from_numpy(masks).to(DEVICE),
-                                                       torch.from_numpy(feats["opciones"]).to(DEVICE),
-                                                       torch.from_numpy(feats["node_feats"][..., COT_COLS]).to(DEVICE))
+            feats = construir_features(env, day["entradas"])
+            h_t, emb = contexto_agente(agent, feats)
+            a_t, o_t = agent.decoder.greedy_cotizacion(h_t, emb, masks, feats["opciones"],
+                                                       feats["node_feats"][..., COT_COLS])
             j, o = int(a_t[0]), int(o_t[0])
             vacio = o == OPCION_VACIO
-            precio = float("nan") if vacio else float(env.precios_row[0][j, o])
-            mediana = float(env.rate_row_obs[0][j])
-            p_ganar = 1.0 if vacio else float(prob_ganar(U_NIVELES_ARR[o], env.competencia[0]))
+            precio = float("nan") if vacio else float(env.precios_row[0, j, o])
+            mediana = float(env.rate_row_obs[0, j])
+            p_ganar = 1.0 if vacio else float(prob_ganar(U_NIVELES_ARR[o], float(env.competencia[0])))
             t_antes = float(env.time_elapsed[0])
-            _, terminated, masks = env.step(np.array([j]), np.array([o]))
+            _, terminated, masks = env.step(a_t, o_t)
             gano, espero = bool(env.last_gano[0]), bool(env.last_espero[0])
             r = float(env.last_raw_reward[0])
             total += r
@@ -146,7 +128,7 @@ def _rollout(agent, start_node, day) -> tuple:
                                          else float("nan")),
                           "horas": float(env.time_elapsed[0]) - t_antes,
                           "margen": r, "is_return": (vacio or gano) and not espero and j == start_node})
-            if terminated[0]:
+            if bool(terminated[0]):
                 valido = route[-1] == start_node and not bool(env.last_time_violation[0])
                 break
     if not valido:

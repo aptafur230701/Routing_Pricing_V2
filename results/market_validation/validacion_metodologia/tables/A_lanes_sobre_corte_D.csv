@@ -1,0 +1,918 @@
+﻿#,Lane,Decil de volumen,Cargas/día,D,p-valor
+1,Boston (MA) → New York (NY),9,246.8,0.236,0.0
+2,Hattiesburg (MS) → Boise (ID),2,1.5,0.231,0.0
+3,Oskaloosa (IA) → Albuquerque (NM),4,5.4,0.225,0.0
+4,Des Moines (IA) → Albuquerque (NM),4,5.8,0.217,0.0
+5,Manchester (NH) → Allentown (PA),9,257.0,0.217,0.0
+6,Manchester (NH) → New York (NY),9,269.5,0.214,0.0
+7,Fort Worth (TX) → Austin (TX),9,120.5,0.206,0.0001
+8,Grand Island (NE) → Park Rapids (MN),5,9.5,0.203,0.0001
+9,Thomasville (AL) → Boise (ID),1,1.0,0.202,0.0001
+10,Alexandria (MN) → Jackson (MS),2,1.6,0.202,0.0001
+11,Manchester (NH) → Philadelphia (PA),9,264.7,0.199,0.0002
+12,New York (NY) → Lexington (MO),8,31.5,0.198,0.0002
+13,Saginaw (MI) → Sturgis (SD),4,3.5,0.198,0.0002
+14,Allentown (PA) → Lawrence (KS),8,41.7,0.198,0.0002
+15,Allentown (PA) → Modesto (CA),9,81.8,0.196,0.0002
+16,North Platte (NE) → Alexandria (MN),4,5.4,0.195,0.0003
+17,Durant (OK) → Austin (TX),9,117.2,0.193,0.0003
+18,Manchester (NH) → Dayton (OH),8,40.1,0.193,0.0003
+19,Lewiston (ME) → Philadelphia (PA),9,135.7,0.193,0.0003
+20,Grand Island (NE) → Alexandria (MN),6,10.7,0.192,0.0003
+21,Boston (MA) → Allentown (PA),9,201.6,0.192,0.0003
+22,Allentown (PA) → Stockton (CA),9,83.7,0.192,0.0003
+23,Grand Rapids (MI) → Sturgis (SD),3,2.8,0.192,0.0003
+24,Oklahoma City (OK) → Odessa (TX),4,6.2,0.191,0.0003
+25,Boston (MA) → Dayton (OH),8,36.6,0.189,0.0004
+26,Dallas (TX) → Austin (TX),9,145.3,0.189,0.0004
+27,Mount Vernon (WA) → Glendale (AZ),4,6.4,0.188,0.0005
+28,Philadelphia (PA) → Lexington (MO),8,51.0,0.188,0.0005
+29,Bozeman (MT) → San Diego (CA),5,8.8,0.187,0.0005
+30,North Platte (NE) → Miami (FL),3,3.2,0.186,0.0005
+31,Akron (OH) → Boise (ID),2,2.5,0.186,0.0005
+32,New York (NY) → Los Angeles (CA),9,148.5,0.186,0.0006
+33,Mount Vernon (WA) → Salt Lake City (UT),5,8.4,0.186,0.0006
+34,Park Rapids (MN) → Billings (MT),2,1.5,0.185,0.0006
+35,New York (NY) → Dallas (TX),9,169.6,0.184,0.0007
+36,Kinston (NC) → Reno (NV),3,4.1,0.184,0.0007
+37,Lewiston (ME) → New York (NY),9,153.5,0.183,0.0007
+38,Madison (WI) → Lexington (MO),9,58.3,0.182,0.0008
+39,Waynesboro (VA) → Warrenton (VA),9,70.2,0.182,0.0008
+40,New York (NY) → Lawrence (KS),7,30.4,0.182,0.0008
+41,Philadelphia (PA) → Modesto (CA),9,93.0,0.181,0.0008
+42,Modesto (CA) → St. Johnsbury (VT),5,10.3,0.181,0.0008
+43,Tacoma (WA) → Salt Lake City (UT),5,9.8,0.181,0.0008
+44,Mount Vernon (WA) → Ogden (UT),5,8.4,0.181,0.0009
+45,Boston (MA) → Philadelphia (PA),9,216.7,0.181,0.0009
+46,Alexandria (MN) → Aurora (MN),2,1.6,0.181,0.0009
+47,Manchester (NH) → Carrollton (KY),8,37.4,0.18,0.0009
+48,Waynesboro (VA) → Cumberland (MD),9,56.1,0.18,0.001
+49,Boston (MA) → Springfield (MA),9,133.2,0.18,0.001
+50,Yakima (WA) → Lexington (MO),5,7.2,0.179,0.001
+51,New York (NY) → Lufkin (TX),9,57.4,0.179,0.001
+52,Denver (CO) → Bedford (IN),7,19.0,0.178,0.0011
+53,New York (NY) → Jonesboro (AR),7,18.9,0.178,0.0011
+54,Las Vegas (NV) → Lufkin (TX),7,16.1,0.177,0.0012
+55,Cheyenne (WY) → Ridgway (CO),6,15.3,0.177,0.0012
+56,Alexandria (MN) → Philadelphia (MS),2,1.8,0.177,0.0012
+57,Baker City (OR) → Denver (CO),7,23.3,0.177,0.0012
+58,Lawrence (KS) → Milledgeville (GA),7,22.2,0.177,0.0012
+59,Durant (OK) → Houston (TX),9,123.0,0.176,0.0013
+60,Philadelphia (PA) → Stockton (CA),9,98.5,0.175,0.0014
+61,Junction city (KS) → Winona (MS),5,9.2,0.175,0.0014
+62,Oklahoma City (OK) → Parsons (KS),7,18.7,0.175,0.0014
+63,Baker City (OR) → Richmond (VA),4,6.6,0.175,0.0014
+64,Stockton (CA) → Orangeburg (SC),5,10.2,0.175,0.0015
+65,New York (NY) → Stockton (CA),9,83.0,0.175,0.0015
+66,Cheyenne (WY) → St. Louis (MO),5,7.2,0.175,0.0015
+67,Dallas (TX) → Houston (TX),9,143.2,0.174,0.0016
+68,New York (NY) → Chandler (AZ),9,65.7,0.174,0.0016
+69,Reed City (MI) → Sturgis (SD),4,3.7,0.173,0.0016
+70,Cheyenne (WY) → Lynchburg (VA),4,5.2,0.173,0.0016
+71,Philadelphia (MS) → Boise (ID),2,1.4,0.173,0.0016
+72,Lincoln (NE) → Alexandria (MN),5,9.4,0.173,0.0016
+73,Warren (AR) → Chandler (AZ),3,4.4,0.173,0.0017
+74,Allentown (PA) → Los Angeles (CA),9,168.6,0.173,0.0017
+75,Mount Vernon (WA) → Chandler (AZ),5,6.5,0.173,0.0017
+76,New York (NY) → Modesto (CA),9,82.3,0.173,0.0017
+77,Cheyenne (WY) → Bedford (IN),7,17.8,0.173,0.0017
+78,New York (NY) → Houston (TX),9,84.9,0.172,0.0018
+79,Salt Lake City (UT) → Las Vegas (NV),4,5.5,0.172,0.0018
+80,Schofield (WI) → Tupelo (MS),3,4.0,0.172,0.0018
+81,Odessa (WA) → Lexington (MO),4,5.6,0.171,0.0019
+82,Fort Worth (TX) → Houston (TX),9,128.2,0.171,0.0019
+83,Baker City (OR) → Waynesboro (VA),4,6.3,0.171,0.002
+84,Quartzsite (AZ) → Ridgway (CO),3,2.4,0.171,0.002
+85,New York (NY) → Glendale (AZ),9,65.3,0.17,0.002
+86,Richmond (VA) → Ithaca (NY),8,34.6,0.17,0.002
+87,Pocatello (ID) → Stockton (CA),8,31.8,0.17,0.0021
+88,Jackson (MS) → Birmingham (AL),7,19.0,0.169,0.0023
+89,North Platte (NE) → Fargo (ND),2,2.0,0.169,0.0023
+90,North Platte (NE) → Park Rapids (MN),5,6.5,0.169,0.0023
+91,Mount Vernon (WA) → Macon (GA),4,4.9,0.169,0.0023
+92,Ogden (UT) → Las Vegas (NV),4,5.7,0.169,0.0023
+93,Billings (MT) → Cheyenne (WY),2,1.7,0.169,0.0023
+94,Marshall (MN) → Aurora (MN),3,2.0,0.168,0.0024
+95,Grand Island (NE) → Yakima (WA),4,6.0,0.168,0.0025
+96,New York (NY) → San Diego (CA),9,149.3,0.168,0.0025
+97,Fort Worth (TX) → San Antonio (TX),9,97.7,0.168,0.0026
+98,Madison (WI) → Lawrence (KS),9,51.9,0.168,0.0026
+99,Allentown (PA) → San Diego (CA),9,167.2,0.167,0.0027
+100,Denver (CO) → Dallas (TX),8,25.7,0.167,0.0027
+101,Sioux Falls (SD) → Minneapolis (MN),4,6.1,0.167,0.0027
+102,Jacksonville (FL) → Amarillo (TX),3,4.9,0.167,0.0027
+103,New York (NY) → Cottonwood (AZ),9,62.5,0.167,0.0027
+104,Cheyenne (WY) → Fort Worth (TX),7,20.5,0.166,0.0029
+105,Philadelphia (PA) → Lawrence (KS),8,50.4,0.166,0.0029
+106,Yakima (WA) → Billings (MT),2,1.5,0.166,0.003
+107,Allentown (PA) → Lexington (MO),8,43.3,0.166,0.003
+108,Philadelphia (PA) → Miami (FL),9,180.6,0.165,0.0031
+109,Milwaukee (WI) → Lawrence (KS),9,95.7,0.165,0.0031
+110,Pocatello (ID) → Coeur d'alene (ID),4,4.3,0.165,0.0031
+111,Denver (CO) → Fort Worth (TX),8,24.9,0.165,0.0032
+112,Winston-Salem (NC) → Modesto (CA),7,23.4,0.165,0.0032
+113,Modesto (CA) → Boston (MA),9,97.0,0.164,0.0034
+114,Boise (ID) → Richmond (VA),4,5.1,0.164,0.0034
+115,Fort Worth (TX) → Lufkin (TX),9,103.0,0.164,0.0034
+116,Fort Worth (TX) → Pierre (SD),1,0.9,0.164,0.0035
+117,Hattiesburg (MS) → Troy (AL),5,10.9,0.163,0.0037
+118,Tacoma (WA) → Ogden (UT),6,10.0,0.163,0.0037
+119,Springfield (MO) → Savannah (GA),5,8.9,0.163,0.0037
+120,Allentown (PA) → Lufkin (TX),9,64.6,0.163,0.0038
+121,Denver (CO) → Baltimore (MD),8,26.9,0.163,0.0038
+122,Gaylord (MI) → Oskaloosa (IA),5,6.0,0.162,0.0039
+123,Faribault (MN) → Winona (MS),3,3.7,0.162,0.0039
+124,New York (NY) → Miami (FL),9,136.5,0.162,0.004
+125,Saginaw (MI) → Findlay (OH),9,139.2,0.162,0.004
+126,Junction city (KS) → Orlando (FL),7,17.7,0.161,0.0041
+127,Denver (CO) → Ridgway (CO),6,15.9,0.161,0.0041
+128,New York (NY) → Durant (OK),9,146.0,0.161,0.0043
+129,Odessa (WA) → Tampa (FL),5,8.1,0.161,0.0044
+130,Minneapolis (MN) → Winona (MS),3,2.7,0.16,0.0046
+131,Odessa (WA) → Lawrence (KS),4,5.5,0.16,0.0046
+132,Albany (NY) → Eau Claire (WI),6,13.6,0.16,0.0047
+133,Cottonwood (AZ) → Ridgway (CO),4,6.2,0.16,0.0047
+134,Cheyenne (WY) → Fargo (ND),4,5.3,0.16,0.0047
+135,New York (NY) → Iowa city (IA),8,51.5,0.159,0.0048
+136,Odessa (WA) → Stockton (CA),7,17.3,0.159,0.0048
+137,Odessa (WA) → Billings (MT),2,1.2,0.159,0.0048
+138,Mount Vernon (WA) → Salem (OR),6,12.6,0.159,0.005
+139,Boston (MA) → Ann Arbor (MI),6,15.0,0.159,0.005
+140,Mount Vernon (WA) → Atlanta (GA),4,5.1,0.159,0.0051
+141,Boston (MA) → Carrollton (KY),8,33.3,0.159,0.0051
+142,Denver (CO) → St. Louis (MO),5,10.2,0.158,0.0053
+143,Alexandria (MN) → Winona (MS),3,2.4,0.158,0.0053
+144,Fayetteville (AR) → Savannah (GA),5,9.0,0.158,0.0053
+145,Akron (OH) → Tupelo (MS),5,9.9,0.158,0.0053
+146,Waynesboro (VA) → Ithaca (NY),8,41.8,0.158,0.0055
+147,San Antonio (TX) → Mcallen (TX),8,31.0,0.158,0.0055
+148,Cheyenne (WY) → Effingham (IL),5,7.7,0.158,0.0055
+149,Fargo (ND) → Richmond (VA),4,6.5,0.157,0.0056
+150,Miami (FL) → Ithaca (NY),5,10.9,0.157,0.0056
+151,Thomasville (AL) → Birmingham (AL),6,15.6,0.157,0.0056
+152,Manchester (NH) → Muncie (IN),8,40.0,0.157,0.0056
+153,Stockton (CA) → Florence (SC),6,14.3,0.157,0.0058
+154,Denver (CO) → Lafayette (IN),8,27.6,0.157,0.006
+155,Denver (CO) → Allentown (PA),8,35.2,0.157,0.006
+156,Springfield (MA) → New York (NY),9,344.2,0.157,0.006
+157,Boise (ID) → Cheyenne (WY),8,26.1,0.156,0.0062
+158,Findlay (OH) → Chandler (AZ),8,41.0,0.156,0.0062
+159,Philadelphia (PA) → Little Rock (AR),6,14.4,0.156,0.0062
+160,Boston (MA) → Muncie (IN),8,37.4,0.156,0.0062
+161,Los Angeles (CA) → Orangeburg (SC),6,13.9,0.156,0.0064
+162,Mount Vernon (WA) → Athens (GA),4,5.5,0.156,0.0064
+163,Hood River (OR) → Baker City (OR),4,7.2,0.156,0.0064
+164,Lewiston (ME) → Allentown (PA),9,126.8,0.156,0.0064
+165,Pierre (SD) → Warsaw (IN),3,2.6,0.156,0.0064
+166,Twin Falls (ID) → Stockton (CA),8,26.0,0.155,0.0066
+167,Boise (ID) → St. Helens (OR),6,12.7,0.155,0.0066
+168,Tulsa (OK) → Odessa (TX),4,5.0,0.155,0.0066
+169,Manchester (NH) → Saginaw (MI),6,14.9,0.155,0.0066
+170,Quartzsite (AZ) → Lufkin (TX),6,13.2,0.155,0.0068
+171,New York (NY) → Fort Worth (TX),9,162.3,0.155,0.0068
+172,Cheyenne (WY) → Saginaw (MI),4,4.7,0.155,0.0068
+173,Buffalo (NY) → Red Bluff (CA),2,1.8,0.155,0.007
+174,Yakima (WA) → Parsons (KS),4,5.4,0.155,0.007
+175,Allentown (PA) → Miami (FL),9,162.2,0.155,0.007
+176,Cheyenne (WY) → Dallas (TX),7,21.1,0.155,0.007
+177,Manchester (NH) → Auburn (AL),5,10.0,0.155,0.007
+178,Junction city (KS) → Fort Myers (FL),7,14.9,0.154,0.0072
+179,Durant (OK) → San Antonio (TX),9,88.2,0.154,0.0072
+180,San Antonio (TX) → Houston (TX),7,17.0,0.154,0.0072
+181,Winona (MS) → Albuquerque (NM),2,2.2,0.154,0.0074
+182,Mount Vernon (WA) → Billings (MT),2,1.1,0.154,0.0074
+183,Bozeman (MT) → Los Angeles (CA),4,6.1,0.154,0.0074
+184,Fairmont (WV) → Tallahassee (FL),5,7.5,0.153,0.0076
+185,New York (NY) → Milwaukee (WI),9,314.5,0.153,0.0076
+186,Allentown (PA) → Chicago (IL),9,456.5,0.153,0.0076
+187,Faribault (MN) → Aurora (MN),3,2.6,0.153,0.0076
+188,Billings (MT) → Denver (CO),2,1.7,0.153,0.0079
+189,Quartzsite (AZ) → Houston (TX),7,14.7,0.153,0.0079
+190,Cheyenne (WY) → Philadelphia (PA),8,30.8,0.153,0.0079
+191,Sioux City (IA) → Lexington (MO),6,16.0,0.153,0.0079
+192,Cottonwood (AZ) → Fayetteville (AR),5,7.3,0.152,0.0081
+193,Omaha (NE) → Pueblo (CO),5,7.6,0.152,0.0081
+194,San Antonio (TX) → Lufkin (TX),6,14.8,0.152,0.0081
+195,Allentown (PA) → Tupelo (MS),7,25.5,0.152,0.0081
+196,Denver (CO) → El Paso (TX),4,6.0,0.152,0.0081
+197,Austin (TX) → Lufkin (TX),7,21.1,0.152,0.0081
+198,St. Helens (OR) → New York (NY),8,36.5,0.152,0.0081
+199,Manchester (NH) → Springfield (MA),9,136.5,0.152,0.0083
+200,Odessa (WA) → Modesto (CA),7,16.5,0.152,0.0083
+201,Junction city (KS) → Athens (GA),7,19.9,0.152,0.0086
+202,Hood River (OR) → Macon (GA),6,15.4,0.152,0.0086
+203,Lewiston (ME) → Springfield (MA),9,70.8,0.152,0.0086
+204,Philadelphia (MS) → Birmingham (AL),7,22.1,0.152,0.0086
+205,Ann Arbor (MI) → Sturgis (SD),2,1.5,0.152,0.0086
+206,Salem (OR) → New York (NY),7,27.6,0.152,0.0086
+207,Philadelphia (PA) → Oklahoma City (OK),7,29.5,0.151,0.0088
+208,Denver (CO) → Philadelphia (PA),8,35.0,0.151,0.0088
+209,Cheyenne (WY) → Blackstone (VA),4,6.3,0.151,0.0088
+210,Bozeman (MT) → Houston (TX),3,3.8,0.151,0.0088
+211,Schofield (WI) → Odessa (TX),2,1.4,0.151,0.0088
+212,Manchester (NH) → Baltimore (MD),9,149.1,0.151,0.0088
+213,Ithaca (NY) → Athens (GA),9,54.9,0.151,0.0088
+214,Allentown (PA) → Chandler (AZ),9,73.0,0.151,0.0091
+215,Cheyenne (WY) → Raleigh (NC),5,8.3,0.151,0.0091
+216,Buffalo (NY) → Tupelo (MS),3,3.6,0.151,0.0091
+217,Oklahoma City (OK) → Lubbock (TX),5,6.9,0.151,0.0091
+218,Minneapolis (MN) → Aurora (MN),3,2.6,0.151,0.0091
+219,Lubbock (TX) → Fort Worth (TX),8,25.2,0.151,0.0091
+220,Jackson (MS) → Warsaw (IN),7,25.6,0.151,0.0091
+221,Boston (MA) → Baltimore (MD),9,113.1,0.151,0.0091
+222,Ogden (UT) → Modesto (CA),7,25.0,0.15,0.0094
+223,Allentown (PA) → Cottonwood (AZ),9,68.6,0.15,0.0094
+224,West Monroe (LA) → Kinston (NC),4,5.7,0.15,0.0094
+225,Parsons (KS) → Jonesboro (AR),8,28.6,0.15,0.0094
+226,Sioux Falls (SD) → Lufkin (TX),5,7.9,0.15,0.0094
+227,St. Louis (MO) → Oklahoma City (OK),5,10.6,0.15,0.0094
+228,Manchester (NH) → Lexington (KY),8,26.8,0.15,0.0094
+229,Philadelphia (PA) → Saginaw (MI),9,177.5,0.15,0.0094
+230,Philadelphia (PA) → Muscle Shoals (AL),8,32.0,0.15,0.0096
+231,West Monroe (LA) → Fresno (CA),4,5.5,0.15,0.0096
+232,Wichita (KS) → Eau Claire (WI),5,10.2,0.15,0.0096
+233,Allentown (PA) → Oklahoma City (OK),7,22.0,0.15,0.0096
+234,Dallas (TX) → San Antonio (TX),9,115.9,0.15,0.0096
+235,Kirksville (MO) → San Antonio (TX),7,21.5,0.15,0.0096
+236,Reed City (MI) → Findlay (OH),9,119.9,0.15,0.0096
+237,New York (NY) → Chicago (IL),9,381.9,0.15,0.0099
+238,Salem (OR) → Baker City (OR),4,5.5,0.15,0.0099
+239,Philadelphia (MS) → Boston (MA),4,6.0,0.15,0.0099
+240,Schofield (WI) → Muncie (IN),8,40.8,0.15,0.0099
+241,Modesto (CA) → Springfield (MA),9,151.0,0.15,0.0099
+242,Boston (MA) → Carlisle (PA),9,96.0,0.149,0.0102
+243,Lake Charles (LA) → Fayetteville (AR),3,4.3,0.149,0.0102
+244,Philadelphia (PA) → Chandler (AZ),9,76.1,0.149,0.0105
+245,Carrollton (KY) → Nashville (TN),9,59.5,0.149,0.0105
+246,Winston-Salem (NC) → Stockton (CA),7,23.9,0.148,0.0108
+247,Albuquerque (NM) → Orlando (FL),3,4.4,0.148,0.0108
+248,Waynesboro (VA) → Greenville (SC),8,31.8,0.148,0.0108
+249,Grants Pass (OR) → Manchester (NH),3,4.3,0.148,0.0108
+250,Dallas (TX) → Odessa (WA),3,4.3,0.148,0.0108
+251,Fairmont (WV) → Springfield (MA),9,78.0,0.148,0.0108
+252,Denver (CO) → Saginaw (MI),4,4.9,0.148,0.0108
+253,Durant (OK) → Nogales (AZ),6,11.4,0.148,0.0108
+254,Sioux City (IA) → St. Louis (MO),6,15.7,0.148,0.0111
+255,Manchester (NH) → Carlisle (PA),9,125.0,0.148,0.0111
+256,Warren (AR) → Glendale (AZ),3,4.3,0.148,0.0111
+257,Richmond (VA) → Fargo (ND),2,1.2,0.148,0.0111
+258,Cheyenne (WY) → Mcallen (TX),3,4.5,0.148,0.0115
+259,Green Bay (WI) → Parsons (KS),8,28.7,0.148,0.0115
+260,Allentown (PA) → Houston (TX),9,95.2,0.148,0.0115
+261,Durant (OK) → Lufkin (TX),9,99.7,0.148,0.0115
+262,Waynesboro (VA) → Baltimore (MD),9,118.2,0.148,0.0115
+263,Brownsville (TN) → Laredo (TX),5,7.9,0.148,0.0115
+264,Stockton (CA) → Fort Myers (FL),8,51.2,0.147,0.0118
+265,Parsons (KS) → Milledgeville (GA),8,36.8,0.147,0.0121
+266,Gaylord (MI) → Denver (CO),2,2.0,0.147,0.0121
+267,Kinston (NC) → Boise (ID),3,4.3,0.147,0.0121
+268,Boston (MA) → Auburn (AL),5,8.7,0.147,0.0121
+269,Orangeburg (SC) → Miami (FL),8,53.9,0.147,0.0121
+270,Fort Worth (TX) → Philadelphia (MS),7,25.9,0.147,0.0121
+271,Austin (TX) → Mcallen (TX),8,38.4,0.147,0.0121
+272,New York (NY) → Marshall (MN),9,98.8,0.147,0.0121
+273,Cheyenne (WY) → El Paso (TX),4,5.7,0.147,0.0121
+274,Faribault (MN) → Hattiesburg (MS),5,8.6,0.146,0.0125
+275,Lewiston (ME) → Cumberland (MD),8,29.8,0.146,0.0125
+276,Raleigh (NC) → New Orleans (LA),6,17.6,0.146,0.0125
+277,Chandler (AZ) → Fayetteville (AR),5,8.0,0.146,0.0125
+278,Philadelphia (PA) → Cottonwood (AZ),9,71.3,0.146,0.0125
+279,Greenville (SC) → North Platte (NE),3,3.0,0.146,0.0125
+280,Sioux City (IA) → Yakima (WA),5,8.7,0.146,0.0125
+281,Boston (MA) → Mount Pleasant (UT),2,2.1,0.146,0.0125
+282,Grants Pass (OR) → Boston (MA),3,4.2,0.146,0.0125
+283,Muncie (IN) → Laredo (TX),7,28.9,0.146,0.0128
+284,Bedford (IN) → Red Bluff (CA),5,9.9,0.146,0.0128
+285,Baker City (OR) → Odessa (WA),4,6.4,0.146,0.0128
+286,New York (NY) → Peoria (IL),9,195.1,0.146,0.0128
+287,Marshall (MN) → Sioux Falls (SD),6,11.5,0.146,0.0128
+288,Quartzsite (AZ) → Fort Worth (TX),7,18.0,0.145,0.0132
+289,Park Rapids (MN) → Parsons (KS),4,5.0,0.145,0.0132
+290,Sioux Falls (SD) → Austin (TX),6,12.9,0.145,0.0132
+291,Fresno (CA) → Saginaw (MI),8,32.4,0.145,0.0132
+292,Omaha (NE) → Dallas (TX),8,40.1,0.145,0.0132
+293,Waynesboro (VA) → Carlisle (PA),9,99.6,0.145,0.0132
+294,Green Bay (WI) → Lawrence (KS),8,30.4,0.145,0.0132
+295,Greenville (SC) → Boise (ID),3,2.7,0.145,0.0132
+296,Boston (MA) → Chicago (IL),9,59.0,0.145,0.0136
+297,Sioux Falls (SD) → Springfield (IL),5,10.3,0.145,0.0136
+298,Cheyenne (WY) → Oskaloosa (IA),4,4.5,0.145,0.0136
+299,Allentown (PA) → Thomasville (AL),6,18.0,0.145,0.0136
+300,Allentown (PA) → Glendale (AZ),9,72.4,0.145,0.0136
+301,Boise (ID) → Denver (CO),8,28.9,0.145,0.0136
+302,Denver (CO) → Lynchburg (VA),4,6.2,0.145,0.0136
+303,Boston (MA) → Manchester (NH),9,69.6,0.145,0.014
+304,Grand Island (NE) → Odessa (WA),3,2.8,0.145,0.014
+305,Odessa (WA) → Los Angeles (CA),9,48.7,0.145,0.014
+306,Mount Vernon (WA) → Dallas (TX),4,5.7,0.145,0.014
+307,Warsaw (IN) → Coeur d'alene (ID),3,4.2,0.145,0.014
+308,Fargo (ND) → Blackstone (VA),4,5.4,0.145,0.014
+309,Modesto (CA) → Pittsburgh (PA),8,49.0,0.145,0.014
+310,Pocatello (ID) → Jonesboro (AR),3,3.8,0.144,0.0144
+311,Jonesboro (AR) → San Diego (CA),8,34.9,0.144,0.0144
+312,Carrollton (KY) → Billings (MT),2,1.5,0.144,0.0144
+313,Denver (CO) → Warrenton (VA),6,13.7,0.144,0.0144
+314,Modesto (CA) → Manchester (NH),9,88.1,0.144,0.0144
+315,Baker City (OR) → Cheyenne (WY),7,20.7,0.144,0.0144
+316,Jacksonville (FL) → Lubbock (TX),4,4.9,0.144,0.0144
+317,Modesto (CA) → San Diego (CA),9,439.2,0.144,0.0144
+318,Cumberland (MD) → Parsons (KS),6,13.6,0.144,0.0144
+319,Milwaukee (WI) → Lubbock (TX),6,14.5,0.144,0.0144
+320,Albuquerque (NM) → Madison (WI),3,3.4,0.144,0.0144
+321,Parsons (KS) → Panama City (FL),5,9.0,0.144,0.0148
+322,Macon (GA) → San Diego (CA),8,53.6,0.144,0.0148
+323,Stockton (CA) → Los Angeles (CA),9,308.1,0.144,0.0148
+324,Pueblo (CO) → Sheridan (WY),4,4.3,0.144,0.0148
+325,Austin (TX) → Fort Worth (TX),9,48.1,0.144,0.0148
+326,Atlanta (GA) → Los Angeles (CA),9,66.7,0.144,0.0148
+327,Austin (TX) → Houston (TX),7,23.5,0.144,0.0148
+328,Birmingham (AL) → Schofield (WI),6,11.5,0.144,0.0148
+329,Cheyenne (WY) → Tulsa (OK),3,3.5,0.143,0.0152
+330,Salem (OR) → Manchester (NH),6,17.2,0.143,0.0152
+331,Madison (WI) → Parsons (KS),9,49.1,0.143,0.0152
+332,Sioux City (IA) → Denver (CO),7,17.5,0.143,0.0152
+333,Odessa (WA) → Parsons (KS),4,4.5,0.143,0.0152
+334,Marshall (MN) → Winona (MS),4,4.2,0.143,0.0152
+335,Cheyenne (WY) → Kinston (NC),3,4.3,0.143,0.0152
+336,Albuquerque (NM) → Milwaukee (WI),4,4.7,0.143,0.0152
+337,Gaylord (MI) → Sturgis (SD),2,1.4,0.143,0.0156
+338,Lawrence (KS) → Hattiesburg (MS),6,10.5,0.143,0.0156
+339,La Crosse (WI) → Lawrence (KS),7,17.3,0.143,0.0156
+340,Pocatello (ID) → Brownsville (TN),3,3.6,0.143,0.0156
+341,Lawrence (KS) → Missoula (MT),2,2.0,0.143,0.0156
+342,Sheridan (WY) → Cheyenne (WY),2,1.6,0.143,0.0156
+343,Park Rapids (MN) → Lawrence (KS),4,5.9,0.143,0.0156
+344,Green Bay (WI) → Tupelo (MS),5,8.4,0.143,0.0161
+345,Boston (MA) → Blackstone (VA),8,42.3,0.143,0.0161
+346,Albuquerque (NM) → Tampa (FL),3,4.4,0.143,0.0161
+347,Boise (ID) → Jacksonville (FL),4,6.4,0.143,0.0161
+348,Muscle Shoals (AL) → Winona (MS),7,18.9,0.143,0.0161
+349,Little Rock (AR) → Orangeburg (SC),5,8.5,0.143,0.0161
+350,Kinston (NC) → New Orleans (LA),5,11.8,0.143,0.0161
+351,Springfield (MO) → Chattanooga (TN),7,27.7,0.143,0.0161
+352,Sioux City (IA) → Chattanooga (TN),6,14.1,0.143,0.0161
+353,Fort Myers (FL) → Tyler (TX),7,18.9,0.143,0.0161
+354,Allentown (PA) → Jonesboro (AR),7,23.2,0.143,0.0161
+355,Omaha (NE) → Faribault (MN),7,24.4,0.142,0.0165
+356,Denver (CO) → Durant (OK),7,21.9,0.142,0.0165
+357,Denver (CO) → Greenville (SC),5,7.2,0.142,0.0165
+358,Springfield (MO) → Nashville (TN),7,20.8,0.142,0.0165
+359,Glendale (AZ) → Fayetteville (AR),5,7.5,0.142,0.0165
+360,Denver (CO) → New York (NY),8,28.0,0.142,0.0165
+361,New York (NY) → Saginaw (MI),9,132.9,0.142,0.0165
+362,Winona (MS) → Lawrence (KS),6,17.4,0.142,0.0165
+363,Springfield (MA) → Philadelphia (PA),9,327.0,0.142,0.0165
+364,Carrollton (KY) → Warren (AR),6,11.8,0.142,0.017
+365,Watertown (SD) → Tampa (FL),3,3.5,0.142,0.017
+366,Panama City (FL) → San Diego (CA),4,7.4,0.142,0.017
+367,Fort Myers (FL) → Los Angeles (CA),8,29.7,0.142,0.017
+368,Sioux City (IA) → Central City (KY),6,11.0,0.142,0.017
+369,Los Angeles (CA) → Pittsburgh (PA),7,20.6,0.142,0.017
+370,Cheyenne (WY) → San Antonio (TX),4,6.6,0.142,0.017
+371,Allentown (PA) → New Orleans (LA),8,34.5,0.141,0.0174
+372,Cheyenne (WY) → Durant (OK),7,18.0,0.141,0.0174
+373,Salem (OR) → Boston (MA),6,16.8,0.141,0.0174
+374,Junction city (KS) → Boston (MA),5,6.2,0.141,0.0174
+375,Muncie (IN) → Lubbock (TX),5,7.8,0.141,0.0174
+376,Cheyenne (WY) → Muncie (IN),7,20.3,0.141,0.0174
+377,Florence (SC) → Los Angeles (CA),8,33.9,0.141,0.0174
+378,Twin Falls (ID) → Las Vegas (NV),5,9.1,0.141,0.0174
+379,Dayton (OH) → Chattanooga (TN),9,67.0,0.141,0.0174
+380,Yakima (WA) → Los Angeles (CA),9,68.5,0.141,0.0174
+381,Crossville (TN) → Warsaw (IN),9,59.1,0.141,0.0174
+382,Florence (SC) → Reno (NV),3,3.9,0.141,0.0179
+383,Parsons (KS) → Tupelo (MS),7,23.0,0.141,0.0179
+384,Saginaw (MI) → Hattiesburg (MS),4,7.0,0.141,0.0179
+385,Stockton (CA) → St. Johnsbury (VT),5,8.6,0.141,0.0179
+386,Indianapolis (IN) → Billings (MT),2,2.4,0.141,0.0179
+387,Lewiston (ME) → Pocatello (ID),4,6.1,0.141,0.0179
+388,Lawrence (KS) → Macon (GA),8,40.4,0.141,0.0179
+389,Fort Myers (FL) → San Diego (CA),8,30.2,0.141,0.0179
+390,Philadelphia (PA) → Fairmont (WV),9,221.0,0.141,0.0179
+391,Kirksville (MO) → Hattiesburg (MS),4,5.8,0.141,0.0179
+392,Albuquerque (NM) → Fort Myers (FL),3,4.6,0.141,0.0179
+393,Denver (CO) → Houston (TX),6,13.3,0.141,0.0179
+394,Tacoma (WA) → Salem (OR),6,15.0,0.141,0.0184
+395,Twin Falls (ID) → Fort Worth (TX),7,21.6,0.141,0.0184
+396,Albuquerque (NM) → Green Bay (WI),3,2.7,0.141,0.0184
+397,Odessa (WA) → Orlando (FL),5,9.9,0.141,0.0184
+398,Circleville (UT) → Bakersfield (CA),4,4.6,0.141,0.0184
+399,Springfield (MA) → Iowa city (IA),6,14.1,0.141,0.0184
+400,Odessa (WA) → Green Bay (WI),4,6.7,0.141,0.0184
+401,Auburn (AL) → Los Angeles (CA),8,39.0,0.14,0.0189
+402,Lincoln (NE) → Park Rapids (MN),4,4.4,0.14,0.0189
+403,Lawrence (KS) → Pocatello (ID),3,2.5,0.14,0.0189
+404,Cheyenne (WY) → Lawrence (KS),5,8.8,0.14,0.0189
+405,Madison (WI) → Ithaca (NY),9,54.4,0.14,0.0189
+406,Orangeburg (SC) → Boise (ID),2,2.4,0.14,0.0189
+407,Salem (OR) → Springfield (MA),7,25.0,0.14,0.0189
+408,Thomasville (AL) → Auburn (AL),6,18.0,0.14,0.0189
+409,Lexington (MO) → Muncie (IN),9,77.9,0.14,0.0189
+410,Yakima (WA) → Winona (MS),3,3.0,0.14,0.0189
+411,Grand Rapids (MI) → Chicago (IL),9,315.5,0.14,0.0189
+412,Twin Falls (ID) → West Monroe (LA),2,1.8,0.14,0.0194
+413,Allentown (PA) → Fort Worth (TX),9,188.1,0.14,0.0194
+414,Saginaw (MI) → Chicago (IL),9,262.5,0.14,0.0194
+415,Findlay (OH) → Carlisle (PA),9,196.7,0.14,0.0194
+416,Carrollton (KY) → Odessa (TX),4,4.7,0.14,0.0194
+417,Philadelphia (PA) → Jonesboro (AR),7,27.0,0.14,0.0194
+418,Dallas (TX) → Lufkin (TX),9,114.0,0.14,0.0194
+419,Allentown (PA) → Little Rock (AR),6,12.0,0.139,0.02
+420,Fargo (ND) → Los Angeles (CA),5,8.6,0.139,0.02
+421,Lincoln (NE) → Central City (KY),5,8.0,0.139,0.02
+422,Cheyenne (WY) → Baltimore (MD),7,22.9,0.139,0.02
+423,Waynesboro (VA) → Charlotte (NC),8,38.3,0.139,0.02
+424,Schofield (WI) → Brownsville (TN),4,4.5,0.139,0.02
+425,Parsons (KS) → Athens (GA),9,63.3,0.139,0.02
+426,Jefferson City (MO) → Texarkana (AR),6,12.9,0.139,0.02
+427,Allentown (PA) → Marshall (MN),9,120.2,0.139,0.02
+428,Park Rapids (MN) → St. Louis (MO),3,4.1,0.139,0.02
+429,Dayton (OH) → Nashville (TN),9,58.6,0.139,0.0205
+430,Baker City (OR) → Albuquerque (NM),4,4.4,0.139,0.0205
+431,Springfield (MA) → Baltimore (MD),9,189.6,0.139,0.0205
+432,Cheyenne (WY) → Houston (TX),6,12.7,0.139,0.0205
+433,Junction city (KS) → Tallahassee (FL),4,5.9,0.139,0.0205
+434,Odessa (WA) → Central City (KY),4,4.3,0.139,0.0205
+435,Grand Island (NE) → Denver (CO),4,6.8,0.139,0.0205
+436,Pierre (SD) → Dayton (OH),3,3.5,0.139,0.0205
+437,Lewiston (ME) → Twin Falls (ID),4,6.1,0.139,0.0205
+438,Orlando (FL) → Las Vegas (NV),2,2.7,0.139,0.0205
+439,Reno (NV) → Orlando (FL),4,6.2,0.139,0.0211
+440,Ridgway (CO) → Kinston (NC),2,2.5,0.139,0.0211
+441,New York (NY) → Athens (GA),9,221.5,0.139,0.0211
+442,Muscle Shoals (AL) → Albany (NY),6,17.9,0.139,0.0211
+443,Tacoma (WA) → Fort Worth (TX),5,8.3,0.139,0.0211
+444,Ann Arbor (MI) → Philadelphia (PA),9,159.0,0.139,0.0211
+445,Pocatello (ID) → Modesto (CA),8,26.5,0.139,0.0211
+446,New York (NY) → Ann Arbor (MI),9,153.9,0.139,0.0211
+447,St. Johnsbury (VT) → Orangeburg (SC),3,4.6,0.139,0.0211
+448,Philadelphia (MS) → Springfield (MA),5,8.2,0.139,0.0211
+449,Ithaca (NY) → Sioux City (IA),3,2.7,0.139,0.0211
+450,Denver (CO) → Lufkin (TX),6,13.2,0.139,0.0211
+451,Akron (OH) → Panama City (FL),3,4.7,0.139,0.0211
+452,Thomasville (AL) → San Antonio (TX),5,10.3,0.139,0.0211
+453,Miami (FL) → Buffalo (NY),4,5.4,0.139,0.0211
+454,Orlando (FL) → Los Angeles (CA),7,28.4,0.139,0.0211
+455,Raleigh (NC) → Boise (ID),4,5.5,0.139,0.0211
+456,Junction city (KS) → Carrollton (KY),7,19.8,0.138,0.0217
+457,Fort Worth (TX) → Watertown (SD),3,3.8,0.138,0.0217
+458,Cheyenne (WY) → Fort Dodge (IA),4,6.4,0.138,0.0217
+459,Charlotte (NC) → Laredo (TX),8,31.8,0.138,0.0217
+460,Manchester (NH) → Chicago (IL),9,63.5,0.138,0.0217
+461,Stockton (CA) → Parsons (KS),4,6.8,0.138,0.0217
+462,Allentown (PA) → Milwaukee (WI),9,375.2,0.138,0.0217
+463,Boston (MA) → New Orleans (LA),3,2.7,0.138,0.0217
+464,Macon (GA) → Los Angeles (CA),8,52.4,0.138,0.0217
+465,Yakima (WA) → Philadelphia (MS),2,2.1,0.138,0.0217
+466,Thomasville (AL) → Demopolis (AL),5,8.2,0.138,0.0217
+467,Ithaca (NY) → Laredo (TX),4,5.6,0.138,0.0222
+468,Chattanooga (TN) → Oskaloosa (IA),4,6.5,0.138,0.0222
+469,Raleigh (NC) → Atlanta (GA),9,106.0,0.138,0.0222
+470,Cheyenne (WY) → Denver (CO),8,41.2,0.138,0.0222
+471,Salt Lake City (UT) → San Diego (CA),8,39.2,0.138,0.0222
+472,Philadelphia (PA) → Glendale (AZ),9,75.5,0.138,0.0222
+473,Denver (CO) → Tupelo (MS),3,3.5,0.138,0.0222
+474,Thomasville (AL) → Troy (AL),5,9.0,0.138,0.0222
+475,Warren (AR) → New York (NY),8,31.0,0.138,0.0222
+476,Waterloo (IA) → Wichita (KS),3,3.6,0.138,0.0222
+477,Boston (MA) → Cumberland (MD),8,33.2,0.138,0.0222
+478,Blackstone (VA) → Fargo (ND),2,1.6,0.138,0.0222
+479,Charlotte (NC) → North Platte (NE),3,2.6,0.138,0.0222
+480,Denver (CO) → Fort Dodge (IA),4,6.4,0.138,0.0222
+481,Odessa (WA) → Fort Myers (FL),5,8.9,0.138,0.0222
+482,Yakima (WA) → Austin (TX),6,12.6,0.138,0.0222
+483,Findlay (OH) → Glendale (AZ),8,40.3,0.137,0.0228
+484,Hood River (OR) → Atlanta (GA),6,16.1,0.137,0.0228
+485,Atlanta (GA) → Tacoma (WA),6,17.7,0.137,0.0228
+486,Muncie (IN) → Nashville (TN),9,65.6,0.137,0.0228
+487,Schofield (WI) → Lubbock (TX),2,1.6,0.137,0.0228
+488,Gaylord (MI) → Schofield (WI),7,16.3,0.137,0.0228
+489,Allentown (PA) → La Crosse (WI),9,84.2,0.137,0.0228
+490,Bozeman (MT) → Lufkin (TX),3,3.8,0.137,0.0228
+491,Greenville (SC) → Durant (OK),9,69.5,0.137,0.0228
+492,Akron (OH) → Wytheville (VA),7,28.8,0.137,0.0234
+493,Tupelo (MS) → Baker City (OR),2,1.8,0.137,0.0234
+494,Park Rapids (MN) → Effingham (IL),3,3.5,0.137,0.0234
+495,Athens (GA) → Los Angeles (CA),9,61.5,0.137,0.0234
+496,Warren (AR) → Cottonwood (AZ),3,4.2,0.137,0.0234
+497,Modesto (CA) → Buffalo (NY),7,23.9,0.137,0.0234
+498,Cheyenne (WY) → Crossville (TN),4,5.7,0.137,0.0234
+499,Eau Claire (WI) → Lawrence (KS),6,14.3,0.137,0.0234
+500,Stockton (CA) → Manchester (NH),8,47.4,0.137,0.0234
+501,Little Rock (AR) → New York (NY),8,48.3,0.136,0.0241
+502,Salt Lake City (UT) → Modesto (CA),7,19.5,0.136,0.0241
+503,Chandler (AZ) → Springfield (MO),5,8.0,0.136,0.0241
+504,Effingham (IL) → Odessa (WA),3,4.7,0.136,0.0241
+505,Sioux Falls (SD) → Central City (KY),4,5.6,0.136,0.0241
+506,Omaha (NE) → Manchester (NH),6,16.5,0.136,0.0241
+507,Quartzsite (AZ) → Durant (OK),6,16.4,0.136,0.0241
+508,Austin (TX) → Laredo (TX),7,23.3,0.136,0.0241
+509,Modesto (CA) → Orangeburg (SC),6,17.8,0.136,0.0241
+510,Athens (GA) → San Diego (CA),9,63.1,0.136,0.0241
+511,Akron (OH) → Oklahoma City (OK),6,16.0,0.136,0.0241
+512,Allentown (PA) → Minneapolis (MN),9,138.4,0.136,0.0241
+513,Philadelphia (PA) → Fort Worth (TX),9,215.8,0.136,0.0241
+514,Manchester (NH) → Blackstone (VA),8,47.6,0.136,0.0241
+515,Cheyenne (WY) → Red Bluff (CA),3,2.9,0.136,0.0247
+516,Bedford (IN) → Omaha (NE),7,23.9,0.136,0.0247
+517,Stockton (CA) → Albuquerque (NM),5,11.0,0.136,0.0247
+518,Greenville (SC) → Laredo (TX),7,26.3,0.136,0.0247
+519,Reno (NV) → Albuquerque (NM),2,2.2,0.136,0.0247
+520,Baltimore (MD) → Oklahoma City (OK),7,24.9,0.136,0.0247
+521,Lawrence (KS) → Raleigh (NC),7,21.2,0.136,0.0247
+522,Junction city (KS) → Tampa (FL),6,12.7,0.136,0.0247
+523,Springfield (MA) → Schofield (WI),5,9.3,0.136,0.0247
+524,New York (NY) → Austin (TX),8,50.1,0.136,0.0247
+525,Peoria (IL) → Kalispell (MT),2,1.4,0.136,0.0247
+526,Bakersfield (CA) → Pittsburgh (PA),7,26.0,0.136,0.0247
+527,Boston (MA) → Effingham (IL),4,6.5,0.136,0.0247
+528,Philadelphia (PA) → Chicago (IL),9,510.9,0.136,0.0247
+529,St. Louis (MO) → Ogden (UT),4,5.6,0.136,0.0247
+530,Lake Charles (LA) → Springfield (MO),3,3.7,0.136,0.0247
+531,Boise (ID) → Waynesboro (VA),4,4.9,0.136,0.0247
+532,Yakima (WA) → Hattiesburg (MS),3,4.0,0.136,0.0254
+533,Minneapolis (MN) → Faribault (MN),8,33.7,0.136,0.0254
+534,Parsons (KS) → Watertown (SD),5,7.8,0.136,0.0254
+535,Indianapolis (IN) → Laredo (TX),7,24.8,0.136,0.0254
+536,Carlisle (PA) → Cumberland (MD),9,197.2,0.136,0.0254
+537,Allentown (PA) → Dallas (TX),9,192.3,0.136,0.0254
+538,Florence (SC) → Nashville (TN),8,30.7,0.136,0.0254
+539,Birmingham (AL) → Fort Dodge (IA),5,9.0,0.136,0.0254
+540,Fresno (CA) → Thomasville (AL),4,5.8,0.136,0.0254
+541,Baltimore (MD) → Lincoln (NE),6,13.6,0.135,0.0261
+542,Durant (OK) → Odessa (WA),3,3.7,0.135,0.0261
+543,Omaha (NE) → Albuquerque (NM),6,11.0,0.135,0.0261
+544,New York (NY) → Demopolis (AL),7,20.8,0.135,0.0261
+545,Fayetteville (AR) → Chattanooga (TN),7,28.1,0.135,0.0261
+546,Chandler (AZ) → Albuquerque (NM),7,25.4,0.135,0.0261
+547,Chicago (IL) → Lubbock (TX),6,15.3,0.135,0.0261
+548,Jackson (MS) → Boston (MA),4,6.6,0.135,0.0261
+549,Philadelphia (PA) → Texarkana (AR),4,6.6,0.135,0.0261
+550,Cumberland (MD) → Denver (CO),4,5.6,0.135,0.0261
+551,Boston (MA) → Schofield (WI),3,3.1,0.135,0.0261
+552,Kirksville (MO) → Jackson (MS),4,4.7,0.135,0.0261
+553,Baker City (OR) → Reno (NV),2,2.2,0.135,0.0261
+554,Panama City (FL) → Green Bay (WI),4,5.9,0.135,0.0261
+555,Philadelphia (PA) → Los Angeles (CA),9,191.2,0.135,0.0261
+556,Allentown (PA) → Saginaw (MI),9,158.2,0.135,0.0261
+557,Reed City (MI) → Chicago (IL),9,269.0,0.135,0.0261
+558,Atlanta (GA) → San Diego (CA),9,67.9,0.135,0.0261
+559,Little Rock (AR) → Florence (SC),6,14.8,0.135,0.0267
+560,Alexandria (MN) → Hattiesburg (MS),3,3.8,0.135,0.0267
+561,Florence (SC) → San Diego (CA),8,34.3,0.135,0.0267
+562,Stockton (CA) → Fayetteville (AR),4,7.2,0.135,0.0267
+563,New Orleans (LA) → Atlanta (GA),7,24.8,0.135,0.0267
+564,Greenville (SC) → Miami (FL),9,97.4,0.135,0.0267
+565,Jackson (MS) → Auburn (AL),7,22.3,0.135,0.0267
+566,Park Rapids (MN) → Odessa (WA),2,2.1,0.135,0.0267
+567,Mount Pleasant (UT) → Las Vegas (NV),4,4.1,0.135,0.0267
+568,Jackson (MS) → Crossville (TN),5,8.3,0.135,0.0267
+569,Minneapolis (MN) → Sioux Falls (SD),6,11.9,0.135,0.0267
+570,Marshall (MN) → North Platte (NE),3,3.3,0.134,0.0274
+571,New York (NY) → Madison (WI),9,174.3,0.134,0.0274
+572,Manchester (NH) → Ann Arbor (MI),7,16.7,0.134,0.0274
+573,Parsons (KS) → Brownsville (TN),7,24.0,0.134,0.0274
+574,Lexington (MO) → Carrollton (KY),9,63.6,0.134,0.0274
+575,New York (NY) → Lafayette (IN),9,388.5,0.134,0.0274
+576,Raleigh (NC) → Modesto (CA),7,23.7,0.134,0.0274
+577,Baltimore (MD) → New Orleans (LA),7,19.9,0.134,0.0274
+578,Grand Island (NE) → Orlando (FL),6,10.3,0.134,0.0274
+579,Muncie (IN) → Modesto (CA),9,52.8,0.134,0.0274
+580,Junction city (KS) → Macon (GA),7,17.5,0.134,0.0282
+581,Brownsville (TN) → Albuquerque (NM),3,4.0,0.134,0.0282
+582,Pierre (SD) → Muncie (IN),3,3.6,0.134,0.0282
+583,Kirksville (MO) → Ann Arbor (MI),7,24.9,0.134,0.0282
+584,Green Bay (WI) → Jonesboro (AR),6,10.6,0.134,0.0282
+585,Effingham (IL) → Red Bluff (CA),3,3.5,0.134,0.0282
+586,Tacoma (WA) → Billings (MT),2,1.6,0.134,0.0282
+587,Fresno (CA) → Waynesboro (VA),8,42.3,0.134,0.0282
+588,Los Angeles (CA) → Mount Vernon (WA),9,161.0,0.134,0.0282
+589,St. Helens (OR) → Philadelphia (PA),8,38.3,0.134,0.0282
+590,New Orleans (LA) → Alexandria (LA),5,10.4,0.134,0.0282
+591,Salt Lake City (UT) → Los Angeles (CA),8,33.9,0.134,0.0282
+592,Gaylord (MI) → Cheyenne (WY),2,2.0,0.134,0.0282
+593,New York (NY) → Brownsville (TN),7,27.3,0.134,0.0282
+594,Grand Island (NE) → Houston (TX),5,9.3,0.134,0.0289
+595,Parsons (KS) → Savannah (GA),5,9.2,0.134,0.0289
+596,Hood River (OR) → Athens (GA),6,16.3,0.134,0.0289
+597,Muncie (IN) → Billings (MT),3,2.7,0.134,0.0289
+598,Reno (NV) → San Diego (CA),8,42.0,0.134,0.0289
+599,Carrollton (KY) → San Antonio (TX),8,40.5,0.134,0.0289
+600,Yakima (WA) → Lawrence (KS),5,7.0,0.134,0.0289
+601,Junction city (KS) → Findlay (OH),7,16.5,0.133,0.0297
+602,Albuquerque (NM) → Jacksonville (FL),3,2.9,0.133,0.0297
+603,Jefferson City (MO) → Ann Arbor (MI),7,26.8,0.133,0.0297
+604,St. Louis (MO) → Red Bluff (CA),2,1.7,0.133,0.0297
+605,Poplar Bluff (MO) → San Antonio (TX),6,15.4,0.133,0.0297
+606,Lincoln (NE) → Odessa (TX),2,1.5,0.133,0.0297
+607,Cheyenne (WY) → New York (NY),8,25.5,0.133,0.0297
+608,Mount Vernon (WA) → Fort Worth (TX),4,5.6,0.133,0.0297
+609,Oskaloosa (IA) → Manchester (NH),5,10.2,0.133,0.0297
+610,Oskaloosa (IA) → Pittsburgh (PA),5,9.0,0.133,0.0297
+611,Minneapolis (MN) → Jacksonville (FL),6,15.0,0.133,0.0297
+612,La Crosse (WI) → Effingham (IL),7,22.9,0.133,0.0297
+613,Allentown (PA) → Lafayette (IN),9,458.3,0.133,0.0297
+614,Los Angeles (CA) → San Diego (CA),9,302.3,0.133,0.0297
+615,Chandler (AZ) → Cumberland (MD),6,10.7,0.133,0.0297
+616,Baker City (OR) → Yakima (WA),5,9.2,0.133,0.0304
+617,Milwaukee (WI) → Philadelphia (MS),7,17.4,0.133,0.0304
+618,Omaha (NE) → Richmond (VA),5,10.0,0.133,0.0304
+619,Omaha (NE) → Waynesboro (VA),5,9.9,0.133,0.0304
+620,Odessa (WA) → Hattiesburg (MS),3,3.3,0.133,0.0304
+621,Watertown (SD) → St. Louis (MO),3,3.5,0.133,0.0304
+622,Jonesboro (AR) → Central City (KY),8,31.1,0.133,0.0304
+623,Florence (SC) → Green Bay (WI),7,22.9,0.133,0.0304
+624,Denver (CO) → Watertown (SD),4,6.2,0.133,0.0304
+625,Reno (NV) → Tampa (FL),4,6.0,0.133,0.0304
+626,Wichita (KS) → Florence (SC),3,3.1,0.133,0.0304
+627,Kirksville (MO) → Sioux City (IA),5,11.2,0.133,0.0304
+628,Philadelphia (MS) → Glendale (AZ),4,5.6,0.133,0.0304
+629,Odessa (WA) → Durant (OK),7,20.2,0.133,0.0304
+630,Lawrence (KS) → Chattanooga (TN),7,20.9,0.133,0.0304
+631,Oskaloosa (IA) → Green Bay (WI),6,14.8,0.133,0.0304
+632,Faribault (MN) → Jackson (MS),3,3.8,0.133,0.0304
+633,Panama City (FL) → Los Angeles (CA),4,6.8,0.132,0.0312
+634,Thomasville (AL) → Macon (GA),7,21.5,0.132,0.0312
+635,Denver (CO) → Lawrence (KS),5,9.0,0.132,0.0312
+636,Manchester (NH) → Mount Pleasant (UT),2,2.2,0.132,0.0312
+637,Manchester (NH) → Iowa city (IA),4,6.7,0.132,0.0312
+638,Carrollton (KY) → Lubbock (TX),4,6.8,0.132,0.0312
+639,Glendale (AZ) → Springfield (MO),5,7.7,0.132,0.0312
+640,Chattanooga (TN) → Lexington (KY),8,45.8,0.132,0.0312
+641,Lawrence (KS) → Dayton (OH),9,55.2,0.132,0.0312
+642,Stockton (CA) → Lynchburg (VA),7,19.8,0.132,0.0312
+643,Lewiston (ME) → Carlisle (PA),9,59.7,0.132,0.0312
+644,Thomasville (AL) → Cottonwood (AZ),3,3.4,0.132,0.0312
+645,Pierre (SD) → Ann Arbor (MI),3,2.9,0.132,0.0312
+646,Baltimore (MD) → Sioux City (IA),6,13.0,0.132,0.0312
+647,Hodgenville (KY) → Little Rock (AR),6,15.7,0.132,0.0312
+648,Dayton (OH) → Lubbock (TX),5,6.9,0.132,0.0312
+649,Saginaw (MI) → Glendale (AZ),6,14.2,0.132,0.0312
+650,Lawrence (KS) → Carrollton (KY),9,57.8,0.132,0.0312
+651,Glendale (AZ) → Madison (WI),6,11.0,0.132,0.0312
+652,Cheyenne (WY) → Allentown (PA),8,31.3,0.132,0.0312
+653,Salt Lake City (UT) → Stockton (CA),7,19.4,0.132,0.0312
+654,Winona (MS) → Fresno (CA),5,7.6,0.132,0.0312
+655,Cheyenne (WY) → Chicago (IL),7,22.9,0.132,0.0312
+656,Albuquerque (NM) → Dallas (TX),5,7.8,0.132,0.0312
+657,Chicago (IL) → Texarkana (AR),6,17.2,0.132,0.032
+658,Florence (SC) → Schofield (WI),6,14.2,0.132,0.032
+659,Sioux City (IA) → Fairmont (WV),5,10.1,0.132,0.032
+660,Muscle Shoals (AL) → Albuquerque (NM),3,3.0,0.132,0.032
+661,Austin (TX) → Dallas (TX),9,47.6,0.132,0.032
+662,Waterloo (IA) → Springfield (IL),7,24.5,0.132,0.032
+663,Ithaca (NY) → Tyler (TX),7,25.2,0.132,0.032
+664,Miami (FL) → Winston-Salem (NC),8,27.9,0.132,0.032
+665,Junction city (KS) → Greenville (SC),5,7.4,0.132,0.032
+666,Allentown (PA) → Nashville (TN),9,63.4,0.132,0.032
+667,Durant (OK) → Jefferson City (MO),8,43.8,0.132,0.032
+668,Crossville (TN) → Central City (KY),8,34.0,0.132,0.0329
+669,Allentown (PA) → Madison (WI),9,228.3,0.132,0.0329
+670,Odessa (WA) → Tallahassee (FL),5,9.5,0.132,0.0329
+671,Pocatello (ID) → West Monroe (LA),2,1.7,0.132,0.0329
+672,Raleigh (NC) → San Diego (CA),8,39.7,0.132,0.0329
+673,St. Johnsbury (VT) → Miami (FL),3,2.8,0.132,0.0329
+674,Cheyenne (WY) → Central City (KY),4,4.6,0.132,0.0329
+675,Miami (FL) → Charlotte (NC),7,26.2,0.132,0.0329
+676,Albuquerque (NM) → Laredo (TX),2,2.1,0.132,0.0329
+677,New York (NY) → Oklahoma City (OK),7,18.7,0.132,0.0329
+678,Wichita (KS) → Lufkin (TX),5,9.9,0.132,0.0329
+679,Green Bay (WI) → Fayetteville (AR),6,15.5,0.132,0.0329
+680,Allentown (PA) → Durant (OK),9,164.7,0.132,0.0329
+681,Jackson (MS) → Fort Smith (AR),5,12.0,0.132,0.0329
+682,Texarkana (AR) → Chandler (AZ),5,8.8,0.132,0.0329
+683,Cheyenne (WY) → Winston-Salem (NC),5,7.3,0.132,0.0329
+684,Modesto (CA) → Florence (SC),7,23.1,0.132,0.0329
+685,Winston-Salem (NC) → San Diego (CA),8,44.5,0.132,0.0329
+686,Cheyenne (WY) → Twin Falls (ID),3,4.2,0.132,0.0329
+687,Springfield (MA) → Saginaw (MI),7,25.5,0.132,0.0329
+688,Miami (FL) → Fort Smith (AR),3,2.7,0.131,0.0337
+689,West Monroe (LA) → St. Louis (MO),4,4.8,0.131,0.0337
+690,Los Angeles (CA) → Troy (AL),6,12.5,0.131,0.0337
+691,Knoxville (TN) → Bedford (IN),8,45.7,0.131,0.0337
+692,Sheridan (WY) → Denver (CO),2,1.7,0.131,0.0337
+693,Philadelphia (PA) → Parsons (KS),8,48.9,0.131,0.0337
+694,Oskaloosa (IA) → Fairmont (WV),5,7.5,0.131,0.0337
+695,Allentown (PA) → Brownsville (TN),8,31.4,0.131,0.0337
+696,Grand Rapids (MI) → Milwaukee (WI),9,308.6,0.131,0.0337
+697,Oklahoma City (OK) → Lawrence (KS),7,21.1,0.131,0.0337
+698,Richmond (VA) → Crossville (TN),6,16.7,0.131,0.0337
+699,Denver (CO) → Effingham (IL),6,11.1,0.131,0.0337
+700,New York (NY) → Minneapolis (MN),9,113.9,0.131,0.0337
+701,Salem (OR) → Macon (GA),4,7.1,0.131,0.0337
+702,St. Louis (MO) → Tyler (TX),7,20.3,0.131,0.0337
+703,Peoria (IL) → Wichita (KS),5,10.1,0.131,0.0337
+704,Cheyenne (WY) → St. Helens (OR),7,22.7,0.131,0.0337
+705,Milwaukee (WI) → Lexington (MO),9,104.7,0.131,0.0346
+706,Parsons (KS) → Central City (KY),7,20.8,0.131,0.0346
+707,Ann Arbor (MI) → Alexandria (LA),3,2.8,0.131,0.0346
+708,Jefferson City (MO) → Jackson (MS),4,6.3,0.131,0.0346
+709,Yakima (WA) → Central City (KY),4,5.0,0.131,0.0346
+710,Saginaw (MI) → Austin (TX),6,12.0,0.131,0.0346
+711,Saginaw (MI) → Ann Arbor (MI),9,137.0,0.131,0.0346
+712,Manchester (NH) → Fairmont (WV),6,15.5,0.131,0.0346
+713,Denver (CO) → Fargo (ND),4,6.0,0.131,0.0346
+714,Faribault (MN) → Philadelphia (MS),3,4.0,0.131,0.0346
+715,Red Bluff (CA) → Modesto (CA),7,19.6,0.13,0.0355
+716,Las Vegas (NV) → Bakersfield (CA),8,45.2,0.13,0.0355
+717,Lewiston (ME) → Lynchburg (VA),6,10.4,0.13,0.0355
+718,Dallas (TX) → Fort Worth (TX),9,152.6,0.13,0.0355
+719,Grants Pass (OR) → Springfield (MA),4,5.1,0.13,0.0355
+720,Springfield (MA) → Albany (NY),9,64.1,0.13,0.0355
+721,Las Vegas (NV) → Dallas (TX),6,14.1,0.13,0.0355
+722,New York (NY) → Birmingham (AL),8,50.0,0.13,0.0355
+723,Cumberland (MD) → Muscle Shoals (AL),6,11.2,0.13,0.0355
+724,Lexington (MO) → Missoula (MT),2,1.8,0.13,0.0355
+725,Indianapolis (IN) → Boston (MA),9,81.3,0.13,0.0355
+726,Lexington (MO) → Blackstone (VA),7,20.9,0.13,0.0355
+727,Lexington (MO) → Raleigh (NC),7,22.6,0.13,0.0355
+728,Poplar Bluff (MO) → Los Angeles (CA),6,17.8,0.13,0.0355
+729,Tampa (FL) → Tyler (TX),7,18.7,0.13,0.0355
+730,Hodgenville (KY) → North Platte (NE),2,2.4,0.13,0.0355
+731,Gaylord (MI) → Peoria (IL),8,33.5,0.13,0.0355
+732,Jonesboro (AR) → West Wendover (NV),3,3.7,0.13,0.0355
+733,Parsons (KS) → Knoxville (TN),7,22.1,0.13,0.0355
+734,Sioux Falls (SD) → Indianapolis (IN),7,25.4,0.13,0.0364
+735,Macon (GA) → Sioux City (IA),4,6.3,0.13,0.0364
+736,Cheyenne (WY) → Tupelo (MS),3,3.3,0.13,0.0364
+737,Lincoln (NE) → Dayton (OH),8,30.8,0.13,0.0364
+738,Lincoln (NE) → Ogden (UT),5,10.9,0.13,0.0364
+739,Allentown (PA) → Las Vegas (NV),7,25.7,0.13,0.0364
+740,Texarkana (AR) → Florence (SC),4,7.3,0.13,0.0364
+741,Lubbock (TX) → Cumberland (MD),4,4.2,0.13,0.0364
+742,Raleigh (NC) → Stockton (CA),7,24.7,0.13,0.0364
+743,Winona (MS) → Denver (CO),5,10.8,0.13,0.0364
+744,Allentown (PA) → Birmingham (AL),9,58.8,0.13,0.0364
+745,Chandler (AZ) → Milwaukee (WI),7,16.3,0.13,0.0364
+746,Warren (AR) → Boise (ID),2,2.2,0.13,0.0364
+747,Cumberland (MD) → Lexington (MO),6,12.1,0.13,0.0364
+748,Alexandria (MN) → Eau Claire (WI),7,23.2,0.13,0.0364
+749,Bedford (IN) → Little Rock (AR),7,20.6,0.13,0.0373
+750,Manchester (NH) → Warrenton (VA),9,92.5,0.13,0.0373
+751,Knoxville (TN) → Albuquerque (NM),4,5.7,0.13,0.0373
+752,Chattanooga (TN) → Carrollton (KY),9,60.5,0.13,0.0373
+753,Albany (GA) → Philadelphia (MS),7,16.9,0.13,0.0373
+754,Saginaw (MI) → Jonesboro (AR),5,11.0,0.13,0.0373
+755,Philadelphia (PA) → Odessa (WA),5,8.0,0.13,0.0373
+756,Las Vegas (NV) → Fort Worth (TX),7,18.7,0.13,0.0373
+757,Birmingham (AL) → Oskaloosa (IA),4,5.0,0.13,0.0373
+758,Lubbock (TX) → Bakersfield (CA),2,2.6,0.13,0.0373
+759,Boston (MA) → St. Louis (MO),4,6.0,0.13,0.0373
+760,Lincoln (NE) → Marshall (MN),6,15.6,0.13,0.0373
+761,Tampa (FL) → Fresno (CA),4,5.0,0.13,0.0373
+762,Philadelphia (PA) → San Diego (CA),9,185.9,0.13,0.0373
+763,Ithaca (NY) → Atlanta (GA),8,52.5,0.13,0.0373
+764,Buffalo (NY) → Minneapolis (MN),6,12.4,0.13,0.0373
+765,Fairmont (WV) → Muscle Shoals (AL),4,6.2,0.13,0.0373
+766,Tacoma (WA) → Dallas (TX),5,8.4,0.13,0.0373
+767,Pittsburgh (PA) → Lincoln (NE),3,4.7,0.129,0.0382
+768,Denver (CO) → Pueblo (CO),7,20.7,0.129,0.0382
+769,Denver (CO) → Twin Falls (ID),3,4.6,0.129,0.0382
+770,Sioux Falls (SD) → Tupelo (MS),5,8.3,0.129,0.0382
+771,Saginaw (MI) → St. Louis (MO),9,48.2,0.129,0.0382
+772,Reno (NV) → Durant (OK),4,5.2,0.129,0.0382
+773,Cheyenne (WY) → Lafayette (IN),8,27.3,0.129,0.0382
+774,Lexington (MO) → Hattiesburg (MS),6,11.5,0.129,0.0382
+775,Albany (NY) → Tulsa (OK),4,5.6,0.129,0.0382
+776,Sioux City (IA) → Dallas (TX),8,40.6,0.129,0.0382
+777,Modesto (CA) → Warrenton (VA),9,123.5,0.129,0.0382
+778,Waynesboro (VA) → Gaylord (MI),3,4.1,0.129,0.0382
+779,Pocatello (ID) → Las Vegas (NV),5,6.4,0.129,0.0382
+780,Park Rapids (MN) → Ithaca (NY),3,4.2,0.129,0.0382
+781,Bakersfield (CA) → Fort Worth (TX),9,79.3,0.129,0.0382
+782,Warrenton (VA) → Brownsville (TN),5,10.0,0.129,0.0382
+783,Jonesboro (AR) → Los Angeles (CA),8,34.6,0.129,0.0382
+784,Philadelphia (PA) → Faribault (MN),9,164.3,0.129,0.0382
+785,Manchester (NH) → New Orleans (LA),3,2.5,0.129,0.0392
+786,Richmond (VA) → Reed City (MI),6,14.5,0.129,0.0392
+787,Albany (NY) → New York (NY),9,153.4,0.129,0.0392
+788,Warrenton (VA) → Cumberland (MD),9,84.5,0.129,0.0392
+789,Madison (WI) → Hattiesburg (MS),7,20.3,0.129,0.0392
+790,Stockton (CA) → Circleville (UT),3,4.8,0.129,0.0392
+791,Stockton (CA) → Pittsburgh (PA),7,24.2,0.129,0.0392
+792,Allentown (PA) → Coeur d'alene (ID),3,4.4,0.129,0.0392
+793,Philadelphia (PA) → Akron (OH),9,334.0,0.129,0.0392
+794,Denver (CO) → Sheridan (WY),5,10.0,0.129,0.0392
+795,Lawrence (KS) → Orlando (FL),8,41.5,0.129,0.0392
+796,Nashville (TN) → Lexington (KY),8,36.4,0.129,0.0392
+797,Quartzsite (AZ) → Los Angeles (CA),9,56.2,0.129,0.0392
+798,Lawrence (KS) → Muncie (IN),9,66.3,0.129,0.0392
+799,Wichita (KS) → Faribault (MN),5,10.7,0.129,0.0392
+800,Nogales (AZ) → Los Angeles (CA),7,18.5,0.129,0.0392
+801,Yakima (WA) → San Diego (CA),9,83.1,0.129,0.0392
+802,Philadelphia (MS) → Chandler (AZ),4,5.6,0.129,0.0392
+803,Schofield (WI) → Fayetteville (AR),6,10.7,0.129,0.0392
+804,Jacksonville (FL) → Stockton (CA),5,10.1,0.129,0.0392
+805,Lincoln (NE) → Cumberland (MD),6,11.4,0.129,0.0392
+806,Warren (AR) → Florence (SC),4,7.6,0.129,0.0392
+807,Stockton (CA) → New York (NY),9,129.8,0.128,0.0402
+808,Green Bay (WI) → Brownsville (TN),5,10.0,0.128,0.0402
+809,Reed City (MI) → Dayton (OH),9,78.1,0.128,0.0402
+810,Manchester (NH) → Kirksville (MO),3,3.5,0.128,0.0402
+811,Allentown (PA) → Hattiesburg (MS),8,41.1,0.128,0.0402
+812,Jonesboro (AR) → New York (NY),8,57.7,0.128,0.0402
+813,Philadelphia (PA) → Minneapolis (MN),9,148.0,0.128,0.0402
+814,Pueblo (CO) → Houston (TX),5,10.1,0.128,0.0402
+815,Greenville (SC) → Albuquerque (NM),3,5.0,0.128,0.0402
+816,Crossville (TN) → Thomasville (AL),7,24.0,0.128,0.0402
+817,Jackson (MS) → San Antonio (TX),6,16.7,0.128,0.0402
+818,Denver (CO) → Odessa (WA),5,6.9,0.128,0.0412
+819,Fargo (ND) → Billings (MT),2,1.3,0.128,0.0412
+820,Fargo (ND) → Junction city (KS),3,3.0,0.128,0.0412
+821,Junction city (KS) → Winston-Salem (NC),5,6.9,0.128,0.0412
+822,Jackson (MS) → Mount Pleasant (UT),2,2.1,0.128,0.0412
+823,Cheyenne (WY) → Lufkin (TX),6,12.5,0.128,0.0412
+824,Allentown (PA) → Faribault (MN),9,152.3,0.128,0.0412
+825,Philadelphia (PA) → Eau Claire (WI),9,157.3,0.128,0.0412
+826,Grand Rapids (MI) → Saginaw (MI),9,124.4,0.128,0.0412
+827,Tulsa (OK) → Stockton (CA),7,18.1,0.128,0.0412
+828,Boston (MA) → Iowa city (IA),5,6.8,0.128,0.0412
+829,Cheyenne (WY) → Nashville (TN),3,3.8,0.128,0.0412
+830,New York (NY) → Tyler (TX),8,52.8,0.128,0.0412
+831,Stockton (CA) → Kinston (NC),5,11.0,0.128,0.0412
+832,Minneapolis (MN) → Missoula (MT),2,2.0,0.128,0.0412
+833,Glendale (AZ) → Ridgway (CO),4,6.6,0.128,0.0412
+834,Los Angeles (CA) → Manchester (NH),8,52.8,0.127,0.0422
+835,Chattanooga (TN) → Texarkana (AR),6,14.0,0.127,0.0422
+836,Cumberland (MD) → Lawrence (KS),5,10.0,0.127,0.0422
+837,Schofield (WI) → Springfield (MO),6,11.1,0.127,0.0422
+838,Ridgway (CO) → Atlanta (GA),5,9.4,0.127,0.0422
+839,Hattiesburg (MS) → Lake Charles (LA),4,6.5,0.127,0.0422
+840,Muscle Shoals (AL) → West Monroe (LA),5,7.2,0.127,0.0422
+841,Albuquerque (NM) → Fort Worth (TX),5,8.4,0.127,0.0422
+842,Sioux City (IA) → North Platte (NE),3,3.6,0.127,0.0422
+843,Greenville (SC) → Fort Worth (TX),9,77.1,0.127,0.0422
+844,Springfield (MA) → Carlisle (PA),9,166.5,0.127,0.0422
+845,Modesto (CA) → Los Angeles (CA),9,424.4,0.127,0.0422
+846,Cheyenne (WY) → Odessa (WA),5,6.9,0.127,0.0422
+847,Philadelphia (PA) → San Antonio (TX),8,54.1,0.127,0.0422
+848,Odessa (WA) → Raleigh (NC),5,6.8,0.127,0.0422
+849,North Platte (NE) → Fort Myers (FL),4,4.5,0.127,0.0422
+850,La Crosse (WI) → Parsons (KS),7,17.8,0.127,0.0422
+851,Stockton (CA) → La Crosse (WI),6,14.6,0.127,0.0422
+852,Lewiston (ME) → Baltimore (MD),9,70.3,0.127,0.0422
+853,Stockton (CA) → Muncie (IN),8,37.8,0.127,0.0422
+854,Miami (FL) → Raleigh (NC),7,22.1,0.127,0.0422
+855,Carlisle (PA) → Parsons (KS),7,24.4,0.127,0.0422
+856,New York (NY) → New Orleans (LA),7,29.6,0.127,0.0422
+857,Parsons (KS) → Hattiesburg (MS),6,14.3,0.127,0.0433
+858,Boston (MA) → Kirksville (MO),3,3.4,0.127,0.0433
+859,La Crosse (WI) → Lexington (MO),7,18.2,0.127,0.0433
+860,Lubbock (TX) → Laredo (TX),6,13.8,0.127,0.0433
+861,Cheyenne (WY) → Greenville (SC),4,6.2,0.127,0.0433
+862,Fresno (CA) → Warrenton (VA),9,85.6,0.127,0.0433
+863,Ithaca (NY) → Dallas (TX),8,44.8,0.127,0.0433
+864,San Diego (CA) → Bedford (IN),8,39.3,0.127,0.0433
+865,New York (NY) → Tupelo (MS),7,20.2,0.127,0.0433
+866,Alexandria (MN) → Grand Island (NE),4,5.5,0.127,0.0433
+867,Waynesboro (VA) → St. Johnsbury (VT),7,24.2,0.127,0.0433
+868,New York (NY) → Hattiesburg (MS),8,35.8,0.127,0.0433
+869,Nogales (AZ) → San Antonio (TX),4,6.1,0.127,0.0433
+870,Tacoma (WA) → Macon (GA),5,6.8,0.127,0.0433
+871,Green Bay (WI) → Little Rock (AR),4,6.4,0.127,0.0433
+872,Charlotte (NC) → Madison (WI),8,54.7,0.127,0.0433
+873,Fargo (ND) → Fort Smith (AR),4,4.7,0.127,0.0433
+874,Ann Arbor (MI) → New York (NY),9,136.5,0.127,0.0433
+875,Springfield (MA) → Allentown (PA),9,305.6,0.127,0.0433
+876,Las Vegas (NV) → Amarillo (TX),3,2.6,0.127,0.0433
+877,Tampa (FL) → Fort Worth (TX),8,41.7,0.127,0.0433
+878,Lawrence (KS) → Nashville (TN),6,14.9,0.127,0.0433
+879,Effingham (IL) → Hood River (OR),5,9.4,0.127,0.0443
+880,Kinston (NC) → Atlanta (GA),9,63.2,0.127,0.0443
+881,Philadelphia (PA) → Milwaukee (WI),9,415.3,0.127,0.0443
+882,Jonesboro (AR) → Cumberland (MD),6,17.3,0.127,0.0443
+883,San Diego (CA) → Tallahassee (FL),5,9.9,0.127,0.0443
+884,Twin Falls (ID) → Modesto (CA),7,21.9,0.127,0.0443
+885,Junction city (KS) → Charlotte (NC),5,7.0,0.127,0.0443
+886,Junction city (KS) → Atlanta (GA),7,20.3,0.127,0.0443
+887,Miami (FL) → Blackstone (VA),6,16.9,0.127,0.0443
+888,Knoxville (TN) → Thomasville (AL),8,26.8,0.127,0.0443
+889,Cumberland (MD) → Tupelo (MS),4,6.7,0.127,0.0443
+890,New York (NY) → Pittsburgh (PA),9,202.2,0.127,0.0443
+891,Oklahoma City (OK) → San Antonio (TX),7,18.8,0.127,0.0443
+892,Marshall (MN) → Boston (MA),7,24.1,0.127,0.0443
+893,Philadelphia (PA) → Pittsburgh (PA),9,277.5,0.127,0.0443
+894,Allentown (PA) → Athens (GA),9,270.3,0.127,0.0443
+895,St. Louis (MO) → Thomasville (AL),4,7.3,0.127,0.0443
+896,Boston (MA) → Lexington (KY),8,24.1,0.127,0.0443
+897,Allentown (PA) → Hood River (OR),7,30.3,0.127,0.0443
+898,Cheyenne (WY) → Manchester (NH),5,7.1,0.127,0.0443
+899,Ridgway (CO) → Durant (OK),5,7.4,0.127,0.0443
+900,Chattanooga (TN) → Central City (KY),8,32.0,0.127,0.0443
+901,Lake Charles (LA) → Athens (GA),6,13.4,0.127,0.0443
+902,Watertown (SD) → Mcallen (TX),3,4.3,0.127,0.0443
+903,Lawrence (KS) → Tupelo (MS),7,17.3,0.127,0.0443
+904,Philadelphia (MS) → Wichita (KS),3,4.1,0.126,0.0454
+905,Faribault (MN) → Sioux Falls (SD),6,12.7,0.126,0.0454
+906,Jefferson City (MO) → Miami (FL),6,13.4,0.126,0.0454
+907,Birmingham (AL) → Texarkana (AR),6,12.7,0.126,0.0454
+908,Pittsburgh (PA) → Birmingham (AL),6,14.5,0.126,0.0454
+909,Denver (CO) → Oskaloosa (IA),4,4.5,0.126,0.0454
+910,Texarkana (AR) → Boise (ID),2,2.2,0.126,0.0454
+911,Milwaukee (WI) → Jackson (MS),7,21.1,0.126,0.0454
+912,Durant (OK) → Philadelphia (MS),7,25.5,0.126,0.0454
+913,Thomasville (AL) → Athens (GA),7,22.2,0.126,0.0454
+914,New York (NY) → Jacksonville (FL),9,82.3,0.126,0.0454
+915,Tallahassee (FL) → Charleston (WV),7,16.4,0.126,0.0454
+916,Glendale (AZ) → Albuquerque (NM),7,24.1,0.126,0.0454
+917,Chattanooga (TN) → Thomasville (AL),8,27.3,0.126,0.0454

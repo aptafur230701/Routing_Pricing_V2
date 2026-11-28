@@ -2,7 +2,8 @@
 routing_env.py
 ==============
 VectorRoutingEnv: entorno del ruteo estocástico con cotización (especificacion_fase0_ruteo_pricing.md §4),
-B episodios en paralelo.
+B episodios en paralelo. Todo el estado son tensores de torch en el dispositivo del entorno (la GPU en el
+servidor): no hay numpy ni loops sobre B en un paso, y nada vuelve a la CPU.
 
 MDP
 ---
@@ -25,14 +26,13 @@ Todo movimiento (y la espera, y perder una cotización lejos de casa) exige pode
 max_duration, termina con TIME_VIOLATION_PENALTY.
 `opciones_validas` (B, N, K+1) es la máscara de opciones y la máscara de destinos es su `any(-1)`.
 
-Revelación post-decisión: el tablero de un nodo (cargas, precios por nivel, competencia m y el
-competidor oculto) se revela AL LLEGAR, y es función pura de (semilla del episodio, nodo, día de
-llegada), con día de llegada = start_day_idx + int(time_elapsed // 14) recortado al último día con
-datos. Dos fuentes de tablero:
-  · mundos simulados: market_process=MarketProcess → `tablero_por_mundo` (cargas, cuantiles y δ
-    sorteados del proceso exógeno);
-  · replay de días reales: mercado_replay=MarketProcess → `tablero_real` (cargas y cuantiles del día
-    real day_offset + día; solo el competidor se sortea, con la semilla del caso).
+Tableros
+--------
+Los mundos vienen sorteados de antemano (`market_process.Mundos`: cargas y uniformes de los competidores por
+episodio, día, nodo y lane; `MarketProcess.sortear_mundos` para mundos simulados y `mundos_replay` para los días
+reales). Al llegar a i el día absoluto dia = min(dia0 + ⌊t / 14⌋, dia_max) se lee la fila [b, dia − dia0, i] y se
+completa con las tablas por día de `MarketProcess.tensores` (precios por nivel · e^δ, cuantiles, m). Como el mundo
+no depende de las decisiones, dos políticas sobre el mismo `Mundos` enfrentan exactamente lo mismo.
 El agente observa los precios por nivel (`precios_row`), las cargas y m (`competencia`), nunca el
 competidor (`u_comp_row` existe solo para la cota con información perfecta y los tests).
 `reward_rows` y `rate_row_obs` son el margen y el precio en la mediana de cada lane: lo observable.
@@ -47,24 +47,15 @@ Terminación:
        nada), el ciclo FALLA: violación con TIME_VIOLATION_PENALTY, como pasarse del tiempo. El ciclo hay que
        hacerlo; cotizar alto a propósito no sirve para saltarse un ciclo malo.
 
-Máscara de destinos: opciones_validas.any(-1). El self-loop es la espera. El camión puede revisitar
-nodos intermedios.
-
-Índice de mercado (feature del agente)
---------------------------------------
-`market_index` (B, N): con market_process, el índice del día real de llegada
-(`MarketProcess.indice_mundo_lote`); en replay, el índice observado del día real
-(`MarketProcess.indice_historico`). `index_std` es la desviación con la que se normaliza.
-
 Presupuesto de cardinalidad K (número de arcos, incluido el retorno)
 ----------------------------------------------------------------------
-reset(k_max_arr=[K o None, …]). None = caso libre. Con K, k_remaining baja en 1 por cada arco
+reset(k_max=[K o None, …]). None = caso libre. Con K, k_remaining baja en 1 por cada arco
 recorrido (un rechazo o una espera no consumen K) y, con k_remaining == 1, solo quedan volver a casa o
-esperar.
-Formulación ≤ K: la política puede cerrar el ciclo antes.
+esperar. Formulación ≤ K: la política puede cerrar el ciclo antes.
 """
 
 import numpy as np
+import torch
 
 from config import (
     MAX_DURATION,
@@ -72,15 +63,15 @@ from config import (
     RETURN_SUCCESS_BONUS,
     TIME_VIOLATION_PENALTY,
     USE_REWARD_SHAPING,
-    MARKET_SEED_TRAIN,
     COTIZACION_HORAS,
     COTIZACIONES_MAX_POR_NODO,
     HORAS_DIA_MERCADO,
     REPOSICION_MAX_MILLAS,
+    CHECK_TENSORS,
 )
-from fit_market_process import dia_de_semana
-from pricing import N_NIVELES, U_NIVELES_ARR, gana, indice_nivel, lane_cost_row
-from problem_data import lane_reward
+from pricing import (
+    N_NIVELES, U_NIVELES_ARR, indice_nivel, interp_cuantiles_t, lane_cost_t, lane_reward_t, percentil_competidor_t,
+)
 
 OPCION_VACIO = N_NIVELES                 # índice de la opción "ir sin cotizar" (tras los K niveles)
 _NIVEL_MEDIANA = indice_nivel(0.5)
@@ -88,7 +79,9 @@ _NIVEL_MEDIANA = indice_nivel(0.5)
 
 def fin_espera(t):
     """Hora en que termina una espera que empieza en t: el siguiente día de mercado (próximo múltiplo de
-    HORAS_DIA_MERCADO, estrictamente mayor que t). Sirve con escalares o arrays."""
+    HORAS_DIA_MERCADO, estrictamente mayor que t). Sirve con tensores (en float64) o con escalares/arrays."""
+    if isinstance(t, torch.Tensor):
+        return (torch.floor(t.double() / HORAS_DIA_MERCADO) + 1.0) * HORAS_DIA_MERCADO
     return (np.floor(np.asarray(t, dtype=np.float64) / HORAS_DIA_MERCADO) + 1.0) * HORAS_DIA_MERCADO
 
 
@@ -123,193 +116,142 @@ def max_pasos_cotizacion(time_matrix, max_duration: float = MAX_DURATION) -> int
     return (max_pasos(time_matrix, max_duration) + max_esperas(max_duration)) * (COTIZACIONES_MAX_POR_NODO + 1)
 
 
+def k_tensor(k_max, B: int, device) -> tuple:
+    """(k_restricted (B,) bool, k_max (B,) long) a partir de una lista de (int | None) o None (todos libres)."""
+    if k_max is None:
+        return torch.zeros(B, dtype=torch.bool, device=device), torch.zeros(B, dtype=torch.long, device=device)
+    if isinstance(k_max, torch.Tensor):                       # tensor con 0 = libre
+        k = k_max.to(device=device, dtype=torch.long)
+        return k > 0, k
+    k = torch.as_tensor([0 if x is None else int(x) for x in k_max], dtype=torch.long, device=device)
+    return k > 0, k
+
+
 class VectorRoutingEnv:
     """
-    B episodios en paralelo; el estado son arrays (B, ...). Interfaz propia (no Gymnasium).
+    B episodios en paralelo; el estado son tensores (B, ...) en `device`. Interfaz propia (no Gymnasium).
 
     Parámetros
     ----------
     time_matrix    : (N, N) horas de viaje.
-    num_nodes      : N.
     distance_arr, diesel_arr : (N, N) para el reward y el costo de cada lane.
-    num_dias       : días con datos del entorno (el día de llegada se recorta a num_dias − 1).
-    market_process : MarketProcess para mundos simulados (exclusivo con mercado_replay).
-    mercado_replay : MarketProcess para el replay de días reales (día absoluto = day_offset + día).
-    market_seed    : semilla del generador que reparte las semillas de episodio cuando reset()
-                     no recibe `world_seeds`.
-    day_offset     : índice absoluto del día 0 del entorno (TRAIN_DAYS para el replay de los días de
-                     evaluación). Define el día de la semana y, en replay, el día real del tablero.
+    market         : MarketProcess (tablas por día: precios por nivel, cuantiles, m, índice, LTR).
+    device         : dispositivo del estado (por defecto config.DEVICE).
     """
 
-    def __init__(
-        self,
-        time_matrix,
-        num_nodes:       int,
-        distance_arr:    np.ndarray,
-        diesel_arr:      np.ndarray,
-        num_dias:        int,
-        max_duration:    float = MAX_DURATION,
-        market_process = None,
-        mercado_replay = None,
-        market_seed:     int = MARKET_SEED_TRAIN,
-        day_offset:      int = 0,
-    ):
-        if (market_process is None) == (mercado_replay is None):
-            raise ValueError("pasar exactamente uno de market_process (mundos simulados) o mercado_replay (replay)")
-        self._market         = market_process
-        self._mercado_replay = mercado_replay
-        self._time_matrix_arr = (
-            time_matrix.to_numpy(dtype=float)
-            if hasattr(time_matrix, "to_numpy")
-            else np.asarray(time_matrix, dtype=float)
-        )
-        self.num_nodes     = num_nodes
-        self.max_duration  = max_duration
-        self._distance_arr = np.asarray(distance_arr)
-        self._diesel_arr   = np.asarray(diesel_arr)
-        self._day_offset   = int(day_offset)
-        self._max_day      = int(num_dias) - 1
-        self._seed_rng     = np.random.default_rng(market_seed)   # reparte semillas de episodio
-        mercado = market_process if market_process is not None else mercado_replay
-        self._indice_std   = mercado.indice_std
-        self._indice_stack = (None if market_process is not None
-                              else mercado_replay.indice_historico(self._day_offset, self._day_offset + int(num_dias)))
-
-        # Inicializados por reset()
-        self._B:                   int        = 0
-        self._start_node:          np.ndarray = None   # (B,) int64
-        self._current_node:        np.ndarray = None   # (B,) int64
-        self._time_elapsed:        np.ndarray = None   # (B,) float32
-        self._step_count:          np.ndarray = None   # (B,) int64 — arcos recorridos
-        self._start_day_idx:       np.ndarray = None   # (B,) int64
-        self._active:              np.ndarray = None   # (B,) bool
-        self._k_restricted:        np.ndarray = None   # (B,) bool
-        self._k_max:               np.ndarray = None   # (B,) int64 — indefinido donde no restringido
-        self._k_remaining:         np.ndarray = None   # (B,) int64 — indefinido donde no restringido
-        self._last_time_violation: np.ndarray = None   # (B,) bool
-        self._last_raw_reward:     np.ndarray = None   # (B,) float32 — reward de la lane del último step()
-        self._world_seed:          np.ndarray = None   # (B,) int64 — semilla de cada episodio
-        self._reward_row:          np.ndarray = None   # (B, N) float32 — margen a la mediana de las lanes salientes
-        self._current_loads_row:   np.ndarray = None   # (B, N) int64 — cargas del tablero
-        self._current_rate_row:    np.ndarray = None   # (B, N) float32 — precio en la mediana (USD/milla)
-        self._precios:       np.ndarray = None   # (B, N, K) USD/milla de cada nivel en las lanes salientes
-        self._u_comp:        np.ndarray = None   # (B, N, C) percentil del mejor competidor por carga (oculto al agente)
-        self._precio_comp:   np.ndarray = None   # (B, N, C) precio del mejor competidor (USD/milla)
-        self._m:             np.ndarray = None   # (B,) competidores efectivos del nodo actual
-        self._perdidas:      np.ndarray = None   # (B, N) int64 — cargas perdidas por lane en esta visita al nodo
-        self._n_rechazos:    np.ndarray = None   # (B,) int64 — rechazos en esta visita al nodo
-        self._opciones:      np.ndarray = None   # (B, N, K+1) bool — opciones válidas del estado actual
-        self._last_cotizo:   np.ndarray = None   # (B,) bool — el último step() fue una cotización
-        self._last_gano:     np.ndarray = None   # (B,) bool — … y se ganó la carga
-        self._last_precio:   np.ndarray = None   # (B,) USD/milla cobrado (NaN si no se cobró)
-        self._last_precio_comp: np.ndarray = None   # (B,) USD/milla del competidor en esa lane (NaN si VACÍO)
-        self._last_espero:   np.ndarray = None   # (B,) bool — el último step() fue una espera
-        self._sin_salida:    np.ndarray = None   # (B,) bool — el ciclo terminó en casa sin salir (terminación B)
-        self._reposicion = vacio_permitido(self._distance_arr)        # (N, N) vacío permitido por distancia
-        T = self._time_matrix_arr
-        vuelta = T + T.T
-        np.fill_diagonal(vuelta, np.inf)
-        self._t_vuelta_min = vuelta.min(axis=1)  # (N,) la ida y vuelta más corta desde cada nodo (para esperar en casa)
+    def __init__(self, time_matrix, distance_arr, diesel_arr, market, device=None, max_duration: float = MAX_DURATION):
+        from config import DEVICE
+        self.device = torch.device(device) if device is not None else DEVICE
+        dev = self.device
+        T = (time_matrix.to_numpy(dtype=float) if hasattr(time_matrix, "to_numpy")
+             else np.asarray(time_matrix, dtype=float))
+        self.num_nodes = N = T.shape[0]
+        self.max_duration = float(max_duration)
+        self._market = market
+        self._max_steps = max_pasos_cotizacion(T, max_duration)
+        self.T = torch.as_tensor(T, dtype=torch.float64, device=dev)              # (N, N) horas
+        self.T32 = self.T.float()
+        # Se conservan los dtypes de los datos (el diésel viene en float32): así el costo y su redondeo salen
+        # idénticos a los de los baselines, UB-PI y la DP, que usan las mismas matrices en numpy.
+        self.dist = torch.as_tensor(np.asarray(distance_arr), device=dev)
+        self.diesel = torch.as_tensor(np.asarray(diesel_arr), device=dev)
+        self.costo = lane_cost_t(self.dist, self.diesel)                            # (N, N) USD
+        self._reposicion = torch.as_tensor(vacio_permitido(distance_arr), device=dev)   # (N, N) vacío permitido
+        vuelta = self.T + self.T.T
+        vuelta.fill_diagonal_(float("inf"))
+        self._t_vuelta_min = vuelta.amin(dim=1)        # (N,) la ida y vuelta más corta desde cada nodo (esperar en casa)
+        self._jj = torch.arange(N, device=dev)
+        self._u_niveles = torch.as_tensor(U_NIVELES_ARR, dtype=torch.float64, device=dev)
+        self._indice_std = float(market.indice_std)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Ciclo de vida
     # ─────────────────────────────────────────────────────────────────────────
 
-    def reset(
-        self,
-        start_nodes:    np.ndarray,         # (B,) int64
-        start_day_idxs: np.ndarray,         # (B,) int64
-        k_max_arr:      list = None,        # length-B list of (int | None); None ⇒ todos libres
-        world_seeds:    np.ndarray = None,  # (B,) semillas de episodio; None ⇒ se reparten desde market_seed.
-                                            # Las MISMAS semillas reproducen los mismos tableros y competidores.
-    ) -> np.ndarray:                        # máscaras (B, N) int8
-        B, N, K = len(start_nodes), self.num_nodes, N_NIVELES
+    def reset(self, mundos, start_nodes, k_max=None) -> torch.Tensor:
+        """Empieza B episodios: mundos (market_process.Mundos), start_nodes (B,), k_max lista de (int | None) o
+        None (todos libres). Devuelve la máscara de destinos (B, N) bool."""
+        dev = self.device
+        self._tab = self._market.tensores(dev)                       # tablas por día (con el κ actual del mercado)
+        self._mundos = mundos
+        B, N, K, C = mundos.B, self.num_nodes, N_NIVELES, COTIZACIONES_MAX_POR_NODO
         self._B = B
-
-        self._start_node    = np.asarray(start_nodes,    dtype=np.int64)
-        self._current_node  = self._start_node.copy()
-        self._time_elapsed  = np.zeros(B, dtype=np.float32)
-        self._step_count    = np.zeros(B, dtype=np.int64)
-        self._start_day_idx = np.asarray(start_day_idxs, dtype=np.int64)
-        self._active        = np.ones(B, dtype=bool)
-
-        if k_max_arr is None:
-            self._k_restricted = np.zeros(B, dtype=bool)
-            self._k_max        = np.zeros(B, dtype=np.int64)
-        else:
-            self._k_restricted = np.array([k is not None for k in k_max_arr], dtype=bool)
-            self._k_max = np.array([int(k) if k is not None else 0 for k in k_max_arr], dtype=np.int64)
-        self._k_remaining = self._k_max.copy()
-        self._last_time_violation = np.zeros(B, dtype=bool)
-        self._last_raw_reward     = np.zeros(B, dtype=np.float32)
-
-        if world_seeds is None:
-            world_seeds = self._seed_rng.integers(0, 2**31 - 1, size=B)
-        self._world_seed = np.asarray(world_seeds, dtype=np.int64)
-        self._reward_row        = np.zeros((B, N), dtype=np.float32)
-        self._current_loads_row = np.zeros((B, N), dtype=np.int64)
-        self._current_rate_row  = np.zeros((B, N), dtype=np.float32)
-        self._precios      = np.zeros((B, N, K), dtype=np.float64)
-        self._u_comp       = np.zeros((B, N, COTIZACIONES_MAX_POR_NODO), dtype=np.float64)
-        self._precio_comp  = np.zeros((B, N, COTIZACIONES_MAX_POR_NODO), dtype=np.float64)
-        self._m            = np.ones(B, dtype=np.float64)
-        self._perdidas     = np.zeros((B, N), dtype=np.int64)
-        self._n_rechazos   = np.zeros(B, dtype=np.int64)
-        self._last_cotizo  = np.zeros(B, dtype=bool)
-        self._last_gano    = np.zeros(B, dtype=bool)
-        self._last_precio  = np.full(B, np.nan)
-        self._last_precio_comp = np.full(B, np.nan)
-        self._last_espero = np.zeros(B, dtype=bool)
-        self._revelar_tablero(np.arange(B), np.minimum(self._start_day_idx, self._max_day))
+        self._filas = torch.arange(B, device=dev)
+        self._start_node = torch.as_tensor(np.asarray(start_nodes) if not isinstance(start_nodes, torch.Tensor)
+                                           else start_nodes, dtype=torch.long, device=dev)
+        self._current_node = self._start_node.clone()
+        self._time_elapsed = torch.zeros(B, dtype=torch.float32, device=dev)
+        self._step_count = torch.zeros(B, dtype=torch.long, device=dev)
+        self._active = torch.ones(B, dtype=torch.bool, device=dev)
+        self._k_restricted, self._k_max = k_tensor(k_max, B, dev)
+        self._k_remaining = self._k_max.clone()
+        self._escala = torch.exp(mundos.delta.to(device=dev, dtype=torch.float64))   # (B,) e^δ
+        z = lambda *s, dtype=torch.float32: torch.zeros(*s, dtype=dtype, device=dev)
+        self._last_time_violation = z(B, dtype=torch.bool)
+        self._last_raw_reward = z(B)
+        self._reward_row = z(B, N)
+        self._current_loads_row = z(B, N, dtype=torch.int32)
+        self._current_rate_row = z(B, N)
+        self._precios = z(B, N, K, dtype=torch.float64)
+        self._u_comp = z(B, N, C, dtype=torch.float64)
+        self._precio_comp = z(B, N, C, dtype=torch.float64)
+        self._m = torch.ones(B, dtype=torch.float64, device=dev)
+        self._perdidas = z(B, N, dtype=torch.long)
+        self._n_rechazos = z(B, dtype=torch.long)
+        self._last_cotizo = z(B, dtype=torch.bool)
+        self._last_gano = z(B, dtype=torch.bool)
+        self._last_espero = z(B, dtype=torch.bool)
+        nan = torch.full((B,), float("nan"), dtype=torch.float64, device=dev)
+        self._last_precio, self._last_precio_comp = nan, nan.clone()
+        self._revelar_tablero(torch.ones(B, dtype=torch.bool, device=dev))
         masks = self._compute_masks()
-        self._sin_salida = masks.sum(axis=1) == 0                # no hay ninguna jugada desde casa: no sale
+        self._sin_salida = ~masks.any(dim=1)                            # no hay ninguna jugada desde casa: no sale
         self._active &= ~self._sin_salida
-        masks[self._sin_salida, 0] = 1                           # filas inactivas: una opción ficticia válida
-        self._opciones[self._sin_salida, 0, OPCION_VACIO] = True
+        masks[:, 0] |= self._sin_salida                                 # filas inactivas: una opción ficticia válida
+        self._opciones[:, 0, OPCION_VACIO] |= self._sin_salida
         return masks
 
-    def step(self, actions: np.ndarray, opciones: np.ndarray) -> tuple:
+    def step(self, actions: torch.Tensor, opciones: torch.Tensor) -> tuple:
         """Un paso de los B episodios: actions (B,) destino, opciones (B,) nivel 0 … K−1 o VACÍO = K.
 
         Solo se procesan las filas activas; las inactivas reciben reward 0 y terminated False.
-        Devuelve (rewards (B,), terminated (B,), next_masks (B, N)), con terminated True solo en las
+        Devuelve (rewards (B,) f32, terminated (B,) bool, next_masks (B, N) bool), con terminated True solo en las
         filas que terminan en ESTE paso.
         """
-        actions  = np.asarray(actions,  dtype=np.int64)
-        opciones = np.asarray(opciones, dtype=np.int64)
-        B, K = self._B, N_NIVELES
-        filas = np.arange(B)
-        act = self._active
-        if act.any() and not self._opciones[filas[act], actions[act], opciones[act]].all():
-            malas = filas[act][~self._opciones[filas[act], actions[act], opciones[act]]]
-            raise ValueError(f"(destino, opción) fuera de la máscara en las filas {malas.tolist()}")
+        dev, B, K = self.device, self._B, N_NIVELES
+        actions = actions.to(device=dev, dtype=torch.long)
+        opciones = opciones.to(device=dev, dtype=torch.long)
+        filas, act = self._filas, self._active
+        if CHECK_TENSORS:
+            malas = act & ~self._opciones[filas, actions, opciones]
+            if malas.any():
+                raise ValueError(f"(destino, opción) fuera de la máscara en las filas {malas.nonzero().flatten().tolist()}")
 
         cotiza = act & (opciones < K)
-        nivel = np.minimum(opciones, K - 1)
-        intento = np.minimum(self._perdidas[filas, actions], COTIZACIONES_MAX_POR_NODO - 1)   # la carga que se cotiza
-        gano = cotiza & gana(U_NIVELES_ARR[nivel], self._u_comp[filas, actions, intento])
+        nivel = opciones.clamp(max=K - 1)
+        intento = self._perdidas[filas, actions].clamp(max=COTIZACIONES_MAX_POR_NODO - 1)     # la carga que se cotiza
+        u_comp = self._u_comp[filas, actions, intento]
+        gano = cotiza & (self._u_niveles[nivel] < u_comp)                                      # pricing.gana
         pierde = cotiza & ~gano
-        espera = act & (actions == self._current_node)            # (i, VACÍO): esperar al día siguiente
-        viaja = act & ~pierde & ~espera                           # ganó, o VACÍO a otro nodo
+        espera = act & (actions == self._current_node)          # (i, VACÍO): esperar al día siguiente
+        viaja = act & ~pierde & ~espera                          # ganó, o VACÍO a otro nodo
 
         # ── Tiempo ────────────────────────────────────────────────────────────
-        t_viaje = self._time_matrix_arr[self._current_node, actions].astype(np.float32)
-        next_time = np.where(viaja, self._time_elapsed + t_viaje,
-                             np.where(espera, fin_espera(self._time_elapsed),
-                                      self._time_elapsed + np.float32(COTIZACION_HORAS))).astype(np.float32)
+        t = self._time_elapsed
+        t_viaje = self.T32[self._current_node, actions]
+        next_time = torch.where(viaja, t + t_viaje,
+                                torch.where(espera, fin_espera(t).float(), t + COTIZACION_HORAS)).float()
 
         # ── Reward de la lane (unidades originales) ───────────────────────────
         nodos = self._current_node
-        precio = np.where(gano, self._precios[filas, actions, nivel], 0.0)
-        raw = lane_reward(precio, gano.astype(np.int64), self._distance_arr[nodos, actions],
-                          self._diesel_arr[nodos, actions]).astype(np.float32)
-        raw = np.where(viaja, raw, 0.0).astype(np.float32)
+        precio = torch.where(gano, self._precios[filas, actions, nivel], torch.zeros_like(u_comp))
+        raw = lane_reward_t(precio, gano.long(), self.dist[nodos, actions], self.diesel[nodos, actions]).float()
+        raw = torch.where(viaja, raw, torch.zeros_like(raw))
         self._last_raw_reward = raw
-        self._last_espero = espera
-        self._last_cotizo = cotiza
-        self._last_gano = gano
-        self._last_precio = np.where(gano, precio, np.nan)
-        self._last_precio_comp = np.where(cotiza, self._precio_comp[filas, actions, intento], np.nan)
+        self._last_espero, self._last_cotizo, self._last_gano = espera, cotiza, gano
+        nan = torch.full_like(precio, float("nan"))
+        self._last_precio = torch.where(gano, precio, nan)
+        self._last_precio_comp = torch.where(cotiza, self._precio_comp[filas, actions, intento], nan)
 
         # ── Terminación (condición A) ─────────────────────────────────────────
         vuelve = viaja & (actions == self._start_node)
@@ -317,299 +259,302 @@ class VectorRoutingEnv:
         cond_a = vuelve | excede
         success = vuelve & (next_time <= self.max_duration)
         time_fail = act & cond_a & ~success
-        self._last_time_violation = time_fail.copy()
+        self._last_time_violation = time_fail
 
-        terminal = np.zeros(B, dtype=np.float32)
-        if USE_REWARD_SHAPING and success.any():
+        terminal = torch.zeros(B, dtype=torch.float32, device=dev)
+        if USE_REWARD_SHAPING:
             denom = max(self.num_nodes - 1, 1)
-            terminal[success] = (
-                RETURN_SUCCESS_BONUS
-                + (RETURN_SUCCESS_BONUS * 0.5) * (self._step_count[success].astype(np.float32) / denom)
-                + (RETURN_SUCCESS_BONUS * 0.3) * (next_time[success] / self.max_duration)
-            )
-        terminal[time_fail] = TIME_VIOLATION_PENALTY
-        rewards = np.where(act, raw / REWARD_SCALE_FACTOR + terminal, 0.0).astype(np.float32)
+            bono = (RETURN_SUCCESS_BONUS + (RETURN_SUCCESS_BONUS * 0.5) * (self._step_count.float() / denom)
+                    + (RETURN_SUCCESS_BONUS * 0.3) * (next_time / self.max_duration))
+            terminal = torch.where(success, bono, terminal)
+        terminal = torch.where(time_fail, torch.full_like(terminal, TIME_VIOLATION_PENALTY), terminal)
+        rewards = torch.where(act, raw / REWARD_SCALE_FACTOR + terminal, torch.zeros_like(raw))
 
         # ── Estado ────────────────────────────────────────────────────────────
-        self._current_node = np.where(viaja, actions, self._current_node).astype(np.int64)
-        self._time_elapsed = np.where(act, next_time, self._time_elapsed).astype(np.float32)
-        self._step_count = np.where(viaja, self._step_count + 1, self._step_count)          # arcos recorridos
-        self._k_remaining = np.where(viaja, self._k_remaining - 1, self._k_remaining)      # rechazo y espera no consumen K
-        self._perdidas[filas[pierde], actions[pierde]] += 1
-        self._n_rechazos = np.where(pierde, self._n_rechazos + 1, self._n_rechazos)
+        self._current_node = torch.where(viaja, actions, self._current_node)
+        self._time_elapsed = torch.where(act, next_time, self._time_elapsed)
+        self._step_count = self._step_count + viaja.long()                       # arcos recorridos
+        self._k_remaining = self._k_remaining - viaja.long()                     # rechazo y espera no consumen K
+        self._perdidas[filas, actions] += pierde.long()
+        self._n_rechazos = self._n_rechazos + pierde.long()
 
         # ── Tablero del nodo de llegada, o del día nuevo tras esperar (nueva visita) ──
-        llega = np.flatnonzero((viaja | espera) & ~cond_a)
-        if len(llega):
-            dia = self._start_day_idx[llega] + (self._time_elapsed[llega] // 14).astype(np.int64)
-            self._perdidas[llega] = 0
-            self._n_rechazos[llega] = 0
-            self._revelar_tablero(llega, np.minimum(dia, self._max_day))
+        llega = (viaja | espera) & ~cond_a
+        self._perdidas = torch.where(llega[:, None], torch.zeros_like(self._perdidas), self._perdidas)
+        self._n_rechazos = torch.where(llega, torch.zeros_like(self._n_rechazos), self._n_rechazos)
+        self._revelar_tablero(llega)
 
         self._active = act & ~cond_a
         next_masks = self._compute_masks()
-        cond_b = (next_masks.sum(axis=1) == 0) & self._active
-        if cond_b.any():                                         # se quedó sin jugadas en casa: el ciclo falla
-            rewards = np.where(cond_b, rewards + np.float32(TIME_VIOLATION_PENALTY), rewards).astype(np.float32)
-            self._last_time_violation = self._last_time_violation | cond_b
-        self._active &= ~cond_b
+        cond_b = ~next_masks.any(dim=1) & self._active          # se quedó sin jugadas en casa: el ciclo falla
+        rewards = torch.where(cond_b, rewards + TIME_VIOLATION_PENALTY, rewards)
+        self._last_time_violation = self._last_time_violation | cond_b
+        self._active = self._active & ~cond_b
         terminated = (act & cond_a) | cond_b
 
-        vacias = next_masks.sum(axis=1) == 0                     # filas inactivas: una opción ficticia válida
-        next_masks[vacias, 0] = 1
-        self._opciones[vacias, 0, OPCION_VACIO] = True
+        vacias = ~next_masks.any(dim=1)                          # filas inactivas: una opción ficticia válida
+        next_masks[:, 0] |= vacias
+        self._opciones[:, 0, OPCION_VACIO] |= vacias
         return rewards, terminated, next_masks
 
     # ─────────────────────────────────────────────────────────────────────────
     # Internos
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _revelar_tablero(self, rows: np.ndarray, arrival_day: np.ndarray) -> None:
-        """Tablero del nodo actual de `rows` al llegar (función pura de semilla, nodo y día)."""
-        nodes = self._current_node[rows]
-        seeds = self._world_seed[rows]
-        if self._market is not None:
-            t = self._market.tablero_por_mundo(nodes, arrival_day, seeds)
-        else:
-            t = self._mercado_replay.tablero_real(nodes, self._day_offset + arrival_day, seeds)
-        self._current_loads_row[rows] = t.loads
-        self._precios[rows] = t.precios
-        self._u_comp[rows] = t.u_comp
-        self._precio_comp[rows] = t.precio_competidor
-        self._m[rows] = t.m
-        # Lo observable de cada lane: el precio y el margen si se cobrara la mediana del mercado.
-        mediana = t.precios[..., _NIVEL_MEDIANA]
-        self._current_rate_row[rows] = mediana.astype(np.float32)
-        reward = lane_reward(mediana, t.loads, self._distance_arr[nodes], self._diesel_arr[nodes]).astype(np.float32)
-        reward[np.arange(len(rows)), nodes] = 0.0           # self-loop = esperar: margen 0
-        self._reward_row[rows] = reward
+    def _dia(self) -> torch.Tensor:
+        """(B,) día absoluto en que está cada episodio, recortado al último día con datos del mundo."""
+        avance = torch.div(self._time_elapsed, HORAS_DIA_MERCADO, rounding_mode="floor").long()
+        return (self._mundos.dia0 + avance).clamp(max=self._mundos.dia_max)
 
-    def _puede_cotizar(self) -> np.ndarray:
-        """(B, N) a la lane le queda alguna carga sin perder y quedan cotizaciones en la visita."""
-        return self.intentos > 0
+    def _revelar_tablero(self, filas: torch.Tensor) -> None:
+        """Tablero del nodo actual en las filas `filas` (B,) bool: la fila del mundo de ese día y nodo."""
+        tab, mun, b, i = self._tab, self._mundos, self._filas, self._current_node
+        dia = self._dia()
+        slot = dia - mun.dia0
+        loads = mun.loads[b, slot, i]                                            # (B, N)
+        u = mun.u[b, slot, i].double()                                           # (B, N, C)
+        escala = self._escala[:, None, None]
+        precios = tab["precios"][dia, i] * escala                                # (B, N, K)
+        m = tab["m"][dia, i]                                                     # (B,)
+        u_comp = percentil_competidor_t(u, m[:, None, None])
+        cuant = tab["cuant"][dia, i]                                             # (B, N, 6)
+        precio_comp = interp_cuantiles_t(u_comp, cuant[:, :, None, :].expand(*u_comp.shape, 6)) * escala
+        mediana = precios[..., _NIVEL_MEDIANA]
+        reward = lane_reward_t(mediana, loads, self.dist[i], self.diesel[i]).float()
+        reward[b, i] = 0.0                                                       # self-loop = esperar: margen 0
+        f1, f2, f3 = filas[:, None], filas[:, None, None], filas
+        self._current_loads_row = torch.where(f1, loads, self._current_loads_row)
+        self._precios = torch.where(f2, precios, self._precios)
+        self._u_comp = torch.where(f2, u_comp, self._u_comp)
+        self._precio_comp = torch.where(f2, precio_comp, self._precio_comp)
+        self._m = torch.where(f3, m, self._m)
+        self._current_rate_row = torch.where(f1, mediana.float(), self._current_rate_row)
+        self._reward_row = torch.where(f1, reward, self._reward_row)
 
-    def _compute_masks(self) -> np.ndarray:
-        """Máscara de destinos (B, N) int8; deja en self._opciones (B, N, K+1) las opciones válidas.
+    def _compute_masks(self) -> torch.Tensor:
+        """Máscara de destinos (B, N) bool; deja en self._opciones (B, N, K+1) las opciones válidas.
 
         Por destino j desde el nodo actual i (ver el docstring del módulo):
-          · niveles: j ≠ i y la lane se puede cotizar (`_puede_cotizar`);
+          · niveles: j ≠ i y a la lane le queda alguna carga cotizable (`intentos` > 0);
           · VACÍO a j ≠ i: reposicionamiento (≤ REPOSICION_MAX_MILLAS) o, desde un intermedio, volver a casa;
           · VACÍO en j = i: esperar al siguiente día de mercado.
         Factibilidad de tiempo: después del movimiento (o de la espera) hay que poder volver a casa dentro de
         max_duration; en casa, antes de salir, la espera deja tiempo para la ida y vuelta más corta.
         Con k_remaining == 1 solo quedan casa y esperar.
         """
-        B, N, K = self._B, self.num_nodes, N_NIVELES
-        filas = np.arange(B)
-        i, h, t = self._current_node, self._start_node, self._time_elapsed.astype(np.float64)
-        jj = np.arange(N)[None, :]
+        K = N_NIVELES
+        i, h, t = self._current_node, self._start_node, self._time_elapsed.double()
+        jj = self._jj[None, :]
         es_i, es_h = jj == i[:, None], jj == h[:, None]
         en_casa = i == h                                                           # (B,) aún no sale
-        T = self._time_matrix_arr
+        T = self.T
+        MAX = self.max_duration
 
         # Tiempo: llegar a j y volver a casa (casa misma: solo llegar).
-        t_vuelta = np.where(es_h, 0.0, T[:, h].T)                                  # (B, N) T[j, h]
+        t_vuelta = torch.where(es_h, torch.zeros_like(T[0]), T[:, h].T)            # (B, N) T[j, h]
         # Volver a casa desde un intermedio vale siempre: si ya no alcanza, el paso termina con la penalización.
-        a_tiempo = ((t[:, None] + T[i, :] + t_vuelta) <= self.max_duration) | (es_h & ~en_casa[:, None])
+        a_tiempo = ((t[:, None] + T[i, :] + t_vuelta) <= MAX) | (es_h & ~en_casa[:, None])
         t_desp = fin_espera(t)                                                     # (B,) fin de la espera
-        espera_ok = np.where(en_casa, t_desp + self._t_vuelta_min[h], t_desp + T[i, h]) <= self.max_duration
+        espera_ok = torch.where(en_casa, t_desp + self._t_vuelta_min[h], t_desp + T[i, h]) <= MAX
 
         # Lejos de casa, cotizar exige que, si se pierde (COTIZACION_HORAS), todavía se pueda volver a casa.
-        pierde_ok = en_casa | (t + COTIZACION_HORAS + T[i, h] <= self.max_duration)
-        cotizable = self._puede_cotizar() & ~es_i & a_tiempo & pierde_ok[:, None]
+        pierde_ok = en_casa | (t + COTIZACION_HORAS + T[i, h] <= MAX)
+        cotizable = (self.intentos > 0) & ~es_i & a_tiempo & pierde_ok[:, None]
         vacio = (self._reposicion[i] | (es_h & ~en_casa[:, None])) & a_tiempo & ~es_i
-        if self._k_restricted.any():                                               # K: con un arco, solo casa
-            solo_casa = (self._k_restricted & (self._k_remaining == 1))[:, None] & ~es_h
-            cotizable &= ~solo_casa
-            vacio &= ~solo_casa
-        vacio |= es_i & espera_ok[:, None]
+        solo_casa = (self._k_restricted & (self._k_remaining == 1))[:, None] & ~es_h     # K: con un arco, solo casa
+        cotizable = cotizable & ~solo_casa
+        vacio = (vacio & ~solo_casa) | (es_i & espera_ok[:, None])
 
-        op = np.zeros((B, N, K + 1), dtype=bool)
-        op[:, :, :K] = cotizable[:, :, None]
-        op[:, :, K] = vacio
-        op &= self._active[:, None, None]
+        op = torch.cat([cotizable[:, :, None].expand(-1, -1, K), vacio[:, :, None]], dim=-1)
+        op = op & self._active[:, None, None]
         self._opciones = op
-        return op.any(axis=-1).astype(np.int8)
+        return op.any(dim=-1)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Propiedades de solo lectura
+    # Propiedades de solo lectura (tensores en el dispositivo)
     # ─────────────────────────────────────────────────────────────────────────
 
     @property
-    def start_node(self) -> np.ndarray:
+    def B(self) -> int:
+        return self._B
+
+    @property
+    def start_node(self) -> torch.Tensor:
         return self._start_node
 
     @property
-    def current_node(self) -> np.ndarray:
+    def current_node(self) -> torch.Tensor:
         return self._current_node
 
     @property
-    def time_elapsed(self) -> np.ndarray:
+    def time_elapsed(self) -> torch.Tensor:
         return self._time_elapsed
 
     @property
-    def step_count(self) -> np.ndarray:
+    def step_count(self) -> torch.Tensor:
         """(B,) arcos recorridos (un rechazo no cuenta)."""
         return self._step_count
 
     @property
     def max_steps(self) -> int:
         """Cota del número de pasos de un episodio, rechazos incluidos (max_pasos_cotizacion)."""
-        return max_pasos_cotizacion(self._time_matrix_arr, self.max_duration)
+        return self._max_steps
 
     @property
-    def current_day_idx(self) -> np.ndarray:
-        return np.minimum(self._start_day_idx + (self._time_elapsed // 14).astype(np.int64), self._max_day)
+    def current_day(self) -> torch.Tensor:
+        """(B,) día absoluto en que está cada episodio (recortado al último día con datos del mundo)."""
+        return self._dia()
 
     @property
-    def current_dow(self) -> np.ndarray:
-        """(B,) día de la semana (lunes = 0) del día en que está cada episodio
-        (day_offset + start_day_idx + int(time_elapsed // 14), sin recortar)."""
-        dias = self._day_offset + self._start_day_idx + (self._time_elapsed // 14).astype(np.int64)
-        return dia_de_semana(dias)
+    def current_dow(self) -> torch.Tensor:
+        """(B,) día de la semana (lunes = 0) del día en que está cada episodio, sin recortar."""
+        avance = torch.div(self._time_elapsed, HORAS_DIA_MERCADO, rounding_mode="floor").long()
+        return (self._tab["dow"][self._mundos.dia0] + avance) % 7
 
     @property
-    def start_dow(self) -> np.ndarray:
+    def start_dow(self) -> torch.Tensor:
         """(B,) día de la semana (lunes = 0) del día de salida de cada episodio."""
-        return dia_de_semana(self._day_offset + self._start_day_idx)
+        return self._tab["dow"][self._mundos.dia0]
 
     @property
-    def reward_rows(self) -> np.ndarray:
+    def reward_rows(self) -> torch.Tensor:
         """(B, N) float32 — margen de las lanes salientes si se cobrara la mediana del mercado
         (f0 de las features del agente; el ingreso real depende de la cotización)."""
         return self._reward_row
 
     @property
-    def world_seed(self) -> np.ndarray:
-        """(B,) semillas de los episodios."""
-        return self._world_seed
+    def mundos(self):
+        return self._mundos
 
     @property
-    def current_loads_row(self) -> np.ndarray:
+    def current_loads_row(self) -> torch.Tensor:
         """(B, N) cargas del tablero del nodo actual."""
         return self._current_loads_row
 
     @property
-    def rate_row_obs(self) -> np.ndarray:
+    def rate_row_obs(self) -> torch.Tensor:
         """(B, N) precio en la mediana del mercado de cada lane saliente (USD/milla)."""
         return self._current_rate_row
 
     @property
     def index_std(self) -> float:
         """Desviación del índice histórico (normaliza la feature de índice del agente)."""
-        return float(self._indice_std)
+        return self._indice_std
 
     @property
-    def market_index(self) -> np.ndarray:
-        """(B, N) índice de mercado de todos los nodos en el día actual de cada episodio (ver docstring)."""
-        if self._market is not None:
-            return self._market.indice_mundo_lote(self._world_seed, self.current_day_idx)
-        return np.asarray(self._indice_stack, dtype=np.float64)[self.current_day_idx]
+    def market_index(self) -> torch.Tensor:
+        """(B, N) índice de mercado observado de todos los nodos el día en que está cada episodio."""
+        return self._tab["indice"][self._dia()]
 
     @property
-    def k_remaining(self) -> np.ndarray:
+    def ltr_actual(self) -> torch.Tensor:
+        """(B,) load-to-truck ratio del hub actual el día en que está cada episodio."""
+        return self._tab["ltr"][self._dia(), self._current_node]
+
+    @property
+    def k_remaining(self) -> torch.Tensor:
         return self._k_remaining
 
     @property
-    def k_restricted(self) -> np.ndarray:
+    def k_restricted(self) -> torch.Tensor:
         return self._k_restricted
 
     @property
-    def last_raw_reward(self) -> np.ndarray:
+    def last_raw_reward(self) -> torch.Tensor:
         """(B,) float32 — reward de la lane del último step() en USD, sin REWARD_SCALE_FACTOR ni bonos ni
         penalizaciones (0 en un rechazo y en filas inactivas). Es la unidad en que se reporta el margen."""
         return self._last_raw_reward
 
     @property
-    def last_time_violation(self) -> np.ndarray:
-        """(B,) bool — el step() actual terminó por pasarse de max_duration."""
+    def last_time_violation(self) -> torch.Tensor:
+        """(B,) bool — el step() actual terminó por pasarse de max_duration o por quedarse sin jugadas."""
         return self._last_time_violation
 
     @property
-    def opciones_validas(self) -> np.ndarray:
+    def opciones_validas(self) -> torch.Tensor:
         """(B, N, K+1) bool — opciones válidas por destino: niveles 0 … K−1 y VACÍO (índice OPCION_VACIO)."""
         return self._opciones
 
     @property
-    def precios_row(self) -> np.ndarray:
+    def precios_row(self) -> torch.Tensor:
         """(B, N, K) USD/milla de cada nivel en las lanes salientes del nodo actual."""
         return self._precios
 
     @property
-    def dist_rows(self) -> np.ndarray:
+    def dist_rows(self) -> torch.Tensor:
         """(B, N) distancia de las lanes salientes del nodo actual."""
-        return self._distance_arr[self._current_node]
+        return self.dist[self._current_node]
 
     @property
-    def cost_rows(self) -> np.ndarray:
+    def cost_rows(self) -> torch.Tensor:
         """(B, N) costo USD de las lanes salientes del nodo actual (misma fórmula que lane_reward)."""
-        return lane_cost_row(self._distance_arr[self._current_node], self._diesel_arr[self._current_node])
+        return self.costo[self._current_node]
 
     @property
-    def competencia(self) -> np.ndarray:
+    def competencia(self) -> torch.Tensor:
         """(B,) competidores efectivos m del nodo actual (LTR del día de llegada)."""
         return self._m
 
     @property
-    def perdidas(self) -> np.ndarray:
-        """(B, N) int64 — cargas perdidas por lane en la visita actual al nodo."""
+    def perdidas(self) -> torch.Tensor:
+        """(B, N) cargas perdidas por lane en la visita actual al nodo."""
         return self._perdidas
 
     @property
-    def intentos(self) -> np.ndarray:
-        """(B, N) int64 — cuántas cargas de cada lane se pueden cotizar todavía en esta visita:
+    def intentos(self) -> torch.Tensor:
+        """(B, N) cuántas cargas de cada lane se pueden cotizar todavía en esta visita:
         min(cargas − perdidas, COTIZACIONES_MAX_POR_NODO − rechazos)."""
-        return np.minimum(self._current_loads_row - self._perdidas,
-                          (COTIZACIONES_MAX_POR_NODO - self._n_rechazos)[:, None])
+        return torch.minimum(self._current_loads_row.long() - self._perdidas,
+                             (COTIZACIONES_MAX_POR_NODO - self._n_rechazos)[:, None])
 
     @property
-    def n_rechazos(self) -> np.ndarray:
+    def n_rechazos(self) -> torch.Tensor:
         """(B,) rechazos en la visita actual al nodo."""
         return self._n_rechazos
 
     @property
-    def u_comp_row(self) -> np.ndarray:
+    def u_comp_row(self) -> torch.Tensor:
         """(B, N) percentil del competidor de la carga que se cotizaría ahora en cada lane. Solo para la cota con
         información perfecta y los tests: ninguna política lo puede leer."""
-        c = np.minimum(self._perdidas, COTIZACIONES_MAX_POR_NODO - 1)
-        return np.take_along_axis(self._u_comp, c[..., None], axis=-1)[..., 0]
+        c = self._perdidas.clamp(max=COTIZACIONES_MAX_POR_NODO - 1)
+        return torch.gather(self._u_comp, -1, c[..., None])[..., 0]
 
     @property
-    def u_comp_cargas(self) -> np.ndarray:
+    def u_comp_cargas(self) -> torch.Tensor:
         """(B, N, C) percentil del competidor de cada carga (idem: solo cota y tests)."""
         return self._u_comp
 
     @property
-    def active(self) -> np.ndarray:
+    def active(self) -> torch.Tensor:
         """(B,) bool — episodios aún en curso (tras reset(), False en las filas que no tienen ninguna jugada)."""
         return self._active
 
     @property
-    def sin_salida(self) -> np.ndarray:
+    def sin_salida(self) -> torch.Tensor:
         """(B,) bool — el ciclo terminó en casa sin salir (ninguna jugada posible): margen 0, no es violación."""
         return self._sin_salida
 
     @property
-    def last_espero(self) -> np.ndarray:
+    def last_espero(self) -> torch.Tensor:
         """(B,) bool — el último step() fue una espera (self-loop VACÍO)."""
         return self._last_espero
 
     @property
-    def last_cotizo(self) -> np.ndarray:
+    def last_cotizo(self) -> torch.Tensor:
         """(B,) bool — el último step() fue una cotización (nivel, no VACÍO)."""
         return self._last_cotizo
 
     @property
-    def last_gano(self) -> np.ndarray:
+    def last_gano(self) -> torch.Tensor:
         """(B,) bool — el último step() cotizó y ganó la carga."""
         return self._last_gano
 
     @property
-    def last_precio(self) -> np.ndarray:
+    def last_precio(self) -> torch.Tensor:
         """(B,) USD/milla cobrado en el último step() (NaN si no se ganó una carga)."""
         return self._last_precio
 
     @property
-    def last_precio_competidor(self) -> np.ndarray:
+    def last_precio_competidor(self) -> torch.Tensor:
         """(B,) USD/milla del mejor competidor en la lane cotizada en el último step() (NaN si no cotizó)."""
         return self._last_precio_comp

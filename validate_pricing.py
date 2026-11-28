@@ -3,7 +3,7 @@ validate_pricing.py
 ===================
 Validación de la decisión de precio del DRL ya entrenado (especificacion_fase0_ruteo_pricing.md §8).
 Corre en mundos simulados con su propia semilla (PRICING_VAL_SEED, distinta de entrenamiento y de evaluación)
-y con el mismo arnés de evaluation.py (`ejecutar_politica`), así que el margen es el mismo de la evaluación.
+y con el mismo arnés de evaluation.py (`ejecutar_lote`, en la GPU), así que el margen es el mismo de la evaluación.
 
   (a) Nivel cotizado por el DRL según el estado. En cada cotización se registra el nivel elegido, el LTR del
       nodo de origen (y los competidores efectivos m), el momento del ciclo (fracción de tiempo restante y
@@ -51,12 +51,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from config import (
-    TRAIN_DAYS, MAX_DURATION, PRICING_VAL_SEED, MARKET_M_EVAL_WORLDS, COMPETENCIA_KAPPA,
+    TRAIN_DAYS, MAX_DURATION, PRICING_VAL_SEED, MARKET_M_EVAL_WORLDS, MARKET_SEED_EVAL, COMPETENCIA_KAPPA,
     AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF,
 )
 import evaluation as ev
+from pricing import N_NIVELES, U_NIVELES_ARR
 from market_process import MarketProcess, asegurar_parametros
-from pricing import N_NIVELES, U_NIVELES_ARR, gana
 from problem_data import load_matrices
 from baselines.dp_relajada import cargar_o_calcular_tabla
 from transfer_learning import load_checkpoint_compatible
@@ -66,84 +66,40 @@ K_LEVELS = (None,)            # la tesis reporta solo K libre
 N_QUINTILES = 5
 
 
-class _Registro:
-    """Envuelve una política del arnés y anota el estado de cada cotización (no cambia sus decisiones)."""
-
-    def __init__(self, politica, env, market, mundo, K, modo="simulado", metodo="DRL"):
-        self.p, self.env, self.market = politica, env, market
-        self.mundo, self.K = mundo, K
-        self.modo, self.metodo = modo, metodo
-        self.filas = []
-        self.nombre = getattr(politica, "nombre", "politica")
-
-    def actuar(self, obs) -> int:
-        return self.p.actuar(obs)
-
-    def cotizar(self, obs, j) -> int:
-        o = self.p.cotizar(obs, j)
-        if o < N_NIVELES:
-            env, i = self.env, obs.nodo
-            dia = int(env.current_day_idx[0])
-            ind = env.market_index[0]
-            self.filas.append(dict(
-                modo=self.modo, metodo=self.metodo, dia_abs=dia,
-                mundo=self.mundo, K=ev._etiqueta_k(self.K), nodo=i, destino=int(j), nivel=int(o),
-                u=float(U_NIVELES_ARR[o]), ltr=float(self.market.ltr_hub[dia, i]), m=float(obs.m),
-                frac_tiempo_restante=max(0.0, 1.0 - obs.tiempo / MAX_DURATION),
-                k_restante=obs.k_restante if obs.k_restante is not None else np.nan,
-                indice_origen=float(ind[i]), indice_destino=float(ind[j]),
-                rechazos_previos=int(obs.n_rechazos),
-                gano=bool(gana(U_NIVELES_ARR[o], env.u_comp_row[0, j])),
-            ))
-        return o
+def _cotizaciones(res: list, casos, modo: str, metodo: str) -> list:
+    """Una fila por cotización (nivel elegido y estado del mercado en la decisión) de los resultados del lote `res`."""
+    filas = []
+    for n, K in enumerate(casos.k_levels):
+        for m in range(casos.M):
+            for p in res[n * casos.M + m]["pasos"]:
+                if not p["accion"].startswith("cotiza"):
+                    continue
+                filas.append(dict(
+                    modo=modo, metodo=metodo, dia_abs=p["dia_abs"], mundo=m, K=ev._etiqueta_k(K), nodo=p["desde"],
+                    destino=p["hacia"], nivel=p["nivel"], u=p["u"], ltr=p["ltr"], m=p["m"],
+                    frac_tiempo_restante=max(0.0, 1.0 - p["horas_transcurridas"] / MAX_DURATION),
+                    k_restante=p["k_restante"] if p["k_restante"] is not None else np.nan,
+                    indice_origen=p["indice_origen"], indice_destino=p["indice_destino"],
+                    rechazos_previos=p["rechazos_previos"], gano=p["accion"] == "cotiza y gana",
+                ))
+    return filas
 
 
-def _politicas(ctx, env) -> dict:
-    """Las del DRL (comparación B) y, si la tabla de B3 existe, "DRL-dest+dp" (su destino con el precio de la tabla)."""
-    pols = ctx.politicas_drl(env)
-    dp = ctx.politica_dp(env)
-    if dp is not None:
-        pols["DRL-dest+dp"] = dp
-    return pols
-
-
-def _correr(ctx, env, dis, k_levels, metodos, registrar=False, registrar_metodos=("DRL",)):
-    """Margen por (K, mundo, método) y, si `registrar`, las cotizaciones de `registrar_metodos`."""
-    pols = _politicas(ctx, env)
+def _correr(ctx, casos, metodos, modo="simulado", registrar_metodos=()) -> tuple:
+    """Margen por (K, mundo, método) y las cotizaciones de `registrar_metodos`, con el arnés de la evaluación."""
     filas, cot = [], []
-    for K in k_levels:
-        for m in range(len(dis["nodo"])):
-            h, dow = int(dis["nodo"][m]), int(dis["dow"][m])
-            for nombre in metodos:
-                pol = pols[nombre]
-                if registrar and nombre in registrar_metodos:
-                    pol = _Registro(pol, env, ctx.market, m, K, "simulado", nombre)
-                r = ev.ejecutar_politica(pol, env, h, int(dis["start_day"][m]), K, int(dis["world_seed"][m]),
-                                         ctx.dist, ctx.diesel, dow)
-                filas.append(dict(modo="simulado", K=ev._etiqueta_k(K), mundo=m, metodo=nombre,
+    for nombre in metodos:
+        res = ev.ejecutar_lote(ctx.politica(nombre), ctx.env, casos.lote_mundos, casos.lote_nodos, casos.lote_k, ctx.dist)
+        for n, K in enumerate(casos.k_levels):
+            for m in range(casos.M):
+                r = res[n * casos.M + m]
+                filas.append(dict(modo=modo, K=ev._etiqueta_k(K), mundo=m, dia_abs=int(casos.dia0[m]), metodo=nombre,
                                   margen=r["margen"], violacion=r["violacion"], n_cotizaciones=r["n_cotizaciones"],
                                   n_ganadas=r["n_ganadas"], nivel_medio=np.mean(r["niveles"]) if r["niveles"]
                                   else np.nan, horas_rechazo=r["horas_rechazo"]))
-                if isinstance(pol, _Registro):
-                    cot.extend(pol.filas)
+        if nombre in registrar_metodos:
+            cot.extend(_cotizaciones(res, casos, modo, nombre))
     return pd.DataFrame(filas), pd.DataFrame(cot)
-
-
-def _correr_replay(ctx, env, nodos, dias, semillas, k_levels, metodos, market):
-    """(cotizaciones, márgenes) de `metodos` en el replay de los días reales de prueba (los mismos casos de la evaluación)."""
-    pols = _politicas(ctx, env)
-    cot, marg = [], []
-    for K in k_levels:
-        for c, (nodo, dia, ws) in enumerate(zip(nodos, dias, semillas)):
-            nodo, dia, ws = int(nodo), int(dia), int(ws)
-            dow = int(market.dia_semana(TRAIN_DAYS + dia))
-            for nombre in metodos:
-                pol = _Registro(pols[nombre], env, market, c, K, "replay", nombre)
-                r = ev.ejecutar_politica(pol, env, nodo, dia, K, ws, ctx.dist, ctx.diesel, dow)
-                cot.extend(pol.filas)
-                marg.append(dict(modo="replay", K=ev._etiqueta_k(K), mundo=c, dia_abs=TRAIN_DAYS + dia, metodo=nombre,
-                                 margen=r["margen"]))
-    return pd.DataFrame(cot), pd.DataFrame(marg)
 
 
 _COMPARACIONES_PRECIO = (("DRL", "DRL-dest+miope"), ("DRL-dest+dp", "DRL"), ("DRL-dest+dp", "DRL-dest+miope"))
@@ -240,22 +196,23 @@ def _figuras(cot, por_q, fig_dir):
     plt.close(fig)
 
 
-def validar_pricing(agent, n, tm, rate, loads, dist, diesel, ltr, avail, p95, market, out,
+def validar_pricing(agent, n, tm, dist, diesel, avail, p95, market, out,
                     M=MARKET_M_EVAL_WORLDS, quick=False, tabla=None) -> dict:
-    """Corre (a) y (b) con `agent` y escribe <out>/pricing_val/{tables,figures}. Devuelve las tablas."""
+    """Corre (a) a (d) con `agent` y escribe <out>/pricing_val/{tables,figures}. Devuelve las tablas."""
     tab_dir, fig_dir = (os.path.join(out, "pricing_val", d) for d in ("tables", "figures"))
     os.makedirs(tab_dir, exist_ok=True)
     os.makedirs(fig_dir, exist_ok=True)
     dis = ev.disenar_mundos(n, M, market, semilla=PRICING_VAL_SEED)
+    # Los mundos se sortean una vez: el competidor de cada carga es el mismo uniforme con cualquier κ (solo cambia m).
+    mundos = ev.mundos_eval(market, dis["start_day"], TRAIN_DAYS - 1, PRICING_VAL_SEED)
+    casos = ev._Casos(dis["nodo"], dis["start_day"], dis["dow"], dis["start_day"], mundos, K_LEVELS)
     print(f"\n--- Validación del precio ({n} nodos, {M} mundos, semilla PRICING_VAL_SEED) ---")
 
     def contexto():
-        c = ev.ContextoEval(agent, market, tabla, tm, dist, diesel, n, ltr, avail, p95)
-        e = ev.make_sim_env(tm, rate[:TRAIN_DAYS], loads[:TRAIN_DAYS], dist, diesel, n, market)
-        return c, e
+        return ev.ContextoEval(agent, market, tabla, tm, dist, diesel, n, avail, p95)
 
-    # (b) sensibilidad a κ, mismos mundos (el contexto se rehace porque las features usan m). Con el κ del
-    # entrenamiento se registran además las cotizaciones del DRL para (a).
+    # (b) sensibilidad a κ, mismos mundos (el contexto se rehace porque el entorno lee m con el κ del mercado). Con el
+    # κ del entrenamiento se registran además las cotizaciones para (a).
     base = ("DRL", "DRL-dest+miope")
     todos = base + (("DRL-dest+dp",) if tabla is not None else ())   # dp: solo si la tabla de B3 existe
     if tabla is None:
@@ -264,11 +221,10 @@ def validar_pricing(agent, n, tm, rate, loads, dist, diesel, ltr, avail, p95, ma
     try:
         for kappa in KAPPAS:
             market.kappa = kappa
-            c, e = contexto()
             # dp solo con el κ de entrenamiento: la tabla de B3 se calculó con ese mercado
             metodos = todos if kappa == COMPETENCIA_KAPPA else base
-            d, registro = _correr(c, e, dis, K_LEVELS, metodos,
-                                  registrar=(kappa == COMPETENCIA_KAPPA), registrar_metodos=metodos)
+            d, registro = _correr(contexto(), casos, metodos,
+                                  registrar_metodos=metodos if kappa == COMPETENCIA_KAPPA else ())
             if kappa == COMPETENCIA_KAPPA:
                 cot, marg_sim = registro, d
             r = resumen_por_metodo(d[d["metodo"].isin(base)])
@@ -278,26 +234,24 @@ def validar_pricing(agent, n, tm, rate, loads, dist, diesel, ltr, avail, p95, ma
         market.kappa = COMPETENCIA_KAPPA
     sens = pd.concat(sens, ignore_index=True)
     if cot is None:                       # COMPETENCIA_KAPPA fuera de KAPPAS: una corrida más para (a)
-        c, e = contexto()
-        marg_sim, cot = _correr(c, e, dis, K_LEVELS, todos, registrar=True, registrar_metodos=todos)
+        marg_sim, cot = _correr(contexto(), casos, todos, registrar_metodos=todos)
 
     # (a) nivel cotizado por el DRL según el estado (mundos simulados)
     cot_sim = cot[cot["metodo"] == "DRL"]
     por_q, rho = niveles_por_estado(cot_sim)
 
-    # (c) lo mismo en el replay de los días reales de prueba, con los casos de la evaluación
-    rate_ev, loads_ev = rate[TRAIN_DAYS:], loads[TRAIN_DAYS:]
-    cot_rep = pd.DataFrame()
-    if rate_ev.shape[0] > 0:
-        c_rep = ev.ContextoEval(agent, market, tabla, tm, dist, diesel, n, ltr[:, TRAIN_DAYS:], avail, p95)
-        e_rep = ev.make_replay_env(tm, rate_ev, loads_ev, dist, diesel, n, day_offset=TRAIN_DAYS, market=market)
-        nodos, dias, semillas = ev.casos_replay(n, rate_ev.shape[0])
-        if quick:
-            idx = np.linspace(0, len(nodos) - 1, 28).astype(int)       # repartido: los casos vienen ordenados por nodo
-            nodos, dias, semillas = nodos[idx], dias[idx], semillas[idx]
-        cot_rep, marg_rep = _correr_replay(c_rep, e_rep, nodos, dias, semillas, K_LEVELS, todos, market)
-    else:
-        marg_rep = pd.DataFrame()
+    # (c) lo mismo en el replay de los días reales de prueba, con los casos (y competidores) de la evaluación
+    D = market.num_dias_total - TRAIN_DAYS
+    cot_rep, marg_rep = pd.DataFrame(), pd.DataFrame()
+    if D > 0:
+        nodos, dias = ev.casos_replay(n, D)
+        dia0 = TRAIN_DAYS + dias
+        mundos_rep = ev.mundos_eval(market, dia0, market.num_dias_total - 1, MARKET_SEED_EVAL + 1, replay=True)
+        idx = (np.linspace(0, len(nodos) - 1, 28).astype(int) if quick     # repartido: los casos vienen ordenados por nodo
+               else np.arange(len(nodos)))
+        casos_rep = ev._Casos(nodos[idx], dia0[idx], market.dia_semana(dia0[idx]), dia0[idx],
+                              mundos_rep.tomar(idx), K_LEVELS)
+        marg_rep, cot_rep = _correr(contexto(), casos_rep, todos, modo="replay", registrar_metodos=todos)
     cot_todo = pd.concat([cot, cot_rep], ignore_index=True)
     reg = regimen_sim_vs_replay(cot_todo)
     if len(cot_rep):
@@ -340,7 +294,7 @@ def main():
     out = args.output_dir or os.path.join(cwd, "results", f"{n}nodes")
 
     asegurar_parametros()
-    tm, rate, loads, dist, diesel, ltr, avail, p95 = load_matrices(n)
+    tm, _, _, dist, diesel, _, avail, p95 = load_matrices(n)
     market = MarketProcess(n)
     agent, _ = load_checkpoint_compatible(ckpt, n, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, verbose=False)
     agent.eval()
@@ -348,7 +302,7 @@ def main():
     # K libre (K = 0), como main.py con K_RESTRINGIDO = False: la firma del caché de la tabla incluye K, y con otro K se
     # recalcularía y se sobrescribiría la tabla que usa main.py.
     tabla = cargar_o_calcular_tabla(market, tm, dist, diesel, K=0)           # None si UB-DP no es tratable a este tamaño
-    validar_pricing(agent, n, tm, rate, loads, dist, diesel, ltr, avail, p95, market, out, tabla=tabla,
+    validar_pricing(agent, n, tm, dist, diesel, avail, p95, market, out, tabla=tabla,
                     M=28 if args.quick else MARKET_M_EVAL_WORLDS, quick=args.quick)
 
 

@@ -19,14 +19,11 @@ import argparse
 import os
 import time
 
-import numpy as np
+import torch  # noqa: F401  (antes que pandas: en Windows, pandas primero rompe la carga de las DLL de torch)
 import pandas as pd
 
 from config import MARKET_SEED_EVAL, MARKET_M_EVAL_WORLDS, TRAIN_DAYS, REPLAY_MAX_CASOS
-from baselines.politicas import PoliticaB2, PoliticaB2P
-from evaluation import (
-    disenar_mundos, ejecutar_politica, make_replay_env, make_sim_env, casos_replay, _UnHilo,
-)
+from evaluation import ContextoEval, _Casos, casos_replay, disenar_mundos, ejecutar_lote, mundos_eval
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
 from stats_analysis import ic_bootstrap_media
@@ -34,51 +31,40 @@ from stats_analysis import ic_bootstrap_media
 _CWD = os.path.dirname(os.path.abspath(__file__))
 
 
-def _correr(politicas, caso, verbose_cada, etiqueta) -> pd.DataFrame:
+def _correr(ctx, casos, etiqueta) -> pd.DataFrame:
+    """B2 y B2P sobre todos los casos a la vez (arnés en lote de la evaluación, K libre)."""
     filas = []
-    t0 = time.time()
-    for c, args in enumerate(caso):
-        for nombre, pol in politicas.items():
-            m = args(pol)
+    for nombre in ("B2", "B2P"):
+        t0 = time.time()
+        res = ejecutar_lote(ctx.politica(nombre), ctx.env, casos.lote_mundos, casos.lote_nodos, casos.lote_k, ctx.dist)
+        for c, m in enumerate(res):
             filas.append(dict(caso=c, metodo=nombre, margen=m["margen"], violacion=m["violacion"],
                               ms_decision=m["ms_decision"], ruta="-".join(map(str, m["ruta"]))))
-        if (c + 1) % verbose_cada == 0:
-            print(f"  {etiqueta}: {c + 1}/{len(caso)}  ({time.time() - t0:.0f} s)", flush=True)
+        print(f"  {etiqueta}: {nombre} en {time.time() - t0:.0f} s", flush=True)
     return pd.DataFrame(filas)
 
 
-def evaluar_simulado(N: int, M: int) -> pd.DataFrame:
+def _contexto(N):
     market = MarketProcess(N)
-    tm, rate, loads, dist, diesel, *_ = load_matrices(N)
-    T = np.asarray(tm, float)
-    politicas = {"B2": PoliticaB2(market, T, dist, diesel), "B2P": PoliticaB2P(market, T, dist, diesel)}
-    env = make_sim_env(tm, rate[:TRAIN_DAYS], loads[:TRAIN_DAYS], dist, diesel, N, market)
+    tm, _, _, dist, diesel, _, avail, p95 = load_matrices(N)
+    return ContextoEval(None, market, None, tm, dist, diesel, N, avail, p95), market
+
+
+def evaluar_simulado(N: int, M: int) -> pd.DataFrame:
+    ctx, market = _contexto(N)
     dis = disenar_mundos(N, M, market, num_dias=TRAIN_DAYS, semilla=MARKET_SEED_EVAL)
-    casos = [
-        (lambda pol, m=m: ejecutar_politica(
-            pol, env, int(dis["nodo"][m]), int(dis["start_day"][m]), None, int(dis["world_seed"][m]),
-            dist, diesel, int(dis["dow"][m])))
-        for m in range(M)
-    ]
-    with _UnHilo():
-        return _correr(politicas, casos, 100, f"N={N} simulado")
+    mundos = mundos_eval(market, dis["start_day"], TRAIN_DAYS - 1, MARKET_SEED_EVAL)
+    casos = _Casos(dis["nodo"], dis["start_day"], dis["dow"], dis["start_day"], mundos, (None,))
+    return _correr(ctx, casos, f"N={N} simulado")
 
 
 def evaluar_replay(N: int) -> pd.DataFrame:
-    market = MarketProcess(N)
-    tm, rate, loads, dist, diesel, *_ = load_matrices(N)
-    T = np.asarray(tm, float)
-    politicas = {"B2": PoliticaB2(market, T, dist, diesel), "B2P": PoliticaB2P(market, T, dist, diesel)}
-    rate_e, loads_e = rate[TRAIN_DAYS:], loads[TRAIN_DAYS:]
-    env = make_replay_env(tm, rate_e, loads_e, dist, diesel, N, day_offset=TRAIN_DAYS, market=market)
-    nodos, dias, semillas = casos_replay(N, rate_e.shape[0], REPLAY_MAX_CASOS)
-    casos = [
-        (lambda pol, n=int(n), d=int(d), ws=int(ws): ejecutar_politica(
-            pol, env, n, d, None, ws, dist, diesel, int(market.dia_semana(TRAIN_DAYS + d))))
-        for n, d, ws in zip(nodos, dias, semillas)
-    ]
-    with _UnHilo():
-        return _correr(politicas, casos, 100, f"N={N} replay")
+    ctx, market = _contexto(N)
+    nodos, dias = casos_replay(N, market.num_dias_total - TRAIN_DAYS, REPLAY_MAX_CASOS)
+    dia0 = TRAIN_DAYS + dias
+    mundos = mundos_eval(market, dia0, market.num_dias_total - 1, MARKET_SEED_EVAL + 1, replay=True)
+    casos = _Casos(nodos, dia0, market.dia_semana(dia0), dia0, mundos, (None,))
+    return _correr(ctx, casos, f"N={N} replay")
 
 
 def resumir(df: pd.DataFrame, modo: str, N: int) -> dict:

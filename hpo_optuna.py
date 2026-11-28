@@ -11,9 +11,8 @@ main.py lo llama antes de entrenar (ver obtener_hiperparametros); también se pu
 
 Qué NO se tunea acá (deliberado)
 --------------------------------
-· El presupuesto de entrenamiento (episodes_per_node / n_updates) no es un
-  hiperparámetro de desempeño: más entrenamiento casi nunca empeora el resultado,
-  solo cuesta tiempo. Se fija por tamaño en config.get_episodes_per_node.
+· El presupuesto de entrenamiento (n_updates) no es un hiperparámetro de desempeño: más entrenamiento casi
+  nunca empeora el resultado, solo cuesta tiempo. Se fija por tamaño en config.get_n_updates.
 · Arquitectura (AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF): fuera de alcance.
 · PPO_GAMMA = 1.0 (horizonte finito de 2-5 pasos) y PPO_N_EPOCHS = 4 (Schulman et al. 2017).
 · USE_SELF_CRITICAL (bool): switch de ablación; se tunea solo su coeficiente.
@@ -73,7 +72,7 @@ import torch
 
 import am_training
 import config
-from config import SEED, TRAIN_DAYS, set_seeds
+from config import SEED, set_seeds
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
 
@@ -91,7 +90,7 @@ HP_TUNEADOS = (
 _BASELINE = {
     name: getattr(am_training, name)
     for name in HP_TUNEADOS + (
-        "SELF_CRITICAL_WARMUP_UPDATES", "get_episodes_per_node", "PPO_N_EPISODES_PER_UPDATE", "SEED",
+        "SELF_CRITICAL_WARMUP_UPDATES", "get_n_updates", "PPO_N_EPISODES_PER_UPDATE", "SEED",
     )
 }
 _SEED_STEP_OFFSET = 100_000  # separa el espacio de `step` por semilla dentro de un mismo trial
@@ -149,14 +148,12 @@ def _sugerir(trial: optuna.Trial) -> dict:
 
 
 def make_objective(num_nodes: int, updates_per_trial: int, data: dict, seeds: list):
-    n_episodes_per_update = _BASELINE["PPO_N_EPISODES_PER_UPDATE"]
-    episodes_per_node_trial = int(np.ceil(updates_per_trial * n_episodes_per_update / num_nodes))
     warmup_trial = max(5, int(0.25 * updates_per_trial))
 
     def objective(trial: optuna.Trial) -> float:
         aplicar_hiperparametros(_sugerir(trial))
         am_training.SELF_CRITICAL_WARMUP_UPDATES = warmup_trial
-        am_training.get_episodes_per_node = lambda n: episodes_per_node_trial
+        am_training.get_n_updates = lambda n: updates_per_trial
 
         pruned = False
         seed_values = []
@@ -179,12 +176,9 @@ def make_objective(num_nodes: int, updates_per_trial: int, data: dict, seeds: li
                 am_training.SEED = seed
                 set_seeds(seed)
                 agent, critic, _, _, _ = am_training.run_am_training(
-                    data["time_matrix"], data["rate_train"], data["loads_train"],
-                    data["distance_arr"], data["diesel_arr"], num_nodes,
-                    ltr_stack=data["ltr_stack"],
+                    data["time_matrix"], data["distance_arr"], data["diesel_arr"], num_nodes, data["market_process"],
                     reward_global_p95=data["reward_global_p95"],
                     avail_expected_arr=data["avail_expected_arr"],
-                    market_process=data["market_process"],
                     est_lane=data["est_lane"],
                     trial_callback=_cb,
                 )
@@ -227,25 +221,21 @@ def run(num_nodes: int = HPO_NUM_NODES, n_trials: int = 50, updates_per_trial: i
     config.HP_OVERRIDES.clear()
 
     print(f"Cargando datos de {num_nodes} nodos...")
-    (time_matrix, rate_stack, loads_stack, distance_arr, diesel_arr,
-     ltr_stack, avail_expected_arr, reward_global_p95) = load_matrices(num_nodes)
+    time_matrix, _, _, distance_arr, diesel_arr, _, avail_expected_arr, reward_global_p95 = load_matrices(num_nodes)
     asegurar_parametros()
     market_process = MarketProcess(num_nodes)
     data = dict(
         time_matrix=time_matrix,
-        rate_train=rate_stack[:TRAIN_DAYS], loads_train=loads_stack[:TRAIN_DAYS],   # como main.py
         distance_arr=distance_arr, diesel_arr=diesel_arr,
-        ltr_stack=ltr_stack, avail_expected_arr=avail_expected_arr,
+        avail_expected_arr=avail_expected_arr,
         reward_global_p95=reward_global_p95,
         market_process=market_process,
         est_lane=market_process.estadisticas_dow(distance_arr, diesel_arr),
     )
 
-    n_episodes_per_update = _BASELINE["PPO_N_EPISODES_PER_UPDATE"]
-    episodes_per_node_trial = int(np.ceil(updates_per_trial * n_episodes_per_update / num_nodes))
     seeds = [SEED + i for i in range(n_seeds_per_trial)]
     print(f"Presupuesto por trial: {updates_per_trial} updates x {n_seeds_per_trial} semillas "
-          f"{seeds} ({episodes_per_node_trial * num_nodes} episodios/semilla)")
+          f"{seeds} ({updates_per_trial * _BASELINE['PPO_N_EPISODES_PER_UPDATE']} episodios/semilla)")
 
     if sampler_name == "random":
         sampler = optuna.samplers.RandomSampler(seed=SEED)

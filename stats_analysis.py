@@ -24,6 +24,7 @@ FECHA_INICIO y TRAIN_DAYS en vez de quemar un rango de días a mano.
 import datetime
 
 import numpy as np
+import torch  # noqa: F401  (antes que pandas: en Windows, pandas primero rompe la carga de las DLL de torch)
 import pandas as pd
 from scipy.stats import wilcoxon
 

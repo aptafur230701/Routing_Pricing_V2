@@ -25,7 +25,7 @@ precio, así que la comparación B puede fijar el destino del DRL y cambiar solo
 
 Compatibilidad
 --------------
-· La máscara de destinos es la del entorno (routing_env.VectorRoutingEnv): np.int8, 1 = válido, 0 = inválido;
+· La máscara de destinos es la del entorno (routing_env.VectorRoutingEnv): tensor bool (o 0/1), True = válido;
   la de opciones es env.opciones_validas (bool, True = válida).
 · Sin dependencias de am_agent.py, am_training.py ni routing_env.py.
 """
@@ -36,6 +36,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
+from config import CHECK_TENSORS
 from model.debug_utils import check_tensor
 from model.encoder import COT_P, COT_V, N_COT_FEATURES
 from pricing import N_NIVELES
@@ -239,8 +240,8 @@ class AttentionDecoder(nn.Module):
         logits    = self.pointer(h_refined, embeddings)         # (batch, N)
         check_tensor("decoder raw logits", logits)
         logits    = logits.masked_fill(mask, float("-inf"))
-        # Verify no NaN crept in at valid positions after masking
-        if torch.isnan(logits[~mask]).any():
+        # Verify no NaN crept in at valid positions after masking (solo con CHECK_TENSORS: fuerza una sincronización)
+        if CHECK_TENSORS and torch.isnan(logits[~mask]).any():
             raise RuntimeError("decoder masked logits: NaN at valid positions after masking")
         return logits, h_refined
 
@@ -256,7 +257,7 @@ class AttentionDecoder(nn.Module):
         B = embeddings.shape[0]
         filas = torch.arange(B, device=embeddings.device)
         validas = opciones[filas, destinos]                                   # (batch, n_opciones)
-        if (~validas).all(dim=-1).any():
+        if CHECK_TENSORS and (~validas).all(dim=-1).any():
             raise RuntimeError("cabeza de precio: destino sin opciones válidas")
         logits = self.precio(context, glimpse, embeddings[filas, destinos], cot[filas, destinos])  # (batch, n_opciones)
         check_tensor("price head raw logits", logits)
@@ -264,8 +265,8 @@ class AttentionDecoder(nn.Module):
 
     @staticmethod
     def _bool_mask(action_mask: torch.Tensor) -> torch.Tensor:
-        """Convierte la máscara Gymnasium (1=válido) a bool (True=inválido)."""
-        return action_mask == 0
+        """Convierte la máscara del entorno (True/1 = válido) a bool (True = inválido)."""
+        return ~action_mask.bool()
 
     # ── API pública: acción (destino, opción de precio) ──────────────────────
 
@@ -291,7 +292,7 @@ class AttentionDecoder(nn.Module):
 
     def greedy_cotizacion(self, context, embeddings, action_mask, opciones, cot) -> tuple:
         """Argmax del destino y, para ese destino, argmax de la opción de precio. Retorna (destino, opción)."""
-        if (action_mask.sum(dim=-1) == 0).any():
+        if CHECK_TENSORS and (action_mask.sum(dim=-1) == 0).any():
             raise RuntimeError("AttentionDecoder.greedy_cotizacion: zero valid actions in mask")
         logits, glimpse = self._logits_y_glimpse(context, embeddings, self._bool_mask(action_mask))
         destino = logits.argmax(dim=-1)
