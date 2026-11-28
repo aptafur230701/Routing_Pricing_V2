@@ -48,7 +48,7 @@ from config import (
     PPO_ENTROPY_COEF_PRECIO_START, PPO_ENTROPY_COEF_PRECIO_END,
     RESUME_CADA_UPDATES, RESUME_CADA_MIN,
 )
-from routing_env import VectorRoutingEnv
+from routing_env import VectorRoutingEnv, OPCION_VACIO
 from greedy_rollout import EntradasAgente, greedy_rollout, construir_features
 from model.agent import AMRoutingAgent
 from model.encoder import COT_COLS
@@ -100,11 +100,13 @@ def _k_codigo(k_list) -> np.ndarray:
 # Forward pass compartido (recolección y actualización)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _forward(agent, critic, feats_t: dict, mask_t, actions_t=None, opcion_t=None):
+def _forward(agent, critic, feats_t: dict, mask_t, actions_t=None, opcion_t=None, n_muestra=None):
     """encoder → context → decoder → critic para un batch, con la acción (destino, opción de precio).
 
     feats_t : tensores node_feats, temporal, market, budget, dow, cot, opciones y current_node. Si actions_t es None
     samplea (recolección); si no, evalúa las acciones almacenadas (actualización PPO).
+    n_muestra : solo en la recolección. None ⇒ samplean todas las filas; un entero ⇒ samplean las primeras
+    n_muestra y el resto toma el argmax (decoder.act_mixto); log π y las entropías son solo de las muestreadas.
     Retorna (destino, opción, log π(j, o), H_destino, H_precio, V(s)).
     """
     nf = feats_t["node_feats"]
@@ -117,7 +119,10 @@ def _forward(agent, critic, feats_t: dict, mask_t, actions_t=None, opcion_t=None
     check_tensor("context h_t", h_t)
     values = critic(h_t)
     cot = nf[..., COT_COLS]                                                    # entra también a la cabeza de precio
-    if actions_t is None:
+    if actions_t is None and n_muestra is not None:
+        actions, opcion, log_probs, h_dest, h_precio = agent.decoder.act_mixto(
+            h_t, embeddings, mask_t, feats_t["opciones"], cot, n_muestra)
+    elif actions_t is None:
         actions, opcion, log_probs, h_dest, h_precio = agent.decoder.act_cotizacion(
             h_t, embeddings, mask_t, feats_t["opciones"], cot)
     else:
@@ -150,7 +155,7 @@ class _Fases:
             self.t[nombre] += time.perf_counter() - t0
 
 
-_FASES_ORDEN = ("mundos", "rollout", "greedy", "gae", "ppo", "validacion")
+_FASES_ORDEN = ("mundos", "rollout", "gae", "ppo", "validacion")   # "rollout" incluye el greedy del self-critical
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -208,34 +213,66 @@ class ValidacionSimulada:
 # Rollout muestreado y GAE (en el dispositivo)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _rollout_muestreado(agent, critic, env, mundos, start_nodes, k_list, entradas) -> dict:
-    """B episodios en paralelo con la política muestreada. Devuelve las transiciones de las filas activas
-    concatenadas (tensores (n, ...)), con el episodio `ep` y el paso `t` de cada una."""
+def _rollout(agent, critic, env, mundos, start_nodes, k_list, entradas, con_greedy: bool) -> tuple:
+    """B episodios en paralelo con la política muestreada y, con `con_greedy`, el rollout greedy del self-critical
+    sobre los MISMOS mundos, nodos y K, en el mismo loop.
+
+    Con con_greedy el entorno tiene 2B filas: las B primeras samplean y las B siguientes (copias de los mismos
+    episodios) toman el argmax, en un solo forward por paso (decoder.act_mixto). En cada paso el agente solo procesa
+    las filas activas: las que ya terminaron no pasan por la red (el entorno les da una acción ficticia que ignora).
+    El greedy da exactamente lo mismo que greedy_rollout(...).env_reward.
+
+    Retorna (transiciones, r_greedy): las transiciones de las filas muestreadas activas concatenadas (tensores
+    (n, ...)), con el episodio `ep` y el paso `t` de cada una; r_greedy (B,) la recompensa del entorno del greedy
+    (None sin con_greedy).
+    """
+    B = len(start_nodes)
+    if con_greedy:
+        mundos = mundos.tomar(np.concatenate([np.arange(B), np.arange(B)]))
+        start_nodes = np.concatenate([start_nodes, start_nodes])
+        k_list = list(k_list) * 2
+    dev = env.device
     masks = env.reset(mundos, start_nodes, k_list)
+    n_filas = env.B
     active = env.active.clone()                   # una fila sin ninguna jugada desde casa no sale (sin transiciones)
+    r_greedy = torch.zeros(B, dtype=torch.float32, device=dev) if con_greedy else None
     trans = defaultdict(list)
     for t in range(env.max_steps):
-        idx = active.nonzero().squeeze(1)
-        if idx.numel() == 0:
+        act_cpu = active.cpu()                    # una sola sincronización por paso: filas activas y cuántas muestrean
+        idx_cpu = act_cpu.nonzero().squeeze(1)
+        if idx_cpu.numel() == 0:
             break
-        feats = construir_features(env, entradas)
-        a, o, lp, _, _, v = _forward(agent, critic, feats, masks)
-        rewards, terminated, next_masks = env.step(a, o)
+        n_s = int(act_cpu[:B].sum())              # las activas muestreadas van primero en idx (índices < B)
+        idx = idx_cpu.to(dev)
+        feats = {k: x[idx] for k, x in construir_features(env, entradas).items()}
+        m = masks[idx]
+        a, o, lp, _, _, v = _forward(agent, critic, feats, m, n_muestra=n_s)
+        acciones = torch.zeros(n_filas, dtype=torch.long, device=dev)            # inactivas: acción ficticia válida
+        opciones = torch.full((n_filas,), OPCION_VACIO, dtype=torch.long, device=dev)
+        acciones[idx] = a
+        opciones[idx] = o
+        rewards, terminated, next_masks = env.step(acciones, opciones)
+
+        ids = idx[:n_s]                           # episodios muestreados activos en este paso
         for k in _FEATS + ("opciones", "current_node"):
-            trans[k].append(feats[k][idx])
-        for k, x in (("mask", masks), ("action", a), ("opcion", o), ("log_prob", lp), ("value", v),
-                     ("reward", rewards), ("done", terminated), ("time_violation", env.last_time_violation),
+            trans[k].append(feats[k][:n_s])
+        for k, x in (("mask", m), ("action", a), ("opcion", o), ("value", v)):
+            trans[k].append(x[:n_s])
+        trans["log_prob"].append(lp)
+        for k, x in (("reward", rewards), ("done", terminated), ("time_violation", env.last_time_violation),
                      ("viajo", ~(env.last_cotizo & ~env.last_gano) & ~env.last_espero),
                      ("cotizo", env.last_cotizo), ("gano", env.last_gano)):
-            trans[k].append(x[idx])
-        trans["ep"].append(idx)
-        trans["t"].append(torch.full_like(idx, t))
+            trans[k].append(x[ids])
+        trans["ep"].append(ids)
+        trans["t"].append(torch.full_like(ids, t))
+        if con_greedy:
+            r_greedy += torch.where(active[B:], rewards[B:], torch.zeros_like(r_greedy))
         masks = next_masks
         active = active & ~terminated
     if bool(active.any()):
         # max_pasos_cotizacion bastan para cerrar cualquier ciclo: un episodio activo aquí sería un bug.
         raise RuntimeError(f"{int(active.sum())} episodios no terminaron dentro del techo de {env.max_steps} pasos")
-    return {k: torch.cat(v) for k, v in trans.items()}
+    return {k: torch.cat(v) for k, v in trans.items()}, r_greedy
 
 
 def _gae(tr: dict, B: int, gamma: float, lam: float) -> tuple:
@@ -356,8 +393,10 @@ def run_am_training(
     # Optimizers separados: el critic converge más rápido (lr 10x). Actor con AdamW (weight_decay es el regularizador
     # PPO-safe primario); critic con Adam puro.
     actor_params = list(agent.parameters())
-    actor_optimizer  = torch.optim.AdamW(actor_params, lr=lr, weight_decay=PPO_WEIGHT_DECAY)
-    critic_optimizer = torch.optim.Adam(critic.parameters(), lr=lr * 10)
+    # fused: un solo kernel por paso del optimizador en la GPU (mismo algoritmo; en CPU no aplica).
+    fused = DEVICE.type == "cuda"
+    actor_optimizer  = torch.optim.AdamW(actor_params, lr=lr, weight_decay=PPO_WEIGHT_DECAY, fused=fused)
+    critic_optimizer = torch.optim.Adam(critic.parameters(), lr=lr * 10, fused=fused)
 
     # LR con decaimiento coseno: cada LR baja desde su valor inicial hasta LR_FINAL_FRAC de ese valor
     # al terminar n_updates (un scheduler.step() al final de cada update).
@@ -479,16 +518,12 @@ def run_am_training(
             k_list = _balanced_k_assignment(B, np.random)
             mundos = market_process.sortear_mundos(start_days, MARKET_DIAS_EPISODIO, num_train_days - 1, gen_mundos)
 
+        # Self-critical: el rollout greedy sobre los MISMOS mundos, nodos y K va en el mismo loop (2B filas).
         agent.eval()
         critic.eval()
         with fases("rollout"), torch.no_grad():
-            tr = _rollout_muestreado(agent, critic, env, mundos, start_nodes, k_list, entradas)
-
-        # ── Self-critical: rollout greedy sobre los MISMOS mundos, nodos y K ───
-        r_greedy = None
-        if USE_SELF_CRITICAL:
-            with fases("greedy"):
-                r_greedy = greedy_rollout(agent, env, mundos, start_nodes, entradas, k_max=k_list).env_reward
+            tr, r_greedy = _rollout(agent, critic, env, mundos, start_nodes, k_list, entradas,
+                                    con_greedy=USE_SELF_CRITICAL)
 
         with fases("gae"):
             ventajas, retornos = _gae(tr, B, gamma, gae_lambda)

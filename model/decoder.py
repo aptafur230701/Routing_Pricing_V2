@@ -20,7 +20,9 @@ Orden autorregresivo: primero j (máscara = el destino tiene alguna opción vál
 Si para j solo hay una opción válida (p. ej. solo VACÍO), log π(o | s, j) = 0. La entropía se devuelve por
 separado (destino y precio) para poder ponderarlas distinto en el PPO. π(j | s) no depende de la cabeza de
 precio, así que la comparación B puede fijar el destino del DRL y cambiar solo la regla de precio.
-· Entrenamiento (PPO): act_cotizacion samplea; evaluate_cotizacion recalcula log π(j, o) y las entropías.
+· Entrenamiento (PPO): act_cotizacion samplea; act_mixto samplea en unas filas y toma el argmax en el resto
+  (rollout muestreado + greedy del self-critical en un solo batch); evaluate_cotizacion recalcula log π(j, o)
+  y las entropías.
 · Evaluación (greedy): greedy_cotizacion (argmax de j y de o); greedy_precio para un destino dado.
 
 Compatibilidad
@@ -289,6 +291,29 @@ class AttentionDecoder(nn.Module):
         dist_o = self._dist_precio(context, glimpse, embeddings, destino, opciones, cot)
         opcion = dist_o.sample()
         return destino, opcion, dist_j.log_prob(destino) + dist_o.log_prob(opcion), dist_j.entropy(), dist_o.entropy()
+
+    def act_mixto(self, context, embeddings, action_mask, opciones, cot, n_muestra: int) -> tuple:
+        """Las primeras `n_muestra` filas samplean (igual que act_cotizacion) y el resto toma el argmax (igual que
+        greedy_cotizacion), con un solo pase del glimpse, el puntero y la cabeza de precio. Lo usa el rollout de
+        entrenamiento para correr el muestreado y el greedy del self-critical en el mismo batch.
+
+        Retorna destino (batch,), opción (batch,) y, solo de las n_muestra filas muestreadas, log π(j, o),
+        entropía del destino y del precio."""
+        m = int(n_muestra)
+        logits, glimpse = self._logits_y_glimpse(context, embeddings, self._bool_mask(action_mask))
+        dist_j = self._categorica(logits[:m], "decoder softmax probs")
+        destino = torch.cat([dist_j.sample(), logits[m:].argmax(dim=-1)])
+        filas = torch.arange(embeddings.shape[0], device=embeddings.device)
+        validas = opciones[filas, destino]
+        if CHECK_TENSORS and (~validas).all(dim=-1).any():
+            raise RuntimeError("cabeza de precio: destino sin opciones válidas")
+        logits_o = self.precio(context, glimpse, embeddings[filas, destino], cot[filas, destino])
+        check_tensor("price head raw logits", logits_o)
+        logits_o = logits_o.masked_fill(~validas, float("-inf"))
+        dist_o = self._categorica(logits_o[:m], "price head probs")
+        opcion = torch.cat([dist_o.sample(), logits_o[m:].argmax(dim=-1)])
+        log_prob = dist_j.log_prob(destino[:m]) + dist_o.log_prob(opcion[:m])
+        return destino, opcion, log_prob, dist_j.entropy(), dist_o.entropy()
 
     def greedy_cotizacion(self, context, embeddings, action_mask, opciones, cot) -> tuple:
         """Argmax del destino y, para ese destino, argmax de la opción de precio. Retorna (destino, opción)."""

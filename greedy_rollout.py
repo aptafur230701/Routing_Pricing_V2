@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from config import MAX_DURATION
+from routing_env import OPCION_VACIO
 from model.encoder import (
     COT_COLS,
     build_node_features_batch,
@@ -131,8 +132,9 @@ def greedy_rollout(
     k_max                = None,          # lista de (int | None) o None ⇒ todos libres
     registrar:  bool     = False,         # True: guarda (P, B) por paso para armar rutas y detalle por arco
     step_hook:  callable = None,          # fn(dict) invocada en cada paso ANTES de env.step, para inspeccionar la
-                                          # decisión sin alterarla. Claves: env, h_t, embeddings, masks, actions,
-                                          # opciones, active, feats
+                                          # decisión sin alterarla. Claves: env, filas (índices de las filas
+                                          # activas) y, solo de esas filas, h_t, embeddings, masks, actions,
+                                          # opciones, feats
 ) -> GreedyResult:
     """Rollout greedy (argmax por nodo) vectorizado sobre un VectorRoutingEnv, en su dispositivo.
 
@@ -156,15 +158,22 @@ def greedy_rollout(
     try:
         with torch.no_grad():
             for _ in range(env.max_steps):   # techo defensivo (ver max_pasos_cotizacion)
-                if not bool(active.any()):
+                idx = active.nonzero().squeeze(1)
+                if idx.numel() == 0:
                     break
-                feats = construir_features(env, entradas)
+                # Solo las filas activas pasan por la red; las que terminaron reciben una acción ficticia válida
+                # (nodo 0, VACÍO) que el entorno ignora.
+                feats = {k: x[idx] for k, x in construir_features(env, entradas).items()}
                 h_t, embeddings = contexto_agente(agent, feats)
-                actions, opciones = agent.decoder.greedy_cotizacion(
-                    h_t, embeddings, masks, feats["opciones"], feats["node_feats"][..., COT_COLS])
+                a_act, o_act = agent.decoder.greedy_cotizacion(
+                    h_t, embeddings, masks[idx], feats["opciones"], feats["node_feats"][..., COT_COLS])
+                actions = torch.zeros(B, dtype=torch.long, device=dev)
+                opciones = torch.full((B,), OPCION_VACIO, dtype=torch.long, device=dev)
+                actions[idx] = a_act
+                opciones[idx] = o_act
                 if step_hook is not None:
-                    step_hook(dict(env=env, h_t=h_t, embeddings=embeddings, masks=masks, actions=actions,
-                                   opciones=opciones, active=active.clone(), feats=feats))
+                    step_hook(dict(env=env, filas=idx, h_t=h_t, embeddings=embeddings, masks=masks[idx],
+                                   actions=a_act, opciones=o_act, feats=feats))
 
                 rewards, terminated, masks = env.step(actions, opciones)
                 cotizo = active & env.last_cotizo

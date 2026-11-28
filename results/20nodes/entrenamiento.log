@@ -1,0 +1,290 @@
+
+============================================================
+  AM — 20 nodes
+  Niveles de K: ['libre']
+  Hiperparámetros propios de este tamaño: ninguno (los de config.py)
+  Semilla de entrenamiento (SEED): 42
+============================================================
+L/T faltante (LT=0 con cargas): 56 casos de 29682 hub-días, llenados con el día válido más cercano del hub.
+Multi-day data  : 153 días totales (jun-oct 2026) | train=122 | eval=31
+REWARD_GLOBAL_P95: 1932.0000
+L/T faltante (LT=0 con cargas): 56 casos de 29682 hub-días, llenados con el día válido más cercano del hub.
+
+  [Transfer] 20 nodos — pesos aleatorios (sin fuente).
+Device           : cuda:0
+Training episodes: 499800
+
+--- Entrenamiento AM-PPO en cuda:0: 499800 episodios (714 updates × 700 ep/update) ---
+Mercado: realizaciones diarias — cada episodio sortea una vez hub inicial, día real inicial y corrimiento de nivel δ.
+Validación: 200 episodios fijos (semilla 777002) × K∈{libre}
+  update    35/714 | episodios    24500/499800 | reward_train    9.6
+    val[K=libre] margen=1461usd acept=36% nivel=3.5
+    MA(3 val)=1378usd *checkpoint guardado (mejor update=33)
+    validez=96% | entropía destino=0.691 | KL=0.0171 | var_explicada=0.543
+    cotización (rollout): aceptación=32% | nivel medio=3.9 | cotizaciones/ep=8.19 | rechazos/ep=5.58 | entropía precio=1.600
+    K-diag: free:len=2.8
+    tiempos/update (35 upd): total 3.27s | mundos 0.00s (0%) | rollout 0.79s (24%) | greedy 0.71s (22%) | gae 0.00s (0%) | ppo 1.72s (53%) | validacion 0.04s (1%) | otro 0.00s (0%)
+  update    70/714 | episodios    49000/499800 | reward_train   12.2
+    val[K=libre] margen=1472usd acept=34% nivel=3.7
+    MA(3 val)=1464usd *checkpoint guardado (mejor update=66)
+    validez=96% | entropía destino=0.383 | KL=0.0253 | var_explicada=0.697
+    cotización (rollout): aceptación=35% | nivel medio=3.6 | cotizaciones/ep=7.73 | rechazos/ep=5.04 | entropía precio=1.460
+    K-diag: free:len=2.8
+    tiempos/update (35 upd): total 2.98s | mundos 0.00s (0%) | rollout 0.89s (30%) | greedy 0.82s (28%) | gae 0.00s (0%) | ppo 1.22s (41%) | validacion 0.04s (1%) | otro 0.00s (0%)
+  update   105/714 | episodios    73500/499800 | reward_train   13.7
+    val[K=libre] margen=1539usd acept=35% nivel=3.6
+    MA(3 val)=1523usd *checkpoint guardado (mejor update=99)
+    validez=96% | entropía destino=0.246 | KL=0.0191 | var_explicada=0.740
+    cotización (rollout): aceptación=30% | nivel medio=4.0 | cotizaciones/ep=9.25 | rechazos/ep=6.46 | entropía precio=1.364
+    K-diag: free:len=2.9
+    tiempos/update (35 upd): total 2.67s | mundos 0.00s (0%) | rollout 0.94s (35%) | greedy 0.87s (33%) | gae 0.00s (0%) | ppo 0.80s (30%) | validacion 0.04s (2%) | otro 0.00s (0%)
+  update   140/714 | episodios    98000/499800 | reward_train   12.8
+    val[K=libre] margen=1507usd acept=34% nivel=3.7
+    MA(3 val)=1499usd
+    validez=96% | entropía destino=0.353 | KL=0.0124 | var_explicada=0.715
+    cotización (rollout): aceptación=34% | nivel medio=3.7 | cotizaciones/ep=8.37 | rechazos/ep=5.49 | entropía precio=1.411
+    K-diag: free:len=3.0
+    tiempos/update (35 upd): total 2.59s | mundos 0.00s (0%) | rollout 0.90s (35%) | greedy 0.86s (33%) | gae 0.00s (0%) | ppo 0.79s (30%) | validacion 0.04s (1%) | otro 0.00s (0%)
+  update   175/714 | episodios   122500/499800 | reward_train   13.3
+    val[K=libre] margen=1540usd acept=31% nivel=4.0
+    MA(3 val)=1530usd *checkpoint guardado (mejor update=165)
+    validez=96% | entropía destino=0.231 | KL=0.0245 | var_explicada=0.691
+    cotización (rollout): aceptación=28% | nivel medio=4.2 | cotizaciones/ep=9.60 | rechazos/ep=6.88 | entropía precio=1.349
+    K-diag: free:len=2.8
+    tiempos/update (35 upd): total 2.58s | mundos 0.00s (0%) | rollout 0.92s (36%) | greedy 0.85s (33%) | gae 0.00s (0%) | ppo 0.76s (29%) | validacion 0.04s (1%) | otro 0.00s (0%)
+  update   210/714 | episodios   147000/499800 | reward_train   13.4
+    val[K=libre] margen=1556usd acept=34% nivel=3.7
+    MA(3 val)=1534usd
+    validez=96% | entropía destino=0.188 | KL=0.0191 | var_explicada=0.723
+    cotización (rollout): aceptación=31% | nivel medio=4.0 | cotizaciones/ep=9.14 | rechazos/ep=6.35 | entropía precio=1.305
+    K-diag: free:len=2.9
+    tiempos/update (35 upd): total 2.53s | mundos 0.00s (0%) | rollout 0.93s (37%) | greedy 0.86s (34%) | gae 0.00s (0%) | ppo 0.68s (27%) | validacion 0.05s (2%) | otro 0.00s (0%)
+  update   245/714 | episodios   171500/499800 | reward_train   14.0
+    val[K=libre] margen=1530usd acept=29% nivel=4.0
+    MA(3 val)=1568usd *checkpoint guardado (mejor update=242)
+    validez=96% | entropía destino=0.170 | KL=0.0191 | var_explicada=0.700
+    cotización (rollout): aceptación=30% | nivel medio=4.0 | cotizaciones/ep=9.21 | rechazos/ep=6.44 | entropía precio=1.269
+    K-diag: free:len=2.9
+    tiempos/update (35 upd): total 2.69s | mundos 0.00s (0%) | rollout 0.92s (34%) | greedy 0.84s (31%) | gae 0.00s (0%) | ppo 0.88s (33%) | validacion 0.04s (2%) | otro 0.00s (0%)
+  update   280/714 | episodios   196000/499800 | reward_train   14.3
+    val[K=libre] margen=1630usd acept=34% nivel=3.7
+    MA(3 val)=1592usd *checkpoint guardado (mejor update=275)
+    validez=96% | entropía destino=0.187 | KL=0.0170 | var_explicada=0.778
+    cotización (rollout): aceptación=33% | nivel medio=3.8 | cotizaciones/ep=8.98 | rechazos/ep=6.01 | entropía precio=1.257
+    K-diag: free:len=3.0
+    tiempos/update (35 upd): total 2.72s | mundos 0.00s (0%) | rollout 0.91s (34%) | greedy 0.86s (32%) | gae 0.00s (0%) | ppo 0.90s (33%) | validacion 0.04s (1%) | otro 0.00s (0%)
+  update   315/714 | episodios   220500/499800 | reward_train   14.6
+    val[K=libre] margen=1625usd acept=35% nivel=3.6
+    MA(3 val)=1623usd *checkpoint guardado (mejor update=308)
+    validez=96% | entropía destino=0.201 | KL=0.0225 | var_explicada=0.773
+    cotización (rollout): aceptación=34% | nivel medio=3.8 | cotizaciones/ep=8.50 | rechazos/ep=5.62 | entropía precio=1.162
+    K-diag: free:len=3.0
+    tiempos/update (35 upd): total 2.71s | mundos 0.00s (0%) | rollout 0.92s (34%) | greedy 0.85s (31%) | gae 0.00s (0%) | ppo 0.89s (33%) | validacion 0.04s (2%) | otro 0.00s (0%)
+  update   350/714 | episodios   245000/499800 | reward_train   14.4
+    val[K=libre] margen=1614usd acept=31% nivel=3.9
+    MA(3 val)=1611usd
+    validez=96% | entropía destino=0.142 | KL=0.0180 | var_explicada=0.734
+    cotización (rollout): aceptación=30% | nivel medio=4.0 | cotizaciones/ep=9.38 | rechazos/ep=6.56 | entropía precio=1.221
+    K-diag: free:len=2.9
+    tiempos/update (35 upd): total 2.63s | mundos 0.00s (0%) | rollout 0.91s (35%) | greedy 0.87s (33%) | gae 0.00s (0%) | ppo 0.80s (31%) | validacion 0.04s (2%) | otro 0.00s (0%)
+  update   385/714 | episodios   269500/499800 | reward_train   14.7
+    val[K=libre] margen=1620usd acept=33% nivel=3.7
+    MA(3 val)=1614usd
+    validez=96% | entropía destino=0.125 | KL=0.0203 | var_explicada=0.712
+    cotización (rollout): aceptación=31% | nivel medio=3.9 | cotizaciones/ep=9.24 | rechazos/ep=6.37 | entropía precio=1.182
+    K-diag: free:len=3.0
+    tiempos/update (35 upd): total 2.68s | mundos 0.00s (0%) | rollout 0.92s (34%) | greedy 0.86s (32%) | gae 0.00s (0%) | ppo 0.85s (32%) | validacion 0.04s (2%) | otro 0.00s (0%)
+  update   420/714 | episodios   294000/499800 | reward_train   14.9
+    val[K=libre] margen=1604usd acept=36% nivel=3.6
+    MA(3 val)=1631usd
+    validez=96% | entropía destino=0.142 | KL=0.0216 | var_explicada=0.745
+    cotización (rollout): aceptación=35% | nivel medio=3.7 | cotizaciones/ep=8.68 | rechazos/ep=5.68 | entropía precio=1.188
+    K-diag: free:len=3.1
+    tiempos/update (35 upd): total 2.73s | mundos 0.00s (0%) | rollout 0.91s (33%) | greedy 0.87s (32%) | gae 0.00s (0%) | ppo 0.91s (33%) | validacion 0.04s (1%) | otro 0.00s (0%)
+  update   455/714 | episodios   318500/499800 | reward_train   14.4
+    val[K=libre] margen=1648usd acept=35% nivel=3.7
+    MA(3 val)=1648usd *checkpoint guardado (mejor update=451)
+    validez=96% | entropía destino=0.141 | KL=0.0191 | var_explicada=0.770
+    cotización (rollout): aceptación=34% | nivel medio=3.7 | cotizaciones/ep=8.65 | rechazos/ep=5.73 | entropía precio=1.146
+    K-diag: free:len=3.0
+    tiempos/update (35 upd): total 2.97s | mundos 0.00s (0%) | rollout 0.92s (31%) | greedy 0.82s (28%) | gae 0.00s (0%) | ppo 1.17s (40%) | validacion 0.04s (1%) | otro 0.00s (0%)
+  update   490/714 | episodios   343000/499800 | reward_train   14.8
+    val[K=libre] margen=1671usd acept=36% nivel=3.7
+    MA(3 val)=1663usd *checkpoint guardado (mejor update=484)
+    validez=96% | entropía destino=0.119 | KL=0.0193 | var_explicada=0.751
+    cotización (rollout): aceptación=33% | nivel medio=3.7 | cotizaciones/ep=9.06 | rechazos/ep=6.07 | entropía precio=1.136
+    K-diag: free:len=3.1
+    tiempos/update (35 upd): total 2.89s | mundos 0.00s (0%) | rollout 0.88s (31%) | greedy 0.84s (29%) | gae 0.00s (0%) | ppo 1.11s (38%) | validacion 0.04s (1%) | otro 0.00s (0%)
+  update   525/714 | episodios   367500/499800 | reward_train   14.6
+    val[K=libre] margen=1621usd acept=33% nivel=3.8
+    MA(3 val)=1630usd
+    validez=96% | entropía destino=0.124 | KL=0.0220 | var_explicada=0.750
+    cotización (rollout): aceptación=31% | nivel medio=3.9 | cotizaciones/ep=9.19 | rechazos/ep=6.30 | entropía precio=1.115
+    K-diag: free:len=3.0
+    tiempos/update (35 upd): total 3.02s | mundos 0.00s (0%) | rollout 0.93s (31%) | greedy 0.86s (28%) | gae 0.00s (0%) | ppo 1.18s (39%) | validacion 0.04s (1%) | otro 0.00s (0%)
+  update   560/714 | episodios   392000/499800 | reward_train   15.0
+    val[K=libre] margen=1685usd acept=35% nivel=3.7
+    MA(3 val)=1634usd
+    validez=96% | entropía destino=0.140 | KL=0.0195 | var_explicada=0.781
+    cotización (rollout): aceptación=33% | nivel medio=3.8 | cotizaciones/ep=8.72 | rechazos/ep=5.81 | entropía precio=1.108
+    K-diag: free:len=3.0
+    tiempos/update (35 upd): total 3.51s | mundos 0.00s (0%) | rollout 0.95s (27%) | greedy 0.90s (26%) | gae 0.00s (0%) | ppo 1.61s (46%) | validacion 0.04s (1%) | otro 0.00s (0%)
+  update   595/714 | episodios   416500/499800 | reward_train   15.2
+    val[K=libre] margen=1671usd acept=35% nivel=3.6
+    MA(3 val)=1661usd
+    validez=96% | entropía destino=0.117 | KL=0.0082 | var_explicada=0.763
+    cotización (rollout): aceptación=35% | nivel medio=3.6 | cotizaciones/ep=8.47 | rechazos/ep=5.50 | entropía precio=1.090
+    K-diag: free:len=3.1
+    tiempos/update (35 upd): total 3.72s | mundos 0.00s (0%) | rollout 0.93s (25%) | greedy 0.87s (24%) | gae 0.00s (0%) | ppo 1.86s (50%) | validacion 0.05s (1%) | otro 0.00s (0%)
+  update   630/714 | episodios   441000/499800 | reward_train   15.4
+    val[K=libre] margen=1673usd acept=35% nivel=3.6
+    MA(3 val)=1659usd
+    validez=96% | entropía destino=0.118 | KL=0.0129 | var_explicada=0.800
+    cotización (rollout): aceptación=33% | nivel medio=3.8 | cotizaciones/ep=8.95 | rechazos/ep=5.97 | entropía precio=1.079
+    K-diag: free:len=3.0
+    tiempos/update (35 upd): total 3.88s | mundos 0.00s (0%) | rollout 0.92s (24%) | greedy 0.85s (22%) | gae 0.00s (0%) | ppo 2.05s (53%) | validacion 0.04s (1%) | otro 0.00s (0%)
+  update   665/714 | episodios   465500/499800 | reward_train   15.5
+    val[K=libre] margen=1678usd acept=33% nivel=3.8
+    MA(3 val)=1695usd *checkpoint guardado (mejor update=660)
+    validez=96% | entropía destino=0.108 | KL=0.0192 | var_explicada=0.749
+    cotización (rollout): aceptación=32% | nivel medio=3.8 | cotizaciones/ep=9.06 | rechazos/ep=6.14 | entropía precio=1.063
+    K-diag: free:len=3.0
+    tiempos/update (35 upd): total 4.19s | mundos 0.00s (0%) | rollout 0.92s (22%) | greedy 0.85s (20%) | gae 0.00s (0%) | ppo 2.37s (57%) | validacion 0.04s (1%) | otro 0.00s (0%)
+  update   700/714 | episodios   490000/499800 | reward_train   16.0
+    val[K=libre] margen=1701usd acept=35% nivel=3.7
+    MA(3 val)=1717usd
+    validez=96% | entropía destino=0.123 | KL=0.0111 | var_explicada=0.788
+    cotización (rollout): aceptación=33% | nivel medio=3.8 | cotizaciones/ep=9.12 | rechazos/ep=6.10 | entropía precio=1.075
+    K-diag: free:len=3.1
+    tiempos/update (35 upd): total 4.24s | mundos 0.00s (0%) | rollout 0.92s (22%) | greedy 0.84s (20%) | gae 0.00s (0%) | ppo 2.44s (57%) | validacion 0.04s (1%) | otro 0.00s (0%)
+Entrenamiento AM-PPO completo.
+Training time: 2210.9 s
+Se evalúa el último update.
+PPO diagnostics plot saved → /kaggle/working/Routing_Pricing_V2/results/20nodes/PPO_Diagnostics_AM.png
+training_log guardado en: /kaggle/working/Routing_Pricing_V2/results/20nodes/training_log_20nodes.pkl
+training_log (Excel) guardado en: /kaggle/working/Routing_Pricing_V2/results/20nodes/training_log_20nodes.xlsx
+UB-DP: calculando la tabla V (20 nodos, S=5000, dt=0.25 h, tope 24.0 h)...
+UB-DP: tabla V calculada en 558.6 s → /kaggle/working/Routing_Pricing_V2/baselines/datos/ubdp_tabla_20nodos.npz
+
+--- Evaluación en mundos simulados ---
+  simulado: UB-PI en 37.3 s
+  simulado: B1 en 0.3 s
+  simulado: B2 en 0.7 s
+  simulado: B2P en 3.8 s
+  simulado: B3 en 0.5 s
+  simulado: DRL en 1.6 s
+  simulado: DRL-dest+mediana en 1.4 s
+  simulado: DRL-dest+be_margen en 1.1 s
+  simulado: DRL-dest+miope en 1.3 s
+
+--- Replay de los días reales de evaluación ---
+  replay: UB-PI en 13.6 s
+  replay: B1 en 0.2 s
+  replay: B2 en 0.6 s
+  replay: B2P en 2.0 s
+  replay: B3 en 0.4 s
+  replay: DRL en 0.7 s
+  replay: DRL-dest+mediana en 0.5 s
+  replay: DRL-dest+be_margen en 0.5 s
+  replay: DRL-dest+miope en 0.5 s
+
+============================================================
+  SUMMARY — 20 nodes  [AM]
+============================================================
+
+  Mundos simulados
+
+  K = libre
+    método              precio                                                                    margen USD  Δ vs DRL  gap UB-PI %  acept. %  u cotizado  USD/mi vs mediana  esperas  reposic.  bajo BE %  viol. %
+    · Modelo propuesto, y sus mismas rutas con reglas de precio fijas (muestran cuánto aporta que el DRL elija el precio)
+    DRL                 El DRL, según el mercado del día                                               1,586        +0         49.9        33        0.48             -0.164     0.78      0.01         10      4.2
+    DRL-dest+mediana    Siempre la tarifa mediana publicada del día                                    1,264      -322         60.1        30        0.47             -0.176     0.98      0.04          9      6.8
+    DRL-dest+be_margen  La tarifa publicada más baja que cubre el costo + 0.30 USD/mi                    712      -873         77.5        48        0.37             -0.880     0.50      0.00          6      6.2
+    DRL-dest+miope      El que maximiza la ganancia esperada del tramo, sin mirar los siguientes       1,454      -131         54.1        33        0.49             -0.181     0.77      0.01          7      6.1
+    · Métodos de comparación
+    B1                  El que maximiza la ganancia esperada del tramo, sin mirar los siguientes         680      -906         78.5        35        0.45             -0.221     0.61      0.01         21      6.1
+    B2                  El que maximiza la ganancia esperada del tramo, sin mirar los siguientes       1,193      -393         62.3        31        0.50             -0.165     1.28      0.03          7      6.9
+    B2P                 El que maximiza la ganancia esperada del tramo, sin mirar los siguientes       1,254      -332         60.4        31        0.50             -0.158     1.30      0.03          7      6.7
+    B3                  El de la misma tabla (hasta 4 intentos por ciudad)                             1,693      +107         46.5        32        0.50             -0.112     0.95      0.01          9      4.6
+    · Referencias (no son métodos aplicables en la práctica)
+    UB-PI               El más alto que todavía gana la carga                                          3,165    +1,579            —         —           —                  —        —         —          —        —
+    UB-DP               El de la misma tabla                                                           1,822      +236            —         —           —                  —        —         —          —        —
+
+  Replay (replay, fuera de muestra (días reales desde 2026-10-01))
+
+  K = libre
+    método              precio                                                                    margen USD  Δ vs DRL  gap UB-PI %  acept. %  u cotizado  USD/mi vs mediana  esperas  reposic.  bajo BE %  viol. %
+    · Modelo propuesto, y sus mismas rutas con reglas de precio fijas (muestran cuánto aporta que el DRL elija el precio)
+    DRL                 El DRL, según el mercado del día                                               1,542        +0         49.8        32        0.49             -0.147     0.85      0.01         10      5.7
+    DRL-dest+mediana    Siempre la tarifa mediana publicada del día                                    1,318      -225         57.1        30        0.47             -0.162     0.98      0.03          8      6.7
+    DRL-dest+be_margen  La tarifa publicada más baja que cubre el costo + 0.30 USD/mi                    649      -893         78.9        45        0.40             -0.923     0.62      0.00          6      9.0
+    DRL-dest+miope      El que maximiza la ganancia esperada del tramo, sin mirar los siguientes       1,394      -148         54.6        32        0.50             -0.179     0.85      0.01          7      9.0
+    · Métodos de comparación
+    B1                  El que maximiza la ganancia esperada del tramo, sin mirar los siguientes         572      -970         81.4        34        0.44             -0.268     0.83      0.01         20      9.3
+    B2                  El que maximiza la ganancia esperada del tramo, sin mirar los siguientes       1,189      -354         61.3        33        0.49             -0.177     1.28      0.04          7     11.0
+    B2P                 El que maximiza la ganancia esperada del tramo, sin mirar los siguientes       1,238      -305         59.7        32        0.51             -0.147     1.35      0.02          7     10.7
+    B3                  El de la misma tabla (hasta 4 intentos por ciudad)                             1,647      +105         46.4        32        0.49             -0.158     0.98      0.00          9      6.7
+    · Referencias (no son métodos aplicables en la práctica)
+    UB-PI               El más alto que todavía gana la carga                                          3,073    +1,530            —         —           —                  —        —         —          —        —
+
+  Lo que aporta el precio del DRL (DRL − mismas rutas con una regla de precio fija):
+    simulado  K=libre  DRL − DRL-dest+mediana        +322.2 USD  IC95 [+264.3, +379.9]  p_Holm=5.3e-26  *
+    simulado  K=libre  DRL − DRL-dest+be_margen      +873.4 USD  IC95 [+813.8, +933.9]  p_Holm=2.3e-112  *
+    simulado  K=libre  DRL − DRL-dest+miope          +131.4 USD  IC95 [+80.3, +181.9]  p_Holm=6.22e-08  *
+    replay    K=libre  DRL − DRL-dest+mediana        +224.6 USD  IC95 [+112.9, +340.5]  p_Holm=1.14e-05  *
+    replay    K=libre  DRL − DRL-dest+be_margen      +893.4 USD  IC95 [+767.0, +1019.6]  p_Holm=6.63e-30  *
+    replay    K=libre  DRL − DRL-dest+miope          +148.2 USD  IC95 [+39.7, +256.9]  p_Holm=0.00162  *
+
+  Entrenamiento del DRL        : 2210.9 s
+  Tabla V de UB-DP             : 558.6 s
+============================================================
+Results saved → /kaggle/working/Routing_Pricing_V2/results/20nodes/DRL_Routing_Summary_AM.xlsx
+Hoja 'Comparación' agregada → /kaggle/working/Routing_Pricing_V2/results/20nodes/DRL_Routing_Summary_AM.xlsx
+Diagnostics plot saved → /kaggle/working/Routing_Pricing_V2/results/20nodes/DRL_Training_Diagnostics_AM.png
+
+--- Validación del precio (20 nodos, 1000 mundos, semilla PRICING_VAL_SEED) ---
+
+Nivel cotizado por el DRL vs estado (Spearman):
+             variable    n  spearman_nivel            p
+                 ltr 8942        0.667806 0.000000e+00
+                   m 8942       -0.667432 0.000000e+00
+frac_tiempo_restante 8942       -0.065851 4.577239e-10
+       indice_origen 8942        0.023880 2.393423e-02
+      indice_destino 8942       -0.036257 6.053792e-04
+
+Régimen y precio, simulado vs replay:
+     modo         metodo  n_cotizaciones  nivel_medio  tasa_aceptacion  ltr_mediana  m_medio  m_mediana  indice_origen_medio  indice_destino_medio  frac_tiempo_restante_media
+simulado            DRL            8942     3.719861         0.332140    42.871563 2.132360   1.594317             0.025227              0.021286                    0.668819
+simulado DRL-dest+miope            8947     3.965799         0.314854    38.969555 2.180819   1.653825             0.012412              0.022151                    0.698283
+simulado    DRL-dest+dp            9917     4.167389         0.299587    42.871563 2.114565   1.594317             0.004181              0.016460                    0.660816
+  replay            DRL            2688     3.881324         0.321057    50.104734 1.991177   1.509239            -0.071458             -0.083317                    0.674637
+  replay DRL-dest+miope            2573     3.988340         0.316751    39.678101 2.062900   1.642150            -0.100979             -0.086396                    0.703441
+  replay    DRL-dest+dp            2883     4.242803         0.302810    47.580780 2.003617   1.536718            -0.099193             -0.087164                    0.667861
+
+Margen de mejora del precio a ruta fija (USD/ciclo; A − B):
+     modo                  comparacion    n  n_clusters    margen_a    margen_b  dif_media_usd   ic95_inf   ic95_sup  frac_a_mejor
+simulado         DRL − DRL-dest+miope 1000        1000 1612.238000 1447.061000     165.177000 116.001175 210.445200      0.533000
+simulado            DRL-dest+dp − DRL 1000        1000 1653.092000 1612.238000      40.854000   2.218350  76.545225      0.514000
+simulado DRL-dest+dp − DRL-dest+miope 1000        1000 1653.092000 1447.061000     206.031000 159.203200 255.131725      0.536000
+  replay         DRL − DRL-dest+miope  300          26 1542.423333 1394.186667     148.236667  34.429333 264.608654      0.533333
+  replay            DRL-dest+dp − DRL  300          26 1633.390000 1542.423333      90.966667  15.732671 174.799758      0.506667
+  replay DRL-dest+dp − DRL-dest+miope  300          26 1633.390000 1394.186667     239.203333 151.400499 329.758550      0.566667
+
+Sensibilidad a κ (K libre):
+  kappa         metodo  margen_medio  tasa_aceptacion  nivel_medio
+   0.5            DRL      1873.184         0.353404     4.028204
+   0.5 DRL-dest+miope      1684.325         0.328721     4.359378
+   1.0            DRL      1612.238         0.332140     3.481887
+   1.0 DRL-dest+miope      1447.061         0.314854     3.789639
+   2.0            DRL      1240.906         0.297211     2.856882
+   2.0 DRL-dest+miope      1079.661         0.294048     3.211838
+
+Tablas → /kaggle/working/Routing_Pricing_V2/results/20nodes/pricing_val/tables
+Figuras → /kaggle/working/Routing_Pricing_V2/results/20nodes/pricing_val/figures
+
+Done! Checkpoint guardado en: checkpoints/am_checkpoint_20nodes.pt
+
+============================================================
+  Secuencia terminada: [20]
+  Todos los tamaños terminaron sin errores.
+============================================================

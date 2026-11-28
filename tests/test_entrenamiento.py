@@ -55,6 +55,47 @@ def test_validacion_fija_reproducible_y_distinta_de_la_evaluacion(d10):
     assert a["score"] == a["margen"]
 
 
+def test_rollout_combinado_greedy_igual_y_transiciones_consistentes(d10):
+    """El greedy que corre junto al muestreado (2B filas, solo las activas por la red) da lo mismo que
+    greedy_rollout; las transiciones muestreadas, repetidas en un entorno de B filas sin compactar, dan las mismas
+    features, máscaras, recompensas y terminación, y el mismo log π y V recalculados sobre el batch completo."""
+    from conftest import mundos_sim
+    from config import K_MAX
+    from greedy_rollout import construir_features, greedy_rollout
+    from model.critic_head import CriticHead
+    B = 60
+    agent = agente_chico(N)
+    torch.manual_seed(0)
+    critic = CriticHead(32).to(DEVICE).eval()
+    nodos = np.arange(B) % N
+    k = [None if i % 3 else K_MAX for i in range(B)]
+    env = d10.env()
+    ent = d10.entradas(env)
+    mun = mundos_sim(d10.market, B, semilla=7)
+    ref = greedy_rollout(agent, env, mun, nodos, ent, k_max=k).env_reward
+    with torch.no_grad():
+        tr, r_greedy = am_training._rollout(agent, critic, env, mun, nodos, k, ent, con_greedy=True)
+        assert torch.equal(r_greedy, ref)
+
+        env2 = d10.env()
+        masks = env2.reset(mun, nodos, k)
+        for t in range(int(tr["t"].max()) + 1):
+            sel = tr["t"] == t
+            ep = tr["ep"][sel]
+            f = construir_features(env2, ent)
+            for c in am_training._FEATS + ("opciones", "current_node"):
+                assert torch.equal(f[c][ep], tr[c][sel])
+            assert torch.equal(masks[ep], tr["mask"][sel])
+            a = torch.zeros(B, dtype=torch.long, device=DEVICE)
+            o = torch.full((B,), am_training.OPCION_VACIO, dtype=torch.long, device=DEVICE)
+            a[ep], o[ep] = tr["action"][sel], tr["opcion"][sel]
+            _, _, lp, _, _, v = am_training._forward(agent, critic, f, masks, actions_t=a, opcion_t=o)
+            assert torch.allclose(lp[ep], tr["log_prob"][sel], atol=1e-5)
+            assert torch.allclose(v[ep], tr["value"][sel], atol=1e-5)
+            rew, term, masks = env2.step(a, o)
+            assert torch.equal(rew[ep], tr["reward"][sel]) and torch.equal(term[ep], tr["done"][sel])
+
+
 def _entrenar(d, monkeypatch, tmp_path, n_updates, episodios=24, **cfg):
     monkeypatch.setattr(am_training, "PPO_N_EPISODES_PER_UPDATE", episodios)
     monkeypatch.setattr(am_training, "get_n_updates", lambda n: n_updates)

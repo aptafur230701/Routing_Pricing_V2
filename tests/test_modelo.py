@@ -230,6 +230,32 @@ def test_act_respeta_opciones_y_logprob_es_la_suma(d10):
         torch.testing.assert_close(lp_o, torch.zeros(B, device=DEVICE), atol=1e-6, rtol=0)
 
 
+def test_act_mixto_muestrea_las_primeras_y_argmax_el_resto(d10):
+    """act_mixto con n_muestra = B es act_cotizacion (misma semilla); con 0 es greedy_cotizacion; con n intermedio,
+    las primeras n filas samplean (log π y entropías solo de ellas) y el resto es el argmax."""
+    agent, h, emb, mask, op, cot = _decisiones(d10)
+    B, n = h.shape[0], 12
+    dec = agent.decoder
+    with torch.no_grad():
+        torch.manual_seed(5)
+        ref = dec.act_cotizacion(h, emb, mask, op, cot)
+        torch.manual_seed(5)
+        mix = dec.act_mixto(h, emb, mask, op, cot, B)
+        for x, y in zip(ref, mix):
+            assert torch.equal(x, y)
+        jg, og = dec.greedy_cotizacion(h, emb, mask, op, cot)
+        j0, o0, lp0, hj0, ho0 = dec.act_mixto(h, emb, mask, op, cot, 0)
+        assert torch.equal(j0, jg) and torch.equal(o0, og) and lp0.numel() == hj0.numel() == ho0.numel() == 0
+        torch.manual_seed(9)
+        ref_n = dec.act_cotizacion(h[:n], emb[:n], mask[:n], op[:n], cot[:n])
+        torch.manual_seed(9)
+        j, o, lp, hj, ho = dec.act_mixto(h, emb, mask, op, cot, n)
+        assert torch.equal(ref_n[0], j[:n]) and torch.equal(ref_n[1], o[:n])
+        for x, y in zip(ref_n[2:], (lp, hj, ho)):                 # otro tamaño de batch: igual hasta redondeo
+            torch.testing.assert_close(x, y, atol=1e-5, rtol=1e-5)
+        assert torch.equal(j[n:], jg[n:]) and torch.equal(o[n:], og[n:])
+
+
 def test_cabeza_de_precio_no_consume_rng_y_arranca_en_la_miope():
     torch.manual_seed(123)
     antes = torch.get_rng_state().clone()
