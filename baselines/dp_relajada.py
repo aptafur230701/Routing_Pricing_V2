@@ -468,7 +468,7 @@ def cargar_o_calcular_tabla(market, time_matrix, distance_arr, diesel_arr, K=K_M
     según el marcador). B3 y UB-DP se reportan entonces como "no tratable"."""
     if market.num_nodes > UBDP_MAX_NODOS:
         if verbose:
-            print(f"UB-DP: no tratable a {market.num_nodes} nodos (más de UBDP_MAX_NODOS = {UBDP_MAX_NODOS}); "
+            print(f"Tabla de B3 (DP): no tratable a {market.num_nodes} nodos (más de UBDP_MAX_NODOS = {UBDP_MAX_NODOS}); "
                   f"no se calcula.")
         return None
     path = path or tabla_path(market.num_nodes)
@@ -478,23 +478,23 @@ def cargar_o_calcular_tabla(market, time_matrix, distance_arr, diesel_arr, K=K_M
         with np.load(path) as z:
             if str(z["firma"]) == firma:
                 if verbose:
-                    print(f"UB-DP: tabla V cargada de {path}")
+                    print(f"Tabla de B3 (DP): tabla V cargada de {path}")
                 return TablaDP(
                     time_matrix, z["V_k"], z["V_libre"], z["V0_k"], z["V0_se_k"],
                     z["V0_libre"], z["V0_se_libre"], z["H_k"], z["H_libre"], dt=dt, S=S,
                     tiempo_calculo=float(z["tiempo_calculo"]),
                 )
         if verbose:
-            print(f"UB-DP: {path} no coincide con los datos actuales; se recalcula.")
+            print(f"Tabla de B3 (DP): {path} no coincide con los datos actuales; se recalcula.")
     if os.path.exists(marcador):
         with open(marcador, encoding="utf-8") as fh:
             info = json.load(fh)
         if info.get("firma") == firma:
             if verbose:
-                print(f"UB-DP: no tratable a {market.num_nodes} nodos ({info['motivo']}, {marcador}).")
+                print(f"Tabla de B3 (DP): no tratable a {market.num_nodes} nodos ({info['motivo']}, {marcador}).")
             return None
     if verbose:
-        print(f"UB-DP: calculando la tabla V ({market.num_nodes} nodos, S={S}, dt={dt} h, "
+        print(f"Tabla de B3 (DP): calculando la tabla V ({market.num_nodes} nodos, S={S}, dt={dt} h, "
               f"tope {max_horas} h)...", flush=True)
     t0 = time.time()
     try:
@@ -512,7 +512,7 @@ def cargar_o_calcular_tabla(market, time_matrix, distance_arr, diesel_arr, K=K_M
         with open(marcador, "w", encoding="utf-8") as fh:
             json.dump(info, fh, indent=2)
         if verbose:
-            print(f"UB-DP: no tratable a {market.num_nodes} nodos ({info['motivo']}) → {marcador}")
+            print(f"Tabla de B3 (DP): no tratable a {market.num_nodes} nodos ({info['motivo']}) → {marcador}")
         return None
     os.makedirs(os.path.dirname(path), exist_ok=True)
     np.savez_compressed(
@@ -521,7 +521,7 @@ def cargar_o_calcular_tabla(market, time_matrix, distance_arr, diesel_arr, K=K_M
         V0_se_libre=tabla.V0_se_libre, H_k=tabla.H_k, H_libre=tabla.H_libre, tiempo_calculo=tabla.tiempo_calculo,
     )
     if verbose:
-        print(f"UB-DP: tabla V calculada en {tabla.tiempo_calculo:.1f} s → {path}")
+        print(f"Tabla de B3 (DP): tabla V calculada en {tabla.tiempo_calculo:.1f} s → {path}")
     return tabla
 
 

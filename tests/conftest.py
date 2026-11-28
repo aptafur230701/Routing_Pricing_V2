@@ -21,7 +21,7 @@ RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if RAIZ not in sys.path:
     sys.path.insert(0, RAIZ)
 
-from config import DEVICE, TRAIN_DAYS, MARKET_DIAS_EPISODIO, COTIZACIONES_MAX_POR_NODO  # noqa: E402
+from config import DEVICE, TRAIN_DAYS, TEST_START, MARKET_DIAS_EPISODIO, COTIZACIONES_MAX_POR_NODO  # noqa: E402
 from market_process import MarketProcess, Mundos, asegurar_parametros  # noqa: E402
 from pricing import N_NIVELES, U_NIVELES_ARR  # noqa: E402
 from problem_data import load_matrices  # noqa: E402
@@ -63,7 +63,7 @@ def d10():
 
 @pytest.fixture(scope="session")
 def tabla10(d10):
-    """Tabla V de UB-DP de 10 nodos con S = 50 (la parte más lenta de los tests en CPU: se calcula una vez)."""
+    """Tabla V de la DP de B3, 10 nodos, S = 50 (la parte más lenta de los tests en CPU: se calcula una vez)."""
     from baselines.dp_relajada import calcular_tabla
     from config import K_MAX
     return calcular_tabla(d10.market, d10.tm, d10.dist, d10.diesel, K=K_MAX, S=50, device=DEVICE)
@@ -74,11 +74,12 @@ def generador(semilla):
 
 
 def mundos_sim(market, B, semilla=0, dia0=None, replay=False):
-    """B mundos (simulados, o replay de los días de prueba) con días de salida al azar (o `dia0`)."""
+    """B mundos (simulados del período de entrenamiento, o replay de días reales de prueba — el mecanismo que usa
+    inference.py) con días de salida al azar (o `dia0`)."""
     rng = np.random.default_rng(semilla)
     if replay:
         dia_max = market.num_dias_total - 1
-        dia0 = TRAIN_DAYS + rng.integers(0, dia_max - TRAIN_DAYS - 2, size=B) if dia0 is None else np.asarray(dia0)
+        dia0 = TEST_START + rng.integers(0, dia_max - TEST_START - 2, size=B) if dia0 is None else np.asarray(dia0)
         return market.mundos_replay(dia0, MARKET_DIAS_EPISODIO, dia_max, generador(semilla))
     dia0 = rng.integers(0, TRAIN_DAYS - MARKET_DIAS_EPISODIO, size=B) if dia0 is None else np.asarray(dia0)
     return market.sortear_mundos(dia0, MARKET_DIAS_EPISODIO, TRAIN_DAYS - 1, generador(semilla))

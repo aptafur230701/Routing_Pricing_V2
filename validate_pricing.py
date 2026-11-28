@@ -2,8 +2,9 @@
 validate_pricing.py
 ===================
 Validación de la decisión de precio del DRL ya entrenado (especificacion_fase0_ruteo_pricing.md §8).
-Corre en mundos simulados con su propia semilla (PRICING_VAL_SEED, distinta de entrenamiento y de evaluación)
-y con el mismo arnés de evaluation.py (`ejecutar_lote`, en la GPU), así que el margen es el mismo de la evaluación.
+Corre en mundos simulados con salida en el período de PRUEBA (octubre, como la evaluación) y su propia semilla
+(PRICING_VAL_SEED, distinta de entrenamiento y de evaluación), con el mismo arnés de evaluation.py (`ejecutar_lote`,
+en la GPU), así que el margen es el mismo de la evaluación.
 
   (a) Nivel cotizado por el DRL según el estado. En cada cotización se registra el nivel elegido, el LTR del
       nodo de origen (y los competidores efectivos m), el momento del ciclo (fracción de tiempo restante y
@@ -15,21 +16,16 @@ y con el mismo arnés de evaluation.py (`ejecutar_lote`, en la GPU), así que el
       conoce el κ del mercado (lee m del estado) y el DRL también lo observa como feature, pero no se entrenó
       con él. Las cotizaciones de (a) son las del DRL con κ = COMPETENCIA_KAPPA (la misma corrida).
 
-  (c) Mismo registro en el REPLAY de los días reales de prueba (los mismos casos que la evaluación), para el DRL y para
-      DRL-dest+miope, y una tabla que compara el régimen de mercado visto en mundos simulados y en replay (LTR, m,
-      índice, nivel y aceptación). Sirve para ver si el precio del DRL se comporta igual fuera de muestra.
-
-  (d) Margen de mejora del precio a ruta fija (`headroom_precio`): el DRL contra sus mismos destinos con (i) la regla
+  (c) Margen de mejora del precio a ruta fija (`headroom_precio`): el DRL contra sus mismos destinos con (i) la regla
       miope y (ii) el precio óptimo de la tabla de B3 (diagnóstico "DRL-dest+dp"; solo donde la tabla existe). Si
       DRL-dest+dp supera al DRL, el precio del DRL tiene margen; si no, la brecha con B3 está en el ruteo.
 
 La comparación B (DRL contra sus destinos con reglas fijas de precio) no se repite aquí: la hace la evaluación
-de main.py, en los mundos de evaluación y en el replay (hoja "Comparación", familia "precio").
+de main.py, en los mundos de prueba (hoja "Comparación", familia "precio").
 
 Salidas: <output_dir>/pricing_val/tables/*.csv y <output_dir>/pricing_val/figures/*.png
-  (a)/(b): cotizaciones_drl, nivel_por_quintil, spearman_nivel, sensibilidad_kappa (mundos simulados, como siempre)
-  (c)    : cotizaciones_comparacion (columnas modo y metodo), nivel_por_quintil_replay, spearman_nivel_replay,
-           regimen_sim_vs_replay
+  (a)/(b): cotizaciones_drl, nivel_por_quintil, spearman_nivel, sensibilidad_kappa
+  (c)    : headroom_precio
 (output_dir por defecto results/<N>nodes). main.py la corre al final de cada tamaño
 (`validar_pricing`); no escribe en el Excel de resultados.
 
@@ -51,7 +47,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from config import (
-    TRAIN_DAYS, MAX_DURATION, PRICING_VAL_SEED, MARKET_M_EVAL_WORLDS, MARKET_SEED_EVAL, COMPETENCIA_KAPPA,
+    MAX_DURATION, PRICING_VAL_SEED, MARKET_M_EVAL_WORLDS, COMPETENCIA_KAPPA,
     AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF,
 )
 import evaluation as ev
@@ -108,17 +104,13 @@ _COMPARACIONES_PRECIO = (("DRL", "DRL-dest+miope"), ("DRL-dest+dp", "DRL"), ("DR
 def headroom_precio(marg: pd.DataFrame, B: int = 2000, semilla: int = 20261127) -> pd.DataFrame:
     """Diferencia pareada de margen (USD por ciclo) entre variantes de precio sobre las MISMAS rutas del DRL.
 
-    marg : columnas modo, mundo, metodo, margen y, en replay, dia_abs. IC 95 % bootstrap; en replay se remuestrean los
-    DÍAS (los escenarios de un mismo día comparten mercado y no son independientes), en simulado cada mundo.
+    marg : columnas modo, mundo, metodo y margen. IC 95 % bootstrap sobre mundos.
     Filas: A − B para (DRL, miope), (dp, DRL) y (dp, miope); las de "dp" solo existen si la tabla de B3 está."""
     rng = np.random.default_rng(semilla)
     filas = []
     for modo, g in marg.groupby("modo", sort=False):
         p = g.pivot_table(index="mundo", columns="metodo", values="margen")
-        if modo == "replay" and "dia_abs" in g:
-            cluster = g.drop_duplicates("mundo").set_index("mundo")["dia_abs"].reindex(p.index)
-        else:
-            cluster = pd.Series(p.index.to_numpy(), index=p.index)
+        cluster = pd.Series(p.index.to_numpy(), index=p.index)
         for a, b in _COMPARACIONES_PRECIO:
             if a not in p or b not in p:
                 continue
@@ -131,15 +123,6 @@ def headroom_precio(marg: pd.DataFrame, B: int = 2000, semilla: int = 20261127) 
                               dif_media_usd=float(dif.mean()), ic95_inf=float(np.percentile(est, 2.5)),
                               ic95_sup=float(np.percentile(est, 97.5)), frac_a_mejor=float((dif > 0).mean())))
     return pd.DataFrame(filas)
-
-
-def regimen_sim_vs_replay(cot: pd.DataFrame) -> pd.DataFrame:
-    """Régimen de mercado y conducta de precio por (modo, método): LTR, m, índice, nivel cotizado y aceptación."""
-    g = cot.groupby(["modo", "metodo"], sort=False)
-    return g.agg(n_cotizaciones=("nivel", "size"), nivel_medio=("nivel", "mean"), tasa_aceptacion=("gano", "mean"),
-                 ltr_mediana=("ltr", "median"), m_medio=("m", "mean"), m_mediana=("m", "median"),
-                 indice_origen_medio=("indice_origen", "mean"), indice_destino_medio=("indice_destino", "mean"),
-                 frac_tiempo_restante_media=("frac_tiempo_restante", "mean")).reset_index()
 
 
 def niveles_por_estado(cot: pd.DataFrame) -> tuple:
@@ -198,15 +181,15 @@ def _figuras(cot, por_q, fig_dir):
 
 def validar_pricing(agent, n, tm, dist, diesel, avail, p95, market, out,
                     M=MARKET_M_EVAL_WORLDS, quick=False, tabla=None) -> dict:
-    """Corre (a) a (d) con `agent` y escribe <out>/pricing_val/{tables,figures}. Devuelve las tablas."""
+    """Corre (a) a (c) con `agent` y escribe <out>/pricing_val/{tables,figures}. Devuelve las tablas."""
     tab_dir, fig_dir = (os.path.join(out, "pricing_val", d) for d in ("tables", "figures"))
     os.makedirs(tab_dir, exist_ok=True)
     os.makedirs(fig_dir, exist_ok=True)
-    dis = ev.disenar_mundos(n, M, market, semilla=PRICING_VAL_SEED)
+    dis = ev.disenar_mundos(n, M, market, periodo="test", semilla=PRICING_VAL_SEED)
     # Los mundos se sortean una vez: el competidor de cada carga es el mismo uniforme con cualquier κ (solo cambia m).
-    mundos = ev.mundos_eval(market, dis["start_day"], TRAIN_DAYS - 1, PRICING_VAL_SEED)
-    casos = ev._Casos(dis["nodo"], dis["start_day"], dis["dow"], dis["start_day"], mundos, K_LEVELS)
-    print(f"\n--- Validación del precio ({n} nodos, {M} mundos, semilla PRICING_VAL_SEED) ---")
+    mundos = ev.mundos_eval(market, dis["start_day"], dis["dia_max"], PRICING_VAL_SEED)
+    casos = ev._Casos(dis["nodo"], dis["start_day"], dis["dow"], mundos, K_LEVELS)
+    print(f"\n--- Validación del precio ({n} nodos, {M} mundos de prueba, semilla PRICING_VAL_SEED) ---")
 
     def contexto():
         return ev.ContextoEval(agent, market, tabla, tm, dist, diesel, n, avail, p95)
@@ -216,7 +199,7 @@ def validar_pricing(agent, n, tm, dist, diesel, avail, p95, market, out,
     base = ("DRL", "DRL-dest+miope")
     todos = base + (("DRL-dest+dp",) if tabla is not None else ())   # dp: solo si la tabla de B3 existe
     if tabla is None:
-        print("  (sin tabla de UB-DP a este tamaño: no se calcula DRL-dest+dp)")
+        print("  (sin tabla de B3 a este tamaño: no se calcula DRL-dest+dp)")
     sens, cot, marg_sim = [], None, None
     try:
         for kappa in KAPPAS:
@@ -236,36 +219,16 @@ def validar_pricing(agent, n, tm, dist, diesel, avail, p95, market, out,
     if cot is None:                       # COMPETENCIA_KAPPA fuera de KAPPAS: una corrida más para (a)
         marg_sim, cot = _correr(contexto(), casos, todos, registrar_metodos=todos)
 
-    # (a) nivel cotizado por el DRL según el estado (mundos simulados)
+    # (a) nivel cotizado por el DRL según el estado
     cot_sim = cot[cot["metodo"] == "DRL"]
     por_q, rho = niveles_por_estado(cot_sim)
 
-    # (c) lo mismo en el replay de los días reales de prueba, con los casos (y competidores) de la evaluación
-    D = market.num_dias_total - TRAIN_DAYS
-    cot_rep, marg_rep = pd.DataFrame(), pd.DataFrame()
-    if D > 0:
-        nodos, dias = ev.casos_replay(n, D)
-        dia0 = TRAIN_DAYS + dias
-        mundos_rep = ev.mundos_eval(market, dia0, market.num_dias_total - 1, MARKET_SEED_EVAL + 1, replay=True)
-        idx = (np.linspace(0, len(nodos) - 1, 28).astype(int) if quick     # repartido: los casos vienen ordenados por nodo
-               else np.arange(len(nodos)))
-        casos_rep = ev._Casos(nodos[idx], dia0[idx], market.dia_semana(dia0[idx]), dia0[idx],
-                              mundos_rep.tomar(idx), K_LEVELS)
-        marg_rep, cot_rep = _correr(contexto(), casos_rep, todos, modo="replay", registrar_metodos=todos)
-    cot_todo = pd.concat([cot, cot_rep], ignore_index=True)
-    reg = regimen_sim_vs_replay(cot_todo)
-    if len(cot_rep):
-        por_q_rep, rho_rep = niveles_por_estado(cot_rep[cot_rep["metodo"] == "DRL"])
-    else:
-        por_q_rep, rho_rep = pd.DataFrame(), pd.DataFrame()
-
-    # (d) margen de mejora del precio a ruta fija: DRL vs miope vs precio de la tabla de B3, sobre las rutas del DRL
-    head = headroom_precio(pd.concat([marg_sim, marg_rep], ignore_index=True))
+    # (c) margen de mejora del precio a ruta fija: DRL vs miope vs precio de la tabla de B3, sobre las rutas del DRL
+    head = headroom_precio(marg_sim)
 
     tablas = {"cotizaciones_drl": cot_sim.drop(columns=["modo", "metodo", "dia_abs"]),
               "nivel_por_quintil": por_q, "spearman_nivel": rho, "sensibilidad_kappa": sens,
-              "cotizaciones_comparacion": cot_todo, "nivel_por_quintil_replay": por_q_rep,
-              "spearman_nivel_replay": rho_rep, "regimen_sim_vs_replay": reg, "headroom_precio": head}
+              "headroom_precio": head}
     for nombre, t in tablas.items():
         t.to_csv(os.path.join(tab_dir, f"{nombre}.csv"), index=False)
     if len(cot_sim):
@@ -273,7 +236,6 @@ def validar_pricing(agent, n, tm, dist, diesel, avail, p95, market, out,
 
     with pd.option_context("display.width", 160, "display.max_columns", 20):
         print("\nNivel cotizado por el DRL vs estado (Spearman):\n", rho.to_string(index=False))
-        print("\nRégimen y precio, simulado vs replay:\n", reg.to_string(index=False))
         print("\nMargen de mejora del precio a ruta fija (USD/ciclo; A − B):\n", head.to_string(index=False))
         print("\nSensibilidad a κ (K libre):\n",
               sens[["kappa", "metodo", "margen_medio", "tasa_aceptacion", "nivel_medio"]].to_string(index=False))
@@ -301,7 +263,7 @@ def main():
     print(f"Checkpoint: {ckpt}")
     # K libre (K = 0), como main.py con K_RESTRINGIDO = False: la firma del caché de la tabla incluye K, y con otro K se
     # recalcularía y se sobrescribiría la tabla que usa main.py.
-    tabla = cargar_o_calcular_tabla(market, tm, dist, diesel, K=0)           # None si UB-DP no es tratable a este tamaño
+    tabla = cargar_o_calcular_tabla(market, tm, dist, diesel, K=0)           # None si la DP no es tratable a este tamaño
     validar_pricing(agent, n, tm, dist, diesel, avail, p95, market, out, tabla=tabla,
                     M=28 if args.quick else MARKET_M_EVAL_WORLDS, quick=args.quick)
 

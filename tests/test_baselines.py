@@ -3,16 +3,17 @@ test_baselines.py
 =================
 Baselines de baselines_drl_ruteo_estocastico.md (baselines/), todos en lote en el dispositivo:
 
-  · UB-DP: la tabla V vectorizada coincide con una enumeración ingenua (dos intentos de cotización, mismo tablero);
-    si no es tratable se deja el marcador y B3 / UB-DP se reportan así.
+  · Tabla de B3 (DP): la tabla V vectorizada coincide con una enumeración ingenua (dos intentos de cotización, mismo
+    tablero); si no es tratable se deja el marcador y B3 se reporta así.
   · UB-PI (DP hacia atrás en lote): coincide con la fuerza bruta de todas las rutas (con revisitas, esperas y
     retrasos), es cota de la mejor ruta con tiempos exactos, revisita cuando conviene y vale 0 si no hay salida.
   · B1 desempata por el índice menor; B2 (tabla hacia atrás) coincide con la enumeración ingenua de rutas y elige
     el primer arco de esa enumeración; con K libre equivale a un K inalcanzable; B2P con índice cero es B2 y es
     monótono en el índice; B3.precio_en coincide con su propia opción.
   · Reglas de precio: en la vuelta a casa perder es volver vacío.
-  · En el arnés: todas las políticas respetan la máscara y son deterministas; UB-PI ≥ cada política en cada mundo;
-    B3 ≤ UB-DP (salvo Monte Carlo); un ciclo fallido vale la penalización.
+  · En el arnés: todas las políticas respetan la máscara y son deterministas; UB-PI ≥ cada política en cada mundo de
+    prueba; en mundos de entrenamiento B3 se acerca al valor de su tabla (salvo Monte Carlo); un ciclo fallido vale
+    la penalización.
   · Estadística (Holm, comparación pareada, notas) y limpieza del repositorio.
 """
 
@@ -225,10 +226,10 @@ def test_tabla_no_tratable_deja_el_marcador_y_b3_se_reporta_asi(tmp_path):
     assert cargar_o_calcular_tabla(d.market, d.tm, d.dist, d.diesel, S=20, path=ruta, verbose=False) is None
     df = ev.evaluar_mundos_simulados(agente_chico(4), d.market, None, d.tm, d.dist, d.diesel, 4, d.avail, d.p95,
                                      M=4, verbose=False)
-    assert "B3" not in set(df["metodo"]) and df["ub_dp"].isna().all()
+    assert "B3" not in set(df["metodo"]) and "ub_dp" not in df.columns
     res = ev.resumen_metodos(df)
-    nt = res[res["metodo"].isin(["B3", "UB-DP"])]
-    assert len(nt) == 2 * df["K"].nunique() and (nt["nota"] == ev.NOTA_NO_TRATABLE).all()
+    nt = res[res["metodo"] == "B3"]
+    assert len(nt) == df["K"].nunique() and (nt["nota"] == ev.NOTA_NO_TRATABLE).all()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,10 +372,11 @@ def test_ub_pi_revisita_cuando_conviene_y_sin_ruta_factible():
 
 def test_ub_pi_regresion_con_datos_reales(d10):
     """Caso libre sobre los tableros reales de los días 0 … D−1 desde la casa 0 (capturado con el solver de antes:
-    ruta 0 → 6 → 0). Si datos/ cambia hay que recapturarlo."""
+    ruta 0 → 6 → 0). Si datos/ o TRAIN_DAYS cambian hay que recapturarlo (el diésel es el promedio de los días de
+    entrenamiento: 1328.0 con jun–sep, 1380.0 con jun–ago)."""
     D = ev.MARKET_DIAS_EPISODIO
     v = solve_ub_pi_lote([0], d10.T, d10.rate[None, :D], d10.loads[None, :D], d10.dist, d10.diesel, MAX_DURATION)
-    assert v[0] == 1328.0
+    assert v[0] == 1380.0
 
 
 def test_mundos_ub_pi_usa_el_competidor_de_cada_carga(d10):
@@ -598,18 +600,31 @@ def test_politicas_respetan_mascara_y_son_deterministas(d10, tabla10):
         ev.PoliticaDRL(sin_tabla, "dp")
 
 
-def test_ub_pi_mayor_o_igual_que_cada_politica_y_b3_cerca_de_ub_dp(sim10):
+def test_ub_pi_mayor_o_igual_que_cada_politica(sim10):
     ok = ~sim10["violacion"]
     assert ok.any() and sim10["ub_pi"].notna().all()
     assert (sim10.loc[ok, "margen"] <= sim10.loc[ok, "ub_pi"] + 1e-6).all()
     assert set(sim10["metodo"]) == set(ev._METODOS)
-    for k in (str(K_MAX), "libre"):
-        g = sim10[(sim10["metodo"] == "B3") & (sim10["K"] == k)]
-        dif = (g["margen"] - g["ub_dp"]).to_numpy()
-        se = dif.std(ddof=1) / np.sqrt(len(dif))
-        assert dif.mean() <= 3.0 * se, f"K={k}: B3 − UB-DP = {dif.mean():.1f} > 3·{se:.1f}"
-        assert g["ub_dp"].mean() >= g["margen"].mean() - 3.0 * se
-        assert g["ub_pi"].mean() >= g["ub_dp"].mean()
+    assert "ub_dp" not in sim10.columns
+
+
+def test_b3_cerca_del_valor_de_su_tabla_en_mundos_de_entrenamiento(d10, tabla10):
+    """Consistencia DP ↔ entorno: en mundos del período con que se construyó la tabla (entrenamiento), el margen de
+    B3 se acerca al valor de su tabla V en (nodo, día de la semana) salvo error de Monte Carlo. En prueba (octubre) no
+    tiene por qué: la tabla es el promedio de junio–agosto."""
+    ctx = ev.ContextoEval(None, d10.market, tabla10, d10.tm, d10.dist, d10.diesel, N, d10.avail, d10.p95)
+    M = 100
+    dis = ev.disenar_mundos(N, M, d10.market, periodo="train", semilla=MARKET_SEED_EVAL)
+    assert dis["dia_max"] == TRAIN_DAYS - 1
+    mundos = ev.mundos_eval(d10.market, dis["start_day"], dis["dia_max"], MARKET_SEED_EVAL)
+    for K in (K_MAX, None):
+        res = ev.ejecutar_lote(ctx.politica("B3"), ctx.env, mundos, dis["nodo"], [K] * M, d10.dist)
+        margen = np.array([r["margen"] for r in res])
+        v = np.array([tabla10.ub_dp(int(n), int(d), K) for n, d in zip(dis["nodo"], dis["dow"])])
+        dif = margen - v
+        se = dif.std(ddof=1) / np.sqrt(M)
+        assert dif.mean() <= 3.0 * se, f"K={K}: B3 − tabla = {dif.mean():.1f} > 3·{se:.1f}"
+        assert v.mean() >= margen.mean() - 3.0 * se
 
 
 def test_ciclo_fallido_se_reporta_con_la_penalizacion(sim10):
@@ -625,13 +640,16 @@ def test_diseno_de_mundos_balanceado_y_conjuntos_disjuntos(d10):
     cn, cd = np.bincount(dis["nodo"], minlength=n), np.bincount(dis["dow"], minlength=7)
     assert cn.min() >= M // n and cn.max() <= -(-M // n) and cd.min() >= M // 7 and cd.max() <= -(-M // 7)
     assert (mp.dia_semana(dis["start_day"]) == dis["dow"]).all()
-    assert (dis["start_day"] <= TRAIN_DAYS - ev.MARKET_DIAS_EPISODIO).all()
-    assert all((dis[k] == ev.disenar_mundos(n, M, mp)[k]).all() for k in dis)
+    ini, fin = mp.periodo("test")                                       # los mundos de evaluación salen en octubre
+    assert (dis["start_day"] >= ini).all() and (dis["start_day"] <= fin - ev.MARKET_DIAS_EPISODIO).all()
+    assert dis["dia_max"] == fin - 1 and ini >= TRAIN_DAYS
+    otra = ev.disenar_mundos(n, M, mp)
+    assert all(np.array_equal(dis[k], otra[k]) for k in dis)
     assert len(set(zip(dis["nodo"], dis["dow"]))) > n                  # el día no queda atado al nodo
     assert MARKET_SEED_EVAL_FINAL not in (MARKET_SEED_EVAL, MARKET_SEED_TRAIN)
-    a = ev.mundos_eval(mp, dis["start_day"], TRAIN_DAYS - 1, MARKET_SEED_EVAL)
-    b = ev.mundos_eval(mp, dis["start_day"], TRAIN_DAYS - 1, MARKET_SEED_EVAL_FINAL)
-    c = ev.mundos_eval(mp, dis["start_day"], TRAIN_DAYS - 1, MARKET_SEED_EVAL_FINAL)
+    a = ev.mundos_eval(mp, dis["start_day"], dis["dia_max"], MARKET_SEED_EVAL)
+    b = ev.mundos_eval(mp, dis["start_day"], dis["dia_max"], MARKET_SEED_EVAL_FINAL)
+    c = ev.mundos_eval(mp, dis["start_day"], dis["dia_max"], MARKET_SEED_EVAL_FINAL)
     assert not torch.equal(a.u, b.u) and torch.equal(b.u, c.u) and torch.equal(b.loads, c.loads)
 
 
@@ -667,9 +685,9 @@ def test_holm_y_comparacion_pareada():
     assert tabla[tabla["comparacion"] == "DRL − B3"]["dif_media_usd"].max() < 0       # B3 le gana
     pd.testing.assert_frame_equal(tabla, st.comparar_con_baselines(df, B=2000))        # semilla fija
 
-def test_marca_de_ub_dp_floja_y_cotas_separadas():
+def test_resumen_con_ub_pi_como_unica_cota():
     filas = []
-    for k, dp in (("5", 90.0), ("libre", 150.0)):          # en "libre" UB-DP > UB-PI
+    for k in ("5", "libre"):
         for i in range(10):
             for metodo, m in (("DRL", 50.0), ("B3", 60.0)):
                 filas.append(dict(modo="simulado", K=k, mundo=i, metodo=metodo, margen=m, violacion=False,
@@ -677,16 +695,15 @@ def test_marca_de_ub_dp_floja_y_cotas_separadas():
                                   ruta=[0, 1, 0], n_cotizaciones=3, n_ganadas=2, horas_rechazo=0.25,
                                   niveles=[1, 4, 2], usd_mi_sobre_mediana=0.1, dinero_en_la_mesa=30.0,
                                   n_esperas=1, horas_espera=5.0, n_reposiciones=0, n_bajo_be=1, usd_bajo_be=-20.0,
-                                  ub_dp=dp, ub_pi=100.0))
+                                  ub_pi=100.0))
     df = pd.DataFrame(filas)
     res = ev.resumen_metodos(df)
-    assert set(res.loc[res["K"] == "libre", "nota"].dropna()) == {st.NOTA_UB_DP_FLOJA}
-    assert res.loc[res["K"] == "5", "nota"].isna().all()
-    # Cada gap contra su propia cota; las cotas aparecen como filas separadas.
+    assert res["nota"].isna().all()
+    # El gap es contra UB-PI; la cota aparece como fila separada y no hay UB-DP.
     b3 = res[(res["K"] == "5") & (res["metodo"] == "B3")].iloc[0]
-    assert b3["gap_ub_dp_pct"] == pytest.approx((90 - 60) / 90 * 100)
     assert b3["gap_ub_pi_pct"] == pytest.approx((100 - 60) / 100 * 100)
-    assert {"UB-PI", "UB-DP"} <= set(res["metodo"])
+    assert "gap_ub_dp_pct" not in res.columns
+    assert "UB-PI" in set(res["metodo"]) and "UB-DP" not in set(res["metodo"])
     assert b3["tasa_aceptacion_pct"] == pytest.approx(200 / 3) and b3["cotizaciones_por_arco"] == pytest.approx(1.5)
     assert b3["nivel_medio"] == pytest.approx(7 / 3) and b3["horas_rechazo"] == pytest.approx(0.25)
     # IC bootstrap de la media: contiene la media y es reproducible (semilla fija).

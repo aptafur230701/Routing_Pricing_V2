@@ -1,8 +1,8 @@
 """
 run_k_comparison.py
 ====================
-Script aparte (NO forma parte del pipeline de main.py) para correr la evaluación en mundos
-simulados (DRL, B1, B2, B3 contra UB-PI y UB-DP) bajo uno o varios presupuestos de
+Script aparte (NO forma parte del pipeline de main.py) para correr la evaluación en los mundos
+de prueba (salidas en octubre; DRL, B1, B2, B3 contra UB-PI) bajo uno o varios presupuestos de
 cardinalidad K, con un checkpoint ya entrenado (no reentrena nada).
 
 Uso

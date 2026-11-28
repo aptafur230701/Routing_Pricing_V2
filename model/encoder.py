@@ -44,22 +44,32 @@ combina sola estas estadísticas en una continuación.
   La fila j == i es la ESPERA (routing_env): su "arco" termina en fin_espera(t), el siguiente día de mercado, así que
   [1] son las horas de espera y [6-13] describen i mañana. Su reward [0] es 0.
 
-Índice de mercado (columna INDEX_COL: [14] con continuación, [6] sin ella):
-  [14] market_index — índice(j, día actual) / desviación del índice histórico (una sola para todos los
+Tablero de HOY en toda la red (también con USE_CONTINUATION_FEATURES): las cargas publicadas hoy (día en que está el
+camión) en las lanes que salen de cada j, y su margen a la mediana de hoy, G_hoy = p50_hoy · e^δ · dist − costo. Es lo
+que muestra un load board público. [6-13] son promedios por día de la semana (lo mismo que sabe la DP de B3); estas
+describen el régimen del día, que es persistente (la media de cargas de una lane cambia mucho entre días del mismo día
+de la semana y se mantiene de un día al siguiente), así que informan también de lo que habrá en j al llegar.
+  [14] out_loads_hoy  — media de min(cargas_hoy[j, l], CLIP) / CLIP sobre F_j
+  [15] out_best_hoy   — clip(max_{l ∈ F_j, cargas_hoy[j, l] > 0} G_hoy[j, l] / p95, −1, 1); 0 si ninguna tiene carga
+  [16] ret_loads_hoy  — min(cargas_hoy[j, h], CLIP) / CLIP: cargas de hoy en la lane de regreso
+  [17] ret_margin_hoy — clip(G_hoy[j, h] / p95, −1, 1)
+  Mismos casos especiales que [8]-[13]: [16]-[17] valen 0 en j == h; [14]-[15] valen 0 si el ciclo termina en j.
+
+Índice de mercado (columna INDEX_COL: [18] con continuación, [6] sin ella):
+  [18] market_index — índice(j, día actual) / desviación del índice histórico (una sola para todos los
                       nodos, calculada en el ajuste). Estado del mercado de salida del nodo j neto del
                       nivel nacional, en desviaciones estándar (market_process.py).
 
 Cotización conjunta (especificacion_fase0_ruteo_pricing.md §4.4; las ÚLTIMAS N_COT_FEATURES columnas, en cero
-fuera del modo cotización). Van al final para que los checkpoints anteriores se carguen con esas columnas en
-cero (transfer_learning._reconcile_state_dict copia las columnas viejas en las primeras posiciones):
-  [15] dispersion   — (p_0.8 − p_0.2) / p_0.5 de la lane i→j, recortada a [0, 1]
-  [16] break_even   — costo / (dist · p_0.5): qué tan cerca está el mínimo rentable de la mediana, en [0, 2] / 2
-  [17] intentos     — cargas de la lane i→j que se pueden cotizar todavía en esta visita / COTIZACIONES_MAX_POR_NODO
+fuera del modo cotización):
+  [19] dispersion   — (p_0.8 − p_0.2) / p_0.5 de la lane i→j, recortada a [0, 1]
+  [20] break_even   — costo / (dist · p_0.5): qué tan cerca está el mínimo rentable de la mediana, en [0, 2] / 2
+  [21] intentos     — cargas de la lane i→j que se pueden cotizar todavía en esta visita / COTIZACIONES_MAX_POR_NODO
                       (> 0 si y solo si se puede cotizar)
-  [18 … 17+K]       — v_k = P_k·(p_k·d − c) / p95: valor esperado de cotizar cada nivel, recortado a [−1, 1]
-  [18+K … 17+2K]    — P_k = (1 − u_k)^m: probabilidad de ganar con cada nivel
-  [18+2K]           — valor de la lane con todos sus intentos (pricing.valor_reintentos) si perderlos vale 0, / p95
-  [19+2K]           — lo mismo si perderlos es recorrer la lane vacía (la vuelta): base −c
+  [22 … 21+K]       — v_k = P_k·(p_k·d − c) / p95: valor esperado de cotizar cada nivel, recortado a [−1, 1]
+  [22+K … 21+2K]    — P_k = (1 − u_k)^m: probabilidad de ganar con cada nivel
+  [22+2K]           — valor de la lane con todos sus intentos (pricing.valor_reintentos) si perderlos vale 0, / p95
+  [23+2K]           — lo mismo si perderlos es recorrer la lane vacía (la vuelta): base −c
   Las de [18] en adelante son 0 si la lane no se puede cotizar. Las columnas de cotización entran también a la
   cabeza de precio (model/decoder.PriceHead), que así ve el valor de cada nivel y no solo el embedding.
   Las features [0] y [5] ya son, en ese modo, el margen si se cobrara la mediana (env.reward_rows).
@@ -88,7 +98,7 @@ from routing_env import fin_espera
 
 # Número de features por nodo — debe coincidir con build_node_features_batch()
 N_BASE_NODE_FEATURES  = 6
-N_CONT_FEATURES       = 8   # home_time, slack_after + 6 estadísticas de las lanes que salen de j
+N_CONT_FEATURES       = 12  # home_time, slack_after + 6 estadísticas de las lanes que salen de j + 4 del tablero de hoy
 N_INDEX_FEATURES      = 1   # índice de mercado (columna INDEX_COL)
 N_COT_FEATURES        = 3 + 2 * N_NIVELES + 2   # cotización conjunta: las últimas columnas
 COT_V = slice(3, 3 + N_NIVELES)                              # dentro de las de cotización: v_k
@@ -122,11 +132,14 @@ def build_continuation_features_batch(
     est,                               # EstadisticasLane en el dispositivo (EstadisticasLane.a(device))
     max_duration:      float,
     reward_global_p95: float,
+    cargas_hoy:        torch.Tensor,   # (B, N, N) cargas publicadas hoy en cada lane (env.cargas_hoy)
+    margen_hoy:        torch.Tensor,   # (B, N, N) margen de cada lane a la mediana de hoy, USD (env.margen_hoy)
 ) -> torch.Tensor:                     # (B, N, N_CONT_FEATURES) float32
     """Features de continuación por nodo j (ver docstring del módulo), sin loops sobre B ni N.
 
-    Las 6 últimas son estadísticas (por día de la semana de llegada a j) de las lanes que SALEN de j: la red no ve
-    esas lanes en ninguna otra entrada, porque sus features describen solo las lanes que salen del nodo actual i.
+    [2]-[7] son estadísticas (por día de la semana de llegada a j) de las lanes que SALEN de j: la red no ve esas lanes
+    en ninguna otra entrada, porque sus features describen solo las lanes que salen del nodo actual i. [8]-[11] son
+    las mismas lanes en el tablero de hoy.
     """
     N    = T.shape[0]
     i, h = current_node, start_node
@@ -169,15 +182,31 @@ def build_continuation_features_batch(
     out_fact  = n_fact.float() / max(N, 1)
     m_j = (torch.log(est.M[dow_j, jx].clamp_min(1.0)) / np.log(max(COMPETENCIA_M_MAX, 1.0 + 1e-9))).clamp(0.0, 1.0)
 
+    # Tablero de hoy: las mismas lanes (F_j y la de regreso) con las cargas y el margen publicados hoy.
+    c_hoy = cargas_hoy.float().clamp(max=LOADS_EXPECTED_CLIP) / LOADS_EXPECTED_CLIP          # (B, N, N)
+    g_hoy = (margen_hoy.double() / p95).clamp(-1.0, 1.0)                                    # (B, N, N)
+    out_loads_hoy = torch.where(hay, torch.where(F, c_hoy, torch.zeros_like(c_hoy)).sum(dim=2) / n_fact.clamp_min(1),
+                                torch.zeros_like(valor))
+    con_carga = F & (cargas_hoy > 0)
+    out_best_hoy = torch.where(con_carga, g_hoy, torch.full((), float("-inf"), dtype=g_hoy.dtype,
+                                                            device=T.device)).amax(dim=2)
+    out_best_hoy = torch.where(con_carga.any(dim=2), out_best_hoy, torch.zeros_like(out_best_hoy))
+    col_h = h[:, None, None].expand(-1, N, 1)                                               # lane j → casa
+    ret_loads_hoy = c_hoy.gather(2, col_h).squeeze(2)
+    ret_margin_hoy = g_hoy.gather(2, col_h).squeeze(2)
+
     # j == h es volver a casa: la lane de regreso no existe y el ciclo termina (sin salientes). La espera en casa antes de
     # salir (j == i == h) sí conserva las salientes de mañana. La holgura [7] se conserva en ambos casos.
     termina = is_h & ~is_i
     def cero(x, msk):
         return torch.where(msk, torch.zeros_like(x), x)
-    ret_margin, ret_loads = cero(ret_margin, is_h), cero(ret_loads, is_h)
-    out_best, out_loads, out_fact, m_j = (cero(x, termina) for x in (out_best, out_loads, out_fact, m_j))
+    ret_margin, ret_loads, ret_loads_hoy, ret_margin_hoy = (cero(x, is_h) for x in (ret_margin, ret_loads,
+                                                                                    ret_loads_hoy, ret_margin_hoy))
+    out_best, out_loads, out_fact, m_j, out_loads_hoy, out_best_hoy = (
+        cero(x, termina) for x in (out_best, out_loads, out_fact, m_j, out_loads_hoy, out_best_hoy))
 
-    return torch.stack([home_time.float(), slack.float(), ret_margin, ret_loads, out_best, out_loads, out_fact, m_j],
+    return torch.stack([home_time.float(), slack.float(), ret_margin, ret_loads, out_best, out_loads, out_fact, m_j,
+                        out_loads_hoy.float(), out_best_hoy.float(), ret_loads_hoy.float(), ret_margin_hoy.float()],
                        dim=-1).float()
 
 
@@ -433,12 +462,15 @@ def build_node_features_batch(
     market_index:      torch.Tensor,   # (B, N) índice de mercado de todos los nodos en el día actual (env.market_index)
     index_std:         float,          # desviación del índice histórico (env.index_std)
     cotizacion_feats:  torch.Tensor = None,   # (B, N, N_COT_FEATURES); None ⇒ esas columnas en cero (tests)
+    cargas_hoy:        torch.Tensor = None,   # (B, N, N) env.cargas_hoy (tablero de hoy; requerido con continuación)
+    margen_hoy:        torch.Tensor = None,   # (B, N, N) env.margen_hoy
 ) -> torch.Tensor:                     # (B, N, N_NODE_FEATURES) float32
     """Matriz (N, N_NODE_FEATURES) de cada uno de los B episodios (ver el docstring del módulo), sin loops."""
     B, N = reward_rows.shape
     dev = reward_rows.device
-    if USE_CONTINUATION_FEATURES and est is None:
-        raise ValueError("USE_CONTINUATION_FEATURES requiere est (MarketProcess.estadisticas_dow(...).a(device))")
+    if USE_CONTINUATION_FEATURES and (est is None or cargas_hoy is None or margen_hoy is None):
+        raise ValueError("USE_CONTINUATION_FEATURES requiere est (MarketProcess.estadisticas_dow(...).a(device)) y el "
+                         "tablero de hoy (env.cargas_hoy, env.margen_hoy)")
     filas = torch.arange(B, device=dev)
 
     # f0 (margen a la mediana) y f5 (el mismo en escala absoluta), recortados para evitar desbordes.
@@ -465,7 +497,7 @@ def build_node_features_batch(
     partes = [torch.stack([f0, f1, f2, f3, f4, f5], dim=-1)]
     if USE_CONTINUATION_FEATURES:
         partes.append(build_continuation_features_batch(current_node, start_node, time_elapsed, dow0, T, est,
-                                                        max_duration, reward_global_p95))
+                                                        max_duration, reward_global_p95, cargas_hoy, margen_hoy))
     partes.append((market_index.double() / max(float(index_std), 1e-12)).float()[..., None])
     partes.append(cotizacion_feats if cotizacion_feats is not None
                   else torch.zeros(B, N, N_COT_FEATURES, dtype=torch.float32, device=dev))

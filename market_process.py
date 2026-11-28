@@ -47,7 +47,7 @@ import numpy as np
 import torch
 
 from config import (
-    TRAIN_DAYS, U_NIVELES, COMPETENCIA_KAPPA, COMPETENCIA_M_MAX, COTIZACIONES_MAX_POR_NODO,
+    TRAIN_DAYS, U_NIVELES, COMPETENCIA_KAPPA, COMPETENCIA_M_MAX, COTIZACIONES_MAX_POR_NODO, periodos,
 )
 from fit_market_process import (
     params_path, estimar_m, indice_observado, dia_de_semana as _dia_de_semana_fi,
@@ -60,7 +60,12 @@ from pricing import (
 from problem_data import cargar_dias_mercado
 
 _CLAVES_AJUSTE = ("f_w", "grupo_lane", "cortes_grupo", "r", "media_lane", "lento_escenarios",
-                  "rho", "sigma", "indice_std", "frac_var_lento", "s_delta")
+                  "rho", "sigma", "indice_std", "frac_var_lento", "s_delta", "train_days")
+
+
+def _ajuste_vigente(z) -> bool:
+    """True si el .npz abierto `z` trae todas las claves del ajuste y se ajustó con los TRAIN_DAYS actuales."""
+    return all(k in z.files for k in _CLAVES_AJUSTE) and int(z["train_days"]) == TRAIN_DAYS
 _COLS_Q = ("min", "q1", "q2", "q3", "p90", "max")
 
 
@@ -139,6 +144,9 @@ class MarketProcess:
             if falta:
                 raise ValueError(f"{path} es de un ajuste anterior (faltan {falta}). "
                                  "Corre `python fit_market_process.py`.")
+            if not _ajuste_vigente(z):
+                raise ValueError(f"{path} se ajustó con {int(z['train_days'])} días de entrenamiento y TRAIN_DAYS = "
+                                 f"{TRAIN_DAYS}. Corre `python fit_market_process.py`.")
             n_total = z["grupo_lane"].shape[0]
             if num_nodes > n_total:
                 raise ValueError(f"num_nodes={num_nodes} excede los {n_total} nodos ajustados")
@@ -188,7 +196,9 @@ class MarketProcess:
         self.mean_rate = dias["mean"][:, :n, :n].astype(np.float64)    # (D, N, N) — tarifa media diaria
         self.count_loads = count_loads_full[:, :n, :n]                 # (D, N, N) — cargas publicadas
 
-        self._m_stack = estimar_m(self.count_loads, dow, self.f_w)
+        # Media del generador de cada lane-día, calculada dentro de cada período (entrenamiento, validación, prueba):
+        # la ventana de ±3 días no cruza de un período a otro.
+        self._m_stack = estimar_m(self.count_loads, dow, self.f_w, por_periodo=True)
 
         # ── Índice de mercado observado en TODOS los días reales (train y prueba) ──
         # Se calcula a escala completa (194 nodos): el nivel nacional que se resta (Fase 3) es el
@@ -208,6 +218,13 @@ class MarketProcess:
         self._dias_train_por_dow = [np.flatnonzero(dow_train == k) for k in range(7)]
 
     # ── utilidades ───────────────────────────────────────────────────────────
+
+    def periodo(self, nombre: str) -> tuple:
+        """(día inicial, día final exclusivo) del período "train", "val" o "test" (config.periodos)."""
+        ini, fin = periodos(self.num_dias_total)[nombre]
+        if fin <= ini:
+            raise ValueError(f"el período {nombre!r} no tiene días en el histórico ({self.num_dias_total} días)")
+        return ini, fin
 
     def dia_semana(self, dias) -> np.ndarray:
         """Día de la semana (lunes = 0) de los índices de día `dias`."""
@@ -375,9 +392,9 @@ def asegurar_parametros() -> None:
     anterior (sin alguno de los parámetros que necesita el generador nuevo)."""
     if os.path.exists(params_path()):
         with np.load(params_path()) as z:
-            if all(k in z.files for k in _CLAVES_AJUSTE):
+            if _ajuste_vigente(z):
                 return
-        print("market_params.npz no corresponde al ajuste actual: reajustando...")
+        print("market_params.npz no corresponde al ajuste actual (claves o TRAIN_DAYS): reajustando...")
     else:
         print("market_params.npz no existe: corriendo el ajuste del proceso exógeno...")
     _ajustar()

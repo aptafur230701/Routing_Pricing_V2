@@ -47,6 +47,7 @@ from config import (
     CKPT_SELECTION, CKPT_WINDOW, USE_LR_COSINE, LR_FINAL_FRAC, hp,
     PPO_ENTROPY_COEF_PRECIO_START, PPO_ENTROPY_COEF_PRECIO_END,
     RESUME_CADA_UPDATES, RESUME_CADA_MIN,
+    REWARD_SCALE_FACTOR, CRITIC_N_LAYERS,
 )
 from routing_env import VectorRoutingEnv, OPCION_VACIO
 from greedy_rollout import EntradasAgente, greedy_rollout, construir_features
@@ -101,13 +102,15 @@ def _k_codigo(k_list) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _forward(agent, critic, feats_t: dict, mask_t, actions_t=None, opcion_t=None, n_muestra=None):
-    """encoder → context → decoder → critic para un batch, con la acción (destino, opción de precio).
+    """encoder → context → decoder del actor, y el crítico (con su propio encoder) para un batch, con la acción
+    (destino, opción de precio).
 
     feats_t : tensores node_feats, temporal, market, budget, dow, cot, opciones y current_node. Si actions_t es None
     samplea (recolección); si no, evalúa las acciones almacenadas (actualización PPO).
     n_muestra : solo en la recolección. None ⇒ samplean todas las filas; un entero ⇒ samplean las primeras
-    n_muestra y el resto toma el argmax (decoder.act_mixto); log π y las entropías son solo de las muestreadas.
-    Retorna (destino, opción, log π(j, o), H_destino, H_precio, V(s)).
+    n_muestra y el resto toma el argmax (decoder.act_mixto); log π, las entropías y V(s) son solo de las muestreadas.
+    Retorna (destino, opción, log π(j, o), H_destino, H_precio, V(s), (W, L)); (W, L) (batch, 2) es la continuación de
+    la cabeza de precio para la acción evaluada (None en la recolección).
     """
     nf = feats_t["node_feats"]
     B = nf.shape[0]
@@ -117,8 +120,14 @@ def _forward(agent, critic, feats_t: dict, mask_t, actions_t=None, opcion_t=None
     h_t = agent.context_net(graph_emb, current_emb, feats_t["temporal"], feats_t["market"], feats_t["budget"],
                             feats_t["dow"], feats_t["cot"])
     check_tensor("context h_t", h_t)
-    values = critic(h_t)
+    if n_muestra is None:
+        values = critic(feats_t)
+    elif n_muestra > 0:                                                        # el greedy no necesita V(s)
+        values = critic({k: x[:n_muestra] for k, x in feats_t.items()})
+    else:                                                                      # solo quedan filas greedy activas
+        values = nf.new_zeros(0)
     cot = nf[..., COT_COLS]                                                    # entra también a la cabeza de precio
+    wl = None
     if actions_t is None and n_muestra is not None:
         actions, opcion, log_probs, h_dest, h_precio = agent.decoder.act_mixto(
             h_t, embeddings, mask_t, feats_t["opciones"], cot, n_muestra)
@@ -126,11 +135,11 @@ def _forward(agent, critic, feats_t: dict, mask_t, actions_t=None, opcion_t=None
         actions, opcion, log_probs, h_dest, h_precio = agent.decoder.act_cotizacion(
             h_t, embeddings, mask_t, feats_t["opciones"], cot)
     else:
-        log_probs, h_dest, h_precio = agent.decoder.evaluate_cotizacion(
+        log_probs, h_dest, h_precio, wl = agent.decoder.evaluate_cotizacion(
             h_t, embeddings, mask_t, feats_t["opciones"], cot, actions_t, opcion_t)
         actions, opcion = actions_t, opcion_t
     check_tensor("log_probs", log_probs)
-    return actions, opcion, log_probs, h_dest, h_precio, values
+    return actions, opcion, log_probs, h_dest, h_precio, values, wl
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,25 +172,25 @@ _FASES_ORDEN = ("mundos", "rollout", "gae", "ppo", "validacion")   # "rollout" i
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ValidacionSimulada:
-    """Validación del greedy en episodios fijos de mundos simulados.
+    """Validación del greedy en episodios fijos de mundos simulados del período de VALIDACIÓN (septiembre).
 
-    Un conjunto fijo de episodios (nodo, día de la semana y día de salida balanceados, con la semilla
-    propia MARKET_SEED_VAL) se sortea UNA vez en el dispositivo y se evalúa por cada nivel de K de
+    Un conjunto fijo de episodios (nodo, día de la semana y día de salida balanceados, con salida en el período de
+    validación y la semilla propia MARKET_SEED_VAL) se sortea UNA vez en el dispositivo y se evalúa por cada nivel de K de
     K_TRAINING_LEVELS en una sola llamada batcheada de greedy_rollout. Reporta el margen en USD (suma del reward
     de cada lane con el precio cotizado), la validez, la tasa de aceptación y el nivel medio cotizado.
     Es observacional: no afecta los gradientes ni el RNG global.
 
-    No calcula B3 ni UB-DP: el entrenamiento no puede depender de la tabla de la DP (a 75-100 nodos
+    No calcula B3: el entrenamiento no puede depender de la tabla de la DP (a 75-100 nodos
     puede no ser tratable). Las comparaciones contra los baselines son de la evaluación final.
     """
 
-    def __init__(self, market_process, env: VectorRoutingEnv, entradas: EntradasAgente, num_dias: int, num_nodes: int):
+    def __init__(self, market_process, env: VectorRoutingEnv, entradas: EntradasAgente, num_nodes: int):
         M = get_val_worlds(num_nodes)
-        dis = disenar_mundos(num_nodes, M, market_process, num_dias=num_dias, semilla=MARKET_SEED_VAL)
+        dis = disenar_mundos(num_nodes, M, market_process, periodo="val", semilla=MARKET_SEED_VAL)
         self.niveles = list(K_TRAINING_LEVELS)
         self.M = M
         g = torch.Generator(device=env.device).manual_seed(MARKET_SEED_VAL)
-        base = market_process.sortear_mundos(dis["start_day"], MARKET_DIAS_EPISODIO, num_dias - 1, g)
+        base = market_process.sortear_mundos(dis["start_day"], MARKET_DIAS_EPISODIO, dis["dia_max"], g)
         self.mundos = base.tomar(np.tile(np.arange(M), len(self.niveles)))
         self.nodos = np.tile(dis["nodo"], len(self.niveles))
         self.k_arr = [K for K in self.niveles for _ in range(M)]
@@ -246,7 +255,7 @@ def _rollout(agent, critic, env, mundos, start_nodes, k_list, entradas, con_gree
         idx = idx_cpu.to(dev)
         feats = {k: x[idx] for k, x in construir_features(env, entradas).items()}
         m = masks[idx]
-        a, o, lp, _, _, v = _forward(agent, critic, feats, m, n_muestra=n_s)
+        a, o, lp, _, _, v, _ = _forward(agent, critic, feats, m, n_muestra=n_s)
         acciones = torch.zeros(n_filas, dtype=torch.long, device=dev)            # inactivas: acción ficticia válida
         opciones = torch.full((n_filas,), OPCION_VACIO, dtype=torch.long, device=dev)
         acciones[idx] = a
@@ -259,7 +268,8 @@ def _rollout(agent, critic, env, mundos, start_nodes, k_list, entradas, con_gree
         for k, x in (("mask", m), ("action", a), ("opcion", o), ("value", v)):
             trans[k].append(x[:n_s])
         trans["log_prob"].append(lp)
-        for k, x in (("reward", rewards), ("done", terminated), ("time_violation", env.last_time_violation),
+        for k, x in (("reward", rewards), ("raw", env.last_raw_reward), ("done", terminated),
+                     ("time_violation", env.last_time_violation),
                      ("viajo", ~(env.last_cotizo & ~env.last_gano) & ~env.last_espero),
                      ("cotizo", env.last_cotizo), ("gano", env.last_gano)):
             trans[k].append(x[ids])
@@ -276,8 +286,9 @@ def _rollout(agent, critic, env, mundos, start_nodes, k_list, entradas, con_gree
 
 
 def _gae(tr: dict, B: int, gamma: float, lam: float) -> tuple:
-    """Ventajas y retornos con GAE, vectorizado sobre los B episodios. Las transiciones de un episodio ocupan los
-    pasos 0 … len−1 sin huecos (la fila está activa hasta que termina) y el valor después del último es 0."""
+    """Ventajas, retornos (λ-retornos) y el retorno del estado SIGUIENTE de cada transición, con GAE, vectorizado
+    sobre los B episodios. Las transiciones de un episodio ocupan los pasos 0 … len−1 sin huecos (la fila está activa
+    hasta que termina) y el valor después del último es 0 (también su retorno siguiente)."""
     dev = tr["reward"].device
     P = int(tr["t"].max()) + 1
     R = torch.zeros(B, P + 1, device=dev)
@@ -292,7 +303,8 @@ def _gae(tr: dict, B: int, gamma: float, lam: float) -> tuple:
         delta = R[:, t] + gamma * V[:, t + 1] * sig - V[:, t]
         adv[:, t] = delta + gamma * lam * adv[:, t + 1] * sig
     ventajas = adv[tr["ep"], tr["t"]]
-    return ventajas, ventajas + tr["value"].float()
+    ret_grid = (adv + V) * hay.float()                                       # 0 donde no hay transición
+    return ventajas, ventajas + tr["value"].float(), ret_grid[tr["ep"], tr["t"] + 1]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -335,7 +347,7 @@ def run_am_training(
     market_process,                           # MarketProcess: cada episodio es un mundo simulado del proceso exógeno
     avail_expected_arr: np.ndarray = None,    # [num_nodes, num_nodes] E[loads] histórico (feature avail_prior)
     reward_global_p95: float      = 1.0,
-    num_dias:       int = TRAIN_DAYS,         # días de entrenamiento (los mundos solo usan esos días)
+    num_dias:       int = TRAIN_DAYS,         # días de entrenamiento (los mundos solo usan esos días: jun–ago)
     pretrained_agent:  AMRoutingAgent = None,
     pretrained_critic: CriticHead     = None,
     best_checkpoint_path: str = None,  # ruta donde se guarda el update con mejor margen de validación; None = no se guarda
@@ -380,23 +392,33 @@ def run_am_training(
 
     n_updates      = get_n_updates(num_nodes)
     total_episodes = n_updates * n_episodes_per_update
-    num_train_days = min(int(num_dias), market_process.num_dias_total)
+    num_train_days = min(int(num_dias), TRAIN_DAYS)     # nunca más allá del período de entrenamiento
 
     # ── Modelos ───────────────────────────────────────────────────────────────
     agent  = pretrained_agent  if pretrained_agent  is not None \
              else AMRoutingAgent(num_nodes, d_h, n_heads, n_layers, d_ff, device=DEVICE,
                                  pre_norm=AM_PRE_NORM, dropout=AM_DROPOUT)
-    critic = pretrained_critic if pretrained_critic is not None else CriticHead(d_h).to(DEVICE)
+    critic = pretrained_critic if pretrained_critic is not None \
+             else CriticHead(d_h, n_heads, CRITIC_N_LAYERS, d_ff, pre_norm=AM_PRE_NORM,
+                             dropout=AM_DROPOUT).to(DEVICE)
     agent.to(DEVICE)
     critic.to(DEVICE)
 
-    # Optimizers separados: el critic converge más rápido (lr 10x). Actor con AdamW (weight_decay es el regularizador
-    # PPO-safe primario); critic con Adam puro.
-    actor_params = list(agent.parameters())
+    # Optimizers separados. Actor con AdamW (weight_decay es el regularizador PPO-safe primario). El resto se ajusta por
+    # regresión, con Adam puro: el crítico (su encoder al LR del actor, su MLP final 10× más rápido, como antes) y la
+    # cabeza de continuación (W, L) de la cabeza de precio, que sale del actor (no la mueve el gradiente de política).
+    delta_params = list(agent.decoder.precio.delta.parameters())
+    ids_delta = {id(p) for p in delta_params}
+    actor_params = [p for p in agent.parameters() if id(p) not in ids_delta]
+    regresion_params = list(critic.parameters()) + delta_params
     # fused: un solo kernel por paso del optimizador en la GPU (mismo algoritmo; en CPU no aplica).
     fused = DEVICE.type == "cuda"
     actor_optimizer  = torch.optim.AdamW(actor_params, lr=lr, weight_decay=PPO_WEIGHT_DECAY, fused=fused)
-    critic_optimizer = torch.optim.Adam(critic.parameters(), lr=lr * 10, fused=fused)
+    critic_optimizer = torch.optim.Adam([
+        {"params": critic.parametros_encoder(), "lr": lr},
+        {"params": critic.parametros_cabeza(), "lr": lr * 10},
+        {"params": delta_params, "lr": lr * 10},
+    ], lr=lr * 10, fused=fused)
 
     # LR con decaimiento coseno: cada LR baja desde su valor inicial hasta LR_FINAL_FRAC de ese valor
     # al terminar n_updates (un scheduler.step() al final de cada update).
@@ -411,7 +433,7 @@ def run_am_training(
         est_lane = market_process.estadisticas_dow(distance_arr, diesel_arr)
     env = VectorRoutingEnv(time_matrix, distance_arr, diesel_arr, market_process, device=DEVICE)
     entradas = EntradasAgente.crear(env, avail_expected_arr, est_lane, reward_global_p95)
-    val = ValidacionSimulada(market_process, env, entradas, num_train_days, num_nodes)
+    val = ValidacionSimulada(market_process, env, entradas, num_nodes)
     gen_mundos = torch.Generator(device=DEVICE).manual_seed(MARKET_SEED_TRAIN)   # mundos de entrenamiento
     n_salida = dias_de_salida(num_train_days)
 
@@ -419,7 +441,7 @@ def run_am_training(
           f"({n_updates} updates × {n_episodes_per_update} ep/update) ---")
     print("Mercado: realizaciones diarias — cada episodio sortea una vez hub inicial, día real inicial y "
           "corrimiento de nivel δ.")
-    print(f"Validación: {val.M} episodios fijos (semilla {MARKET_SEED_VAL}) × K∈"
+    print(f"Validación: {val.M} episodios fijos con salida en septiembre (semilla {MARKET_SEED_VAL}) × K∈"
           f"{{{', '.join('libre' if K is None else str(K) for K in val.niveles)}}}")
 
     best_score = -np.inf
@@ -441,6 +463,7 @@ def run_am_training(
         "k_niveles": ["libre" if k is None else int(k) for k in K_TRAINING_LEVELS],
         "seed": int(SEED), "market_seed_train": int(MARKET_SEED_TRAIN), "num_train_days": int(num_train_days),
         "device": DEVICE.type, "arquitectura": {k: tuple(v.shape) for k, v in agent.state_dict().items()},
+        "arquitectura_critico": {k: tuple(v.shape) for k, v in critic.state_dict().items()},
     }
     t_previo = 0.0                # segundos de sesiones anteriores
     start_update = 0
@@ -526,8 +549,13 @@ def run_am_training(
                                     con_greedy=USE_SELF_CRITICAL)
 
         with fases("gae"):
-            ventajas, retornos = _gae(tr, B, gamma, gae_lambda)
+            ventajas, retornos, ret_sig = _gae(tr, B, gamma, gae_lambda)
             ep, dev = tr["ep"], tr["reward"].device
+            # Objetivo de la continuación (W, L) de la cabeza de precio, en unidades de p95: lo que vino después del
+            # tramo en la rama que ocurrió (ganar o perder). Es el reward del paso sin el margen de la lane (queda la
+            # penalización si la hubo) más el λ-retorno del estado siguiente; solo cuenta en las cotizaciones.
+            y_cont = ((tr["reward"].float() - tr["raw"].float() / REWARD_SCALE_FACTOR + ret_sig)
+                      * (REWARD_SCALE_FACTOR / max(float(reward_global_p95), 1e-6)))
             n_tr = ep.numel()
             r_ep = torch.zeros(B, device=dev).index_add_(0, ep, tr["reward"].float())
             n_pasos_ep = torch.zeros(B, dtype=torch.long, device=dev).index_add_(0, ep, torch.ones_like(ep))
@@ -556,11 +584,15 @@ def run_am_training(
                     # Normalización por mini-batch (media 0, std 1) y recorte de ventajas extremas.
                     adv_b = ((adv_b - adv_b.mean()) / (adv_b.std(unbiased=False) + 1e-8)).clamp(-5.0, 5.0)
 
-                    _, _, new_lp, entropy, entropy_precio, new_val = _forward(
+                    _, _, new_lp, entropy, entropy_precio, new_val, wl = _forward(
                         agent, critic, feats_b, tr["mask"][idx], actions_t=tr["action"][idx], opcion_t=tr["opcion"][idx])
                     ratio = torch.exp(new_lp - old_lp)
                     actor_loss = -torch.min(ratio * adv_b, ratio.clamp(1 - clip_eps, 1 + clip_eps) * adv_b).mean()
                     value_loss = nn.functional.mse_loss(new_val, ret_b)
+                    # Pérdida auxiliar de Δ: regresión de W (si se ganó) o L (si se perdió) sobre lo realizado.
+                    cot_b = tr["cotizo"][idx].float()
+                    pred = torch.where(tr["gano"][idx], wl[:, 0], wl[:, 1])
+                    delta_loss = ((pred - y_cont[idx]) ** 2 * cot_b).sum() / cot_b.sum().clamp_min(1.0)
                     # Entropía del destino y de la cabeza de precio, cada una con su coeficiente.
                     actor_loss_total = (actor_loss - entropy_coef * entropy.mean()
                                         - entropy_coef_precio * entropy_precio.mean())
@@ -568,28 +600,32 @@ def run_am_training(
                         sc_loss = -(SELF_CRITICAL_COEF * sc_ep[idx] * new_lp).mean()
                         actor_loss_total = actor_loss_total + sc_loss
 
-                    # value_loss también backpropaga hacia el encoder/context_net (h_t no se detacha): un solo
-                    # backward sobre la suma da los mismos gradientes que dos por separado.
+                    # Las tres pérdidas tocan parámetros disjuntos (actor; crítico; cabeza de continuación, que recibe
+                    # sus entradas sin gradiente): un solo backward sobre la suma da lo mismo que tres por separado.
                     actor_optimizer.zero_grad(set_to_none=True)
                     critic_optimizer.zero_grad(set_to_none=True)
-                    (actor_loss_total + value_loss).backward()
+                    (actor_loss_total + value_loss + delta_loss).backward()
                     nn.utils.clip_grad_norm_(actor_params, grad_clip)
                     actor_optimizer.step()
-                    nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
+                    nn.utils.clip_grad_norm_(list(critic.parameters()), grad_clip)
+                    nn.utils.clip_grad_norm_(delta_params, grad_clip)
                     critic_optimizer.step()
 
                     with torch.no_grad():
+                        n_cot_b = cot_b.sum().clamp_min(1.0)
                         fila = torch.stack([(old_lp - new_lp).mean(), ((ratio - 1).abs() > clip_eps).float().mean(),
                                             actor_loss_total.detach(), actor_loss.detach(), value_loss.detach(),
                                             entropy.mean(), entropy_precio.mean(),
-                                            sc_loss.detach() if apply_self_critical else torch.zeros((), device=dev)])
-                    kl, clip_frac, tot, pol, vl, ent, ent_p, scl = fila.tolist()   # una sincronización por minibatch
+                                            sc_loss.detach() if apply_self_critical else torch.zeros((), device=dev),
+                                            delta_loss.detach(), ((wl[:, 0] - wl[:, 1]) * cot_b).sum() / n_cot_b])
+                    kl, clip_frac, tot, pol, vl, ent, ent_p, scl, dl, dm = fila.tolist()   # una sincronización por minibatch
                     stats["kl"].append(kl)
                     stats["clip"].append(clip_frac)
                     if kl > 0.05:
                         kl_too_high = True
                         break
-                    for k, x in (("total", tot), ("pol", pol), ("val", vl), ("ent", ent), ("ent_p", ent_p), ("sc", scl)):
+                    for k, x in (("total", tot), ("pol", pol), ("val", vl), ("ent", ent), ("ent_p", ent_p), ("sc", scl),
+                                 ("delta_loss", dl), ("delta", dm)):
                         stats[k].append(x)
                 if kl_too_high:   # sale también de n_ppo_epochs
                     break
@@ -648,6 +684,10 @@ def run_am_training(
         log_entry["nivel_medio"]         = nivel_medio
         log_entry["cotizaciones_por_ep"] = n_cot / max(n_ep, 1)
         log_entry["rechazos_por_ep"]     = (n_cot - n_gan) / max(n_ep, 1)
+        # Cabeza de continuación del precio: error de la regresión (unidades de p95²) y Δ = W − L medio en las
+        # cotizaciones, en USD.
+        log_entry["delta_loss"]          = media("delta_loss")
+        log_entry["delta_medio_usd"]     = media("delta") * float(reward_global_p95)
 
         stop_now = False
         log_freq = max(1, n_updates // 20)
@@ -712,7 +752,8 @@ def run_am_training(
                   f"| nivel medio={log_entry['nivel_medio']:.1f} "
                   f"| cotizaciones/ep={log_entry['cotizaciones_por_ep']:.2f} "
                   f"| rechazos/ep={log_entry['rechazos_por_ep']:.2f} "
-                  f"| entropía precio={log_entry['entropy_precio']:.3f}")
+                  f"| entropía precio={log_entry['entropy_precio']:.3f} "
+                  f"| Δ medio={log_entry['delta_medio_usd']:.0f}usd (mse {log_entry['delta_loss']:.3f})")
             partes = []
             for lvl in K_TRAINING_LEVELS:
                 d = k_diagnostics.get("free" if lvl is None else str(lvl))

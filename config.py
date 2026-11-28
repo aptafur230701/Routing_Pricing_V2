@@ -66,6 +66,8 @@ AM_D_H      = 192  # Dimensión de embeddings del Transformer. Subido de 128: la
 AM_N_HEADS  = 8    # Número de cabezas de atención en el Transformer (192/8=24, exacto)
 AM_N_LAYERS = 4    # Número de capas del encoder Transformer. Subido de 3 junto con AM_D_H.
 AM_D_FF     = 768  # Dimensión de la capa feed-forward. Mantiene la proporción 4×AM_D_H.
+CRITIC_N_LAYERS = 2  # Capas del encoder PROPIO del crítico (model/critic_head.py; el resto, como el actor). La mitad que el
+                     # actor: el encoder es lo que más cuesta en cada update y el crítico solo tiene que estimar un escalar.
 AM_PRE_NORM = True  # Pre-norm (True) vs post-norm (False) en TransformerEncoderLayer.
                     # Ablacionable: False reproduce el comportamiento post-norm anterior.
 AM_DROPOUT  = 0.0   # Dropout en las sublayers del encoder (nunca en el path de logits del
@@ -111,7 +113,7 @@ U_NIVELES = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)   # p10 … p90: ning�
 COMPETENCIA_KAPPA = 1.0    # m = clip(1 + κ · LTR_REF / LTR, 1, M_MAX); sensibilidad κ ∈ {0.5, 1, 2} (entrenado con 1)
 COMPETENCIA_M_MAX = 20.0   # tope de competidores efectivos (con LTR ≈ 0.8, p5 del train, m sin tope sería ≈ 33)
 # LTR_REF no es constante: es la mediana del LTR por hub y día en los días de train (los 194 hubs, así no depende
-# de num_nodes) y la calcula MarketProcess al iniciar (≈ 25.5 con los datos jun-sep 2026).
+# de num_nodes) y la calcula MarketProcess al iniciar (≈ 25.7 con los días de entrenamiento, jun-ago 2026).
 COTIZACION_HORAS = 0.25          # horas que se pierden por cada cotización rechazada (= una franja de la DP)
 COTIZACIONES_MAX_POR_NODO = 4    # rechazos por visita a un nodo (o por día de espera); después solo quedan esperar
 BANDA_PRECIO_MASA = 0.8   # rango de precio por arco (evaluación): niveles contiguos alrededor del elegido que juntan esta probabilidad de la cabeza de precio
@@ -182,14 +184,29 @@ def configurar_k(restringido: bool) -> None:
     K_TRAINING_LEVELS[:] = K_LEVELS + [None]
 
 # ── Features de continuación por nodo ────────────────────────
-USE_CONTINUATION_FEATURES = True   # True: 8 features extra por nodo j (N_NODE_FEATURES = 38 con el índice de mercado) con la
-                                   # información de qué pasa después de j: tiempo y holgura de regreso a casa y
+USE_CONTINUATION_FEATURES = True   # True: 12 features extra por nodo j (N_NODE_FEATURES = 42 con el índice de mercado) con
+                                   # la información de qué pasa después de j: tiempo y holgura de regreso a casa,
                                    # estadísticas por día de la semana de las lanes que salen de j (market_process.
-                                   # EstadisticasLane; ver model/encoder.py). False: las 6 features base.
+                                   # EstadisticasLane) y esas mismas lanes en el tablero de hoy (ver model/encoder.py).
+                                   # False: las 6 features base.
 
-# ── Train / eval split ───────────────────────────────────────
-# jun 1 - sep 30 2026 (122 días) entrenamiento; oct 1-31 2026 (31 días) prueba, fuera de muestra.
-TRAIN_DAYS = 122
+# ── Split temporal: entrenamiento / validación / prueba ──────
+#   entrenamiento  jun 1 – ago 31 2026 (92 días): ajuste del proceso de mercado (fit_market_process), entrenamiento
+#                  del DRL y tablas de los baselines (B2, B2P, B3). Todo lo que se aprende sale de aquí.
+#   validación     sep 1 – sep 30 (30 días): solo para elegir (checkpoint, hiperparámetros de hpo_optuna).
+#   prueba         oct 1 – oct 31 (31 días): solo para reportar (los mundos de evaluación de main.py).
+# Ninguna cantidad de un período usa días de otro: la media de cargas m (ventana de ±3 días) y el día más cercano
+# con cargas de una lane (precios y LTR faltantes) se calculan dentro de cada período (`periodos`).
+TRAIN_DAYS = 92
+VAL_DAYS   = 30
+TEST_START = TRAIN_DAYS + VAL_DAYS     # primer día de prueba (oct 1)
+
+
+def periodos(num_dias_total: int) -> dict:
+    """{"train", "val", "test"} → (día inicial, día final exclusivo) de cada período, recortado a `num_dias_total`."""
+    cortes = [0, TRAIN_DAYS, TEST_START, num_dias_total]
+    cortes = [min(c, num_dias_total) for c in cortes]
+    return {nombre: (cortes[i], cortes[i + 1]) for i, nombre in enumerate(("train", "val", "test"))}
 
 # ── Market signal normalisation clamps ───────────────────────
 LTR_CLIP           = 200.0   # techo seguro para el load_to_truck_ratio diario del hub
@@ -232,13 +249,14 @@ MARKET_SEED_EVAL_FINAL = 777003  # semilla de un segundo conjunto de mundos de e
                                   # distinta de entrenamiento, validación y MARKET_SEED_EVAL. MARKET_SEED_EVAL es el
                                   # conjunto de desarrollo (con él se decidieron cosas, p. ej. el checkpoint); el B se
                                   # usa UNA vez, con la configuración congelada. main.py: EVAL_SET=final.
-MARKET_M_EVAL_WORLDS = 1000 if EN_GPU else 100   # M: nº de mundos de evaluación simulados por nivel de K. Con
-                                # MARKET_SEED_EVAL fija, todas las corridas y baselines ven los MISMOS mundos.
+MARKET_M_EVAL_WORLDS = 1000 if EN_GPU else 100   # M: nº de mundos de evaluación simulados por nivel de K, con
+                                # día de salida en el período de PRUEBA (octubre). Con MARKET_SEED_EVAL fija, todas
+                                # las corridas y baselines ven los MISMOS mundos.
 
 # ── Validación durante el entrenamiento (mundos simulados) ───
-# Mundos fijos con semilla propia (distinta de entrenamiento y de MARKET_SEED_EVAL, para que el
-# reporte final no use mundos con los que se eligió el checkpoint). Se evalúa el greedy del
-# agente en ellos y se compara con B3 / UB-DP; el mejor update por margen se guarda aparte.
+# Mundos fijos con día de salida en el período de VALIDACIÓN (septiembre) y semilla propia (distinta de
+# entrenamiento y de MARKET_SEED_EVAL). Se evalúa el greedy del agente en ellos; el mejor update por margen se guarda
+# aparte. hpo_optuna.py elige los hiperparámetros con estos mismos mundos.
 MARKET_SEED_VAL = 777002
 VAL_CHECKS      = 60      # nº aproximado de chequeos de validación por entrenamiento
 
@@ -260,7 +278,6 @@ UBDP_MAX_NODOS  = 75      # por encima, UB-DP (y B3) no se calcula: se reporta "
                           # (con los dos intentos de cotización el costo crece con N³ · S)
 UBDP_SEED       = 20261018   # semilla del Generator propio de la DP
 UBDP_TABLA_PATH = "datos/ubdp_tabla_{n}nodos.npz"   # relativo a la raíz del proyecto; {n} = nº de nodos
-REPLAY_MAX_CASOS = 300   # tope de casos (nodo, día) del replay por nivel de K; si hay más, se toma un subconjunto balanceado
 BOOTSTRAP_B     = 10000   # remuestreos del intervalo bootstrap de la diferencia pareada
 BOOTSTRAP_SEED  = 20261019
 
@@ -270,7 +287,9 @@ BOOTSTRAP_SEED  = 20261019
 # LR_FINAL_FRAC.
 HP_POR_NODOS = {
     10: {},
-    20: {},   # sin overrides: los hiperparámetros del HPO (hpo_optuna.py) ya están fijos en este archivo
+    20: {"LR_FINAL_FRAC": 0.20},   # el resto, los del HPO (hpo_optuna.py), ya fijos en este archivo. Con 714 updates
+                                   # y el LR al 10 % la validación seguía subiendo al final: más updates y un LR final
+                                   # algo más alto (no es un hiperparámetro del HPO).
     35: {"LR_FINAL_FRAC": 0.30},
     50: {},
     75: {},
@@ -300,10 +319,10 @@ CHECK_TENSORS = os.environ.get("CHECK_TENSORS", "0") == "1"   # True: valida NaN
 
 
 def get_n_updates(num_nodes: int) -> int:
-    """Updates PPO del entrenamiento completo por tamaño (los mismos que daba el presupuesto de episodios anterior
-    con 700 episodios por update). Los episodios totales son n_updates × PPO_N_EPISODES_PER_UPDATE."""
+    """Updates PPO del entrenamiento completo por tamaño. Los episodios totales son n_updates × PPO_N_EPISODES_PER_UPDATE.
+    20 nodos: 2000 (antes 714, que en la GPU de Kaggle eran 37 min y no alcanzaban: la validación seguía subiendo)."""
     if num_nodes <= 10:  return 285
-    if num_nodes <= 20:  return 714
+    if num_nodes <= 20:  return 2000
     if num_nodes <= 35:  return 1300
     if num_nodes <= 50:  return 1000
     if num_nodes <= 75:  return 1070

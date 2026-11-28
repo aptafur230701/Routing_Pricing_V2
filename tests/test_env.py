@@ -365,7 +365,8 @@ def test_mismo_mundo_mismas_acciones_mismo_resultado(d10):
 
 def test_el_tablero_es_el_del_mundo_y_no_depende_de_las_acciones(d10):
     """En cada llegada el entorno lee la fila [b, día − dia0, i] del mundo: cargas y competidores (u → u_comp con el m
-    del día), el índice y el LTR del día y el margen a la mediana; dos políticas distintas ven lo mismo."""
+    del día), el índice y el LTR del día y el margen a la mediana; dos políticas distintas ven lo mismo. El día es el
+    de la visita, aunque los rechazos hayan pasado el reloj al día siguiente."""
     mp, tab = d10.market, d10.market.tensores(DEVICE)
     mundos = mundos_sim(mp, 30, semilla=6)
     for semilla in (1, 2):
@@ -383,9 +384,52 @@ def test_el_tablero_es_el_del_mundo_y_no_depende_de_las_acciones(d10):
                                        d10.diesel[i]).astype(np.float32)
                 esperado[i] = 0.0                                                # self-loop = esperar: margen 0
                 np.testing.assert_array_equal(np_(env.reward_rows[b]), esperado)
-                dow = (int(tab["dow"][int(mundos.dia0[b])]) + int(float(env.time_elapsed[b]) // 14)) % 7
-                assert int(env.current_dow[b]) == dow
+                avance = int(env.dias_desde_salida[b])                       # el día de la visita, no el del reloj
+                assert avance <= int(float(env.time_elapsed[b]) // 14) and dia == min(int(mundos.dia0[b]) + avance,
+                                                                                    mundos.dia_max)
+                assert int(env.current_dow[b]) == (int(tab["dow"][int(mundos.dia0[b])]) + avance) % 7
         correr_al_azar(d10.env(), mundos, np.arange(30) % N, semilla=semilla, al_paso=al_paso)
+
+
+def test_cotizacion_perdida_que_cruza_de_dia_no_cambia_el_dia_de_la_visita():
+    """El camión llega a 1 a las 13.9 h (día 0) y pierde una cotización: el reloj pasa a 14.15 h (día 1), pero el
+    tablero, el día, el día de la semana, el índice, el LTR y el tablero de la red siguen siendo los del día 0. Al
+    esperar se revela el día nuevo."""
+    from market_process import Mundos
+    n, D, C = 3, 6, COTIZACIONES_MAX_POR_NODO
+    s = escenario_sintetico(n)
+    T = np.full((n, n), 13.9)
+    np.fill_diagonal(T, 0.0)
+    mercado = s["mercado"]
+    env = VectorRoutingEnv(T, s["dist"], s["diesel"], mercado, device=DEVICE)
+    loads = torch.zeros((1, D, n, n), dtype=torch.int32, device=DEVICE)
+    for d in range(D):
+        loads[0, d] = d + 1                                                   # cada día, otro número de cargas
+    loads[0, :, torch.arange(n), torch.arange(n)] = 0
+    u = torch.zeros((1, D, n, n, C), device=DEVICE)                           # competidor u = 0: toda cotización pierde
+    mundos = Mundos(loads=loads, u=u, delta=torch.zeros(1, dtype=torch.float64, device=DEVICE),
+                    dia0=torch.zeros(1, dtype=torch.long, device=DEVICE), dia_max=D - 1)
+    env.reset(mundos, [0])
+    tab = mercado.tensores(DEVICE)
+    a = lambda x: torch.tensor([x], device=DEVICE)
+    env.step(a(1), a(OPCION_VACIO))                                           # vacío a 1: llega a las 13.9 h
+    assert float(env.time_elapsed[0]) == pytest.approx(13.9) and int(env.current_day[0]) == 0
+    antes = dict(cargas=np_(env.current_loads_row[0]).copy(), hoy=np_(env.cargas_hoy[0]).copy(),
+                 indice=np_(env.market_index[0]).copy(), dow=int(env.current_dow[0]), ltr=float(env.ltr_actual[0]))
+    env.step(a(2), a(0))                                                      # cotiza 1→2 y pierde
+    assert env.last_cotizo[0] and not env.last_gano[0]
+    assert float(env.time_elapsed[0]) == pytest.approx(13.9 + COTIZACION_HORAS)   # el reloj ya está en el día 1
+    assert int(env.current_day[0]) == 0 and int(env.dias_desde_salida[0]) == 0
+    np.testing.assert_array_equal(np_(env.current_loads_row[0])[[0]], antes["cargas"][[0]])   # lane no cotizada igual
+    np.testing.assert_array_equal(np_(env.cargas_hoy[0]), antes["hoy"])
+    np.testing.assert_array_equal(np_(env.cargas_hoy[0]), np_(loads[0, 0]))
+    np.testing.assert_array_equal(np_(env.market_index[0]), np_(tab["indice"][0]))
+    np.testing.assert_array_equal(np_(env.market_index[0]), antes["indice"])
+    assert int(env.current_dow[0]) == antes["dow"] and float(env.ltr_actual[0]) == antes["ltr"]
+    env.step(a(1), a(OPCION_VACIO))                                           # espera: tablero del día nuevo
+    assert float(env.time_elapsed[0]) == pytest.approx(28.0) and int(env.current_day[0]) == 2
+    np.testing.assert_array_equal(np_(env.current_loads_row[0]), np_(loads[0, 2, 1]))
+    np.testing.assert_array_equal(np_(env.cargas_hoy[0]), np_(loads[0, 2]))
 
 
 def test_replay_con_las_cargas_reales(d10):

@@ -5,7 +5,8 @@ Entry point for the AM-PPO pipeline.
 
   1. Load data          (problem_data.py)
   2. Training           (am_training.py, con los hiperparámetros PPO fijos de config.py)
-  3. Evaluation         (evaluation.py: mundos simulados + replay; DRL, baselines B1-B3 y B2P, UB-PI, UB-DP)
+  3. Evaluation         (evaluation.py: mundos simulados con salida en el período de prueba, octubre; DRL,
+                         baselines B1-B3 y B2P, cota UB-PI)
   4. Save results       (Excel con hojas Resumen y Comparación + mundos_AM.csv con los datos por mundo)
   5. Validación del precio (validate_pricing.py: results/<N>nodes/pricing_val/)
 
@@ -52,12 +53,12 @@ from config import (
 from problem_data import load_matrices
 from baselines.dp_relajada import cargar_o_calcular_tabla
 from evaluation import (
-    evaluar_mundos_simulados, evaluar_replay, imprimir_resumen,
+    evaluar_mundos_simulados, imprimir_resumen,
     save_results, plot_diagnostics, plot_ppo_diagnostics,
 )
 from market_process import MarketProcess, asegurar_parametros
 from excel_report import guardar_mundos, agregar_rutas_y_precios
-from stats_analysis import append_comparacion_to_excel, comparar_con_baselines, FAMILIAS, NOTA_REPLAY
+from stats_analysis import append_comparacion_to_excel, comparar_con_baselines, FAMILIAS
 from transfer_learning import (
     NODE_SEQUENCE, build_agent_for_training, load_checkpoint_compatible,
 )
@@ -158,11 +159,11 @@ def _evaluate_and_report(
     avail_expected_arr=None, reward_global_p95=1.0, market_process=None,
     semilla_eval=MARKET_SEED_EVAL, sufijo_cache="",
 ):
-    """Evaluación en mundos simulados y replay + resumen + guardado de archivos.
+    """Evaluación en los mundos de prueba + resumen + guardado de archivos.
 
-    Mundos simulados: DRL, B1, B2, B2P y B3 sobre M mundos por nivel de K, con UB-PI y
-    UB-DP. Replay: el mismo arnés sobre los días reales de evaluación (TRAIN_DAYS en adelante),
-    fuera de muestra: ni el entrenamiento ni el ajuste del proceso exógeno usaron esos días.
+    DRL, B1, B2, B2P y B3 sobre M mundos simulados por nivel de K, con día de salida en el período de prueba
+    (octubre) y la cota UB-PI. Ni el ajuste del proceso, ni el entrenamiento, ni las tablas de los baselines, ni la
+    elección del checkpoint usaron esos días.
     """
     # Antes de evaluar (decenas de minutos): los archivos de salida tienen que poderse sobrescribir. En Windows
     # un Excel abierto bloquea el archivo y la evaluación se perdería al final.
@@ -173,54 +174,46 @@ def _evaluate_and_report(
                 open(ruta, "r+b").close()
             except PermissionError:
                 raise PermissionError(f"{ruta} está abierto en otro programa (¿Excel?): ciérralo y vuelve a correr")
-    # La tabla solo calcula los K que se evalúan: con K libre (K_RESTRINGIDO = False) es un solo barrido
-    # (K = 0) en vez de K = 1…K_MAX más el libre.
+    # La tabla de B3 sale solo de los días de entrenamiento (como el DRL). Solo calcula los K que se evalúan: con K
+    # libre (K_RESTRINGIDO = False) es un solo barrido (K = 0) en vez de K = 1…K_MAX más el libre.
     k_tabla = max([k for k in K_TRAINING_LEVELS if k is not None], default=0)
     tabla = cargar_o_calcular_tabla(market_process, time_matrix, distance_arr, diesel_arr, K=k_tabla)
-    # B1, B2, B2P, B3, UB-PI y UB-DP no dependen del DRL: se calculan una vez por nº de nodos y se reusan
+    # B1, B2, B2P, B3 y UB-PI no dependen del DRL: se calculan una vez por nº de nodos y se reusan
     # entre corridas mientras no cambien el proceso, la tabla V ni el diseño.
     cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos", "cache_eval")
 
-    print("\n--- Evaluación en mundos simulados ---")
+    print("\n--- Evaluación en los mundos de prueba (salidas en octubre) ---")
     sim_df = evaluar_mundos_simulados(
         agent, market_process, tabla, time_matrix, distance_arr, diesel_arr, NUM_NODES,
-        avail_expected_arr, reward_global_p95,
+        avail_expected_arr, reward_global_p95, periodo="test",
         k_levels=tuple(K_TRAINING_LEVELS),
-        cache_path=os.path.join(cache_dir, f"baselines_simulado_{NUM_NODES}nodos{sufijo_cache}.pkl"),
+        cache_path=os.path.join(cache_dir, f"baselines_prueba_{NUM_NODES}nodos{sufijo_cache}.pkl"),
         semilla_eval=semilla_eval,
-    )
-    print("\n--- Replay de los días reales de evaluación ---")
-    replay_df = evaluar_replay(
-        agent, market_process, tabla, time_matrix, distance_arr, diesel_arr, NUM_NODES,
-        avail_expected_arr, reward_global_p95,
-        k_levels=tuple(K_TRAINING_LEVELS),
-        cache_path=os.path.join(cache_dir, f"baselines_replay_{NUM_NODES}nodos.pkl"),
     )
 
     print(f"\n{'='*60}")
     print(f"  SUMMARY — {NUM_NODES} nodes  [{label}]")
     print(f"{'='*60}")
-    for titulo, df in (("Mundos simulados", sim_df), (f"Replay ({NOTA_REPLAY})", replay_df)):
-        imprimir_resumen(df, titulo)
-    _imprimir_comparacion_b(sim_df, replay_df)
+    imprimir_resumen(sim_df, "Mundos de prueba (salidas en octubre)")
+    _imprimir_comparacion_b(sim_df)
     print(f"\n  Entrenamiento del DRL        : {train_time:.1f} s")
-    print(f"  Tabla V de UB-DP             : " + ("no tratable" if tabla is None else f"{tabla.tiempo_calculo:.1f} s"))
+    print(f"  Tabla V de B3                : " + ("no tratable" if tabla is None else f"{tabla.tiempo_calculo:.1f} s"))
     print(f"{'='*60}")
 
     summary_rows.append({
         "Model":                  label,
         "Node Size":              NUM_NODES,
         "DRL Training Time (s)":  train_time,
-        "UB-DP Table Time (s)":   float("nan") if tabla is None else tabla.tiempo_calculo,
+        "DP Table Time (s)":      float("nan") if tabla is None else tabla.tiempo_calculo,
     })
 
     excel_path = os.path.join(cwd, f"DRL_Routing_Summary_{label}.xlsx")
     plot_path  = os.path.join(cwd, f"DRL_Training_Diagnostics_{label}.png")
 
-    save_results(sim_df, replay_df, summary_rows, excel_path)
-    append_comparacion_to_excel(excel_path, sim_df, replay_df)
-    agregar_rutas_y_precios(excel_path, sim_df, replay_df)
-    guardar_mundos(sim_df, replay_df, os.path.join(cwd, f"mundos_{label}.csv"))
+    save_results(sim_df, summary_rows, excel_path)
+    append_comparacion_to_excel(excel_path, sim_df)
+    agregar_rutas_y_precios(excel_path, sim_df)
+    guardar_mundos(sim_df, os.path.join(cwd, f"mundos_{label}.csv"))
     if ep_rewards:
         plot_diagnostics(ep_rewards, ep_losses, sim_df, NUM_NODES, plot_path)
 
@@ -229,20 +222,18 @@ def _evaluate_and_report(
     validar_pricing(agent, NUM_NODES, time_matrix, distance_arr, diesel_arr,
                     avail_expected_arr, reward_global_p95, market_process, cwd, tabla=tabla)
 
-    return sim_df, replay_df
+    return sim_df
 
 
-def _imprimir_comparacion_b(sim_df, replay_df) -> None:
+def _imprimir_comparacion_b(sim_df) -> None:
     """Comparación B en consola: DRL − (destino del DRL + regla fija), con IC bootstrap y Holm."""
-    df = sim_df if replay_df is None or replay_df.empty else pd.concat([sim_df, replay_df], ignore_index=True)
-    b = comparar_con_baselines(df, familias={"precio": FAMILIAS["precio"]})
+    b = comparar_con_baselines(sim_df, familias={"precio": FAMILIAS["precio"]})
     if b.empty:
         return
     sig = [c for c in b.columns if c.startswith("significativo")][0]
     print("\n  Lo que aporta el precio del DRL (DRL − mismas rutas con una regla de precio fija):")
     for _, r in b.iterrows():
-        modo = "replay" if str(r["modo"]).startswith("replay") else "simulado"
-        print(f"    {modo:<9} K={r['K']:<6} {r['comparacion']:<26} "
+        print(f"    K={r['K']:<6} {r['comparacion']:<26} "
               f"{r['dif_media_usd']:+9.1f} USD  IC95 [{r['ic95_inf']:+.1f}, {r['ic95_sup']:+.1f}]  "
               f"p_Holm={r['p_holm']:.3g}{'  *' if r[sig] else ''}")
 
@@ -283,8 +274,8 @@ def _run_one_size(
     time_matrix, _, _, distance_arr, diesel_arr, _, avail_expected_arr, reward_global_p95 = load_matrices(NUM_NODES)
 
     # ── Proceso exógeno de cargas y tarifas ──────────────────────────────────
-    # El entrenamiento (mundos simulados de los TRAIN_DAYS) y la evaluación (mundos simulados, replay de los días
-    # de prueba, UB-PI, UB-DP, B2, B2P y B3) salen de él. El modelo no ve los días de prueba.
+    # Ajustado con los días de entrenamiento (jun–ago). El entrenamiento usa mundos de entrenamiento, la validación
+    # (checkpoint) mundos de septiembre y la evaluación (B2, B2P, B3, UB-PI) mundos de octubre.
     asegurar_parametros()
     market_process = MarketProcess(NUM_NODES)
     est_lane = market_process.estadisticas_dow(distance_arr, diesel_arr)   # una vez por nº de nodos

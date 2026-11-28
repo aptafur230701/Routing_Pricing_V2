@@ -2,9 +2,9 @@
 excel_report.py
 ===============
 Libro de Excel con los resultados de la evaluación (baselines_drl_ruteo_estocastico.md). Cuatro hojas:
-  · Resumen     — por (K, método), en tres grupos (DRL y sus rutas con precio fijo, baselines, cotas): margen medio con
-                  IC95, diferencia pareada contra el DRL, gap contra UB-PI, millas cargadas y aceptación; mundos
-                  simulados y replay (días reales desde TRAIN_DAYS, fuera de muestra); tiempos fuera de línea.
+  · Resumen     — por (K, método), en tres grupos (DRL y sus rutas con precio fijo, baselines, cota UB-PI): margen
+                  medio con IC95, diferencia pareada contra el DRL, gap contra UB-PI, millas cargadas y aceptación, en
+                  los mundos simulados con salida en el período de prueba (octubre); tiempos fuera de línea.
   · Comparación — la agrega stats_analysis.append_comparacion_to_excel (DRL − cada método, Wilcoxon + Holm).
   · Rutas y precios — agregar_rutas_y_precios: una fila por tramo de cada ciclo del DRL con sus millas y su rango
                   de precio (evaluation.banda_precio sobre la cabeza de precio), más una fila de total por ciclo.
@@ -18,14 +18,11 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from evaluation import resumen_metodos, NOTA_NO_TRATABLE
-from stats_analysis import NOTA_UB_DP, NOTA_UB_DP_FLOJA, NOTA_UB_DP_FLOJA_LARGA
+from evaluation import resumen_metodos
 
 # ── Palette ───────────────────────────────────────────────────
 _BLUE_DARK    = "2E5395"
 _BLUE_LIGHT   = "DCE6F1"
-_PURPLE_DARK  = "7030A0"
-_PURPLE_LIGHT = "EBDDF0"
 _GREEN_DARK   = "548235"
 _YELLOW       = "FFF2CC"
 
@@ -81,12 +78,11 @@ def _data_cell(cell, value, num_format=None, fill_hex=None):
 
 def build_formatted_excel(
     sim_df: pd.DataFrame,
-    replay_df: pd.DataFrame,
     summary_rows: list,
     output_path: str,
 ) -> None:
     wb = Workbook()
-    _build_summary(wb, sim_df, replay_df, summary_rows)
+    _build_summary(wb, sim_df, summary_rows)
     if "Sheet" in wb.sheetnames:
         del wb["Sheet"]
     wb.save(output_path)
@@ -131,8 +127,8 @@ _COMO_LEER = (
     "más caro. Precio sobre la mediana: precio cobrado − tarifa mediana publicada de la lane, promedio sobre las "
     "cargas ganadas. Cargas por debajo del costo: ganadas a un precio menor que el costo por milla. La hoja Comparación indica qué diferencias son estadísticamente significativas.")
 
-_TITULO_REAL = "DÍAS REALES DE OCTUBRE 2026 (no se usaron para entrenar): resultado principal"
-_TITULO_SIM = "ESCENARIOS SIMULADOS (mercados generados con el modelo de mercado ajustado a los datos)"
+_TITULO_SIM = ("ESCENARIOS DE PRUEBA: salidas del 1 al 26 de octubre de 2026, mercados generados con el modelo de "
+               "mercado (ajustado solo con junio–agosto). Octubre no se usó para entrenar ni para elegir el modelo.")
 
 
 def _bloque_resumen(ws, row, titulo, color_oscuro, color_claro, resumen):
@@ -164,21 +160,11 @@ def _bloque_resumen(ws, row, titulo, color_oscuro, color_claro, resumen):
                 _data_cell(ws.cell(row, c), _clean(r.get(col)), fmt,
                            fill_hex=_YELLOW if es_cota else None)
             row += 1
-        if (g["nota"] == NOTA_UB_DP_FLOJA).any():
-            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=len(_COLS_RESUMEN))
-            _data_cell(ws.cell(row, 1), f"* {NOTA_UB_DP_FLOJA_LARGA}", fill_hex=_YELLOW)
-            ws.row_dimensions[row].height = 48
-            row += 1
-        if (g["metodo"] == "UB-DP").any():
-            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=len(_COLS_RESUMEN))
-            _data_cell(ws.cell(row, 1), NOTA_UB_DP)
-            ws.row_dimensions[row].height = 32
-            row += 1
         row += 1
     return row
 
 
-def _build_summary(wb, sim_df, replay_df, summary_rows):
+def _build_summary(wb, sim_df, summary_rows):
     ws = wb.create_sheet("Resumen")
     sr = summary_rows[0] if summary_rows else {}
     row = 1
@@ -187,18 +173,16 @@ def _build_summary(wb, sim_df, replay_df, summary_rows):
     ws.row_dimensions[row].height = 110
     row += 2
 
-    if replay_df is not None and not replay_df.empty:
-        row = _bloque_resumen(ws, row, _TITULO_REAL, _BLUE_DARK, _BLUE_LIGHT, resumen_metodos(replay_df))
-    row = _bloque_resumen(ws, row, _TITULO_SIM, _PURPLE_DARK, _PURPLE_LIGHT, resumen_metodos(sim_df))
+    row = _bloque_resumen(ws, row, _TITULO_SIM, _BLUE_DARK, _BLUE_LIGHT, resumen_metodos(sim_df))
 
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
     _header_cell(ws.cell(row, 1), "TIEMPO DE CÓMPUTO (una sola vez, antes de usar el modelo)", _GREEN_DARK)
     row += 1
     for metrica, clave in (("Entrenamiento del DRL (horas)", "DRL Training Time (s)"),
-                           ("Cálculo del «Óptimo con mercado promedio» y de B3 (horas)", "UB-DP Table Time (s)")):
+                           ("Cálculo de la tabla de B3 (horas)", "DP Table Time (s)")):
         _data_cell(ws.cell(row, 1), metrica)
         valor = _clean(sr.get(clave))
-        valor = "no se calcula a este tamaño" if valor is None and clave == "UB-DP Table Time (s)" else (
+        valor = "no se calcula a este tamaño" if valor is None and clave == "DP Table Time (s)" else (
             None if valor is None else valor / 3600.0)
         _data_cell(ws.cell(row, 2), valor, "0.0")
         row += 1
@@ -211,11 +195,9 @@ def _build_summary(wb, sim_df, replay_df, summary_rows):
     ws.column_dimensions[get_column_letter(len(_COLS_RESUMEN))].width = 26
 
 
-def guardar_mundos(sim_df: pd.DataFrame, replay_df: pd.DataFrame, path: str) -> None:
+def guardar_mundos(sim_df: pd.DataFrame, path: str) -> None:
     """Una fila por (modo, K, mundo, método) en CSV: los datos crudos de la evaluación."""
-    partes = [sim_df] if replay_df is None or replay_df.empty else [sim_df, replay_df]
-    df = pd.concat(partes, ignore_index=True)
-    df.drop(columns=[c for c in ("pasos", "cotizaciones") if c in df.columns]).to_csv(path, index=False)
+    sim_df.drop(columns=[c for c in ("pasos", "cotizaciones") if c in sim_df.columns]).to_csv(path, index=False)
 
 
 # ═════════════════════════════════════════════════════════════
@@ -224,13 +206,13 @@ def guardar_mundos(sim_df: pd.DataFrame, replay_df: pd.DataFrame, path: str) -> 
 
 _DIAS = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
 
-_ETIQUETA_REAL, _ETIQUETA_SIM = "Días reales", "Simulado"
+_ETIQUETA_SIM = "Prueba (oct)"
 
 _COMO_LEER_RUTAS = (
     "CÓMO LEER ESTA HOJA. Una fila por tramo de cada ciclo del DRL, en el orden en que se recorre, con una fila de "
-    "total al cierre de cada ciclo. Escenario: el caso de prueba, el mismo para todos los métodos. En días reales, un "
-    "camión con base en una ciudad que sale un día de octubre de 2026, con las cargas y tarifas publicadas ese día; "
-    "en simulado, un mercado completo generado por el modelo de mercado. Precios (USD por milla): la referencia es el "
+    "total al cierre de cada ciclo. Escenario: el caso de prueba, el mismo para todos los métodos: un camión con base "
+    "en una ciudad que sale un día de octubre de 2026, en un mercado generado por el modelo de mercado a partir de "
+    "ese día. Precios (USD por milla): la referencia es el "
     "precio al que el DRL ganó la carga, el mismo con que se calcula el margen del ciclo; el rango son los precios "
     "que el DRL consideraba casi igual de buenos en esa decisión (los que juntan el 80% de su preferencia). Todos "
     "los precios son percentiles (p10 … p90) de las tarifas publicadas ese día en esa ruta. Costo por milla: diésel "
@@ -271,12 +253,12 @@ def _tabla(ws, row, columnas, filas, color):
     return row
 
 
-def agregar_rutas_y_precios(excel_path: str, sim_df: pd.DataFrame, replay_df: pd.DataFrame = None) -> None:
+def agregar_rutas_y_precios(excel_path: str, sim_df: pd.DataFrame) -> None:
     """Agrega al Excel la hoja 'Rutas y precios': una fila por tramo recorrido de cada ciclo del DRL (con su rango
     de precio, referencia, mediana, costo y millas) y una fila de total por ciclo. Requiere la columna `pasos`."""
     from openpyxl import load_workbook
     from config import FECHA_INICIO
-    partes = [(_ETIQUETA_REAL, replay_df), (_ETIQUETA_SIM, sim_df)]
+    partes = [(_ETIQUETA_SIM, sim_df)]
     partes = [(n, _filas_drl(d)) for n, d in partes if d is not None and not d.empty and "pasos" in d]
     if not partes:
         return
@@ -308,8 +290,7 @@ def agregar_rutas_y_precios(excel_path: str, sim_df: pd.DataFrame, replay_df: pd
     for nombre, d in partes:
         for _, r in d.sort_values("mundo").iterrows():
             dia = _DIAS[int(r["dia_semana"])]
-            salida = (f"{dia} {(np.datetime64(FECHA_INICIO) + int(r['dia_abs'])).astype(str)}"
-                      if nombre == _ETIQUETA_REAL else dia)
+            salida = f"{dia} {(np.datetime64(FECHA_INICIO) + int(r['dia_abs'])).astype(str)}"
             perdidas = {}
             for p in r["pasos"]:
                 tramo = (p["desde"], p["hacia"])
@@ -356,13 +337,11 @@ _PREGUNTA = {"ruteo": "DRL frente a los métodos de comparación",
 
 
 def escribir_comparacion(excel_path: str, pareada: pd.DataFrame) -> None:
-    """Hoja 'Comparación' con nombres legibles: una fila por (datos, comparación), días reales primero."""
+    """Hoja 'Comparación' con nombres legibles: una fila por comparación."""
     from openpyxl import load_workbook
     from evaluation import NOMBRE
     sig = [c for c in pareada.columns if c.startswith("significativo")]
     d = pareada.copy()
-    d["_real"] = ~d["modo"].astype(str).str.startswith("simulado")
-    d = d.sort_values("_real", ascending=False, kind="stable")
     wb = load_workbook(excel_path)
     if "Comparación" in wb.sheetnames:
         del wb["Comparación"]
@@ -388,7 +367,7 @@ def escribir_comparacion(excel_path: str, pareada: pd.DataFrame) -> None:
             conclusion = "El DRL gana menos (el IC 95% queda por debajo de 0)"
         else:
             conclusion = "Sin diferencia significativa"
-        filas.append((_ETIQUETA_REAL if r["_real"] else _ETIQUETA_SIM, _PREGUNTA.get(r["familia"], r["familia"]),
+        filas.append((_ETIQUETA_SIM, _PREGUNTA.get(r["familia"], r["familia"]),
                       nombre, r["n_mundos"], r["dif_media_usd"], r["ic95_inf"], r["ic95_sup"], r["p_holm"],
                       conclusion))
     _tabla(ws, 3, cols, filas, _GREEN_DARK)

@@ -23,7 +23,7 @@ Uso
 ---
     python fit_market_process.py
 
-Escribe datos/market_params.npz. El ajuste usa los primeros TRAIN_DAYS días (jun-sep 2026) y los
+Escribe datos/market_params.npz. El ajuste usa los primeros TRAIN_DAYS días (jun-ago 2026) y los
 194 nodos; las fechas salen de los nombres de archivo de datos/datos_finales_jun_oct_2026 (ver
 problem_data.cargar_dias_mercado).
 """
@@ -35,7 +35,7 @@ from scipy.special import gammaln
 
 from config import (
     DIAS_EXCLUIDOS, FECHA_INICIO, TRAIN_DAYS, MARKET_R_MAX, MARKET_N_GRUPOS, MARKET_PARAMS_PATH,
-    VENTANA_LENTO_DIAS, MARKET_VENTANA_VECINOS,
+    VENTANA_LENTO_DIAS, MARKET_VENTANA_VECINOS, periodos,
 )
 from problem_data import cargar_dias_mercado
 
@@ -82,14 +82,22 @@ def estimar_factores_dow(total_por_fecha: np.ndarray, dow: np.ndarray) -> np.nda
 
 
 def estimar_m(count_loads: np.ndarray, dow: np.ndarray, f_w: np.ndarray,
-              vecinos: int = MARKET_VENTANA_VECINOS) -> np.ndarray:
+              vecinos: int = MARKET_VENTANA_VECINOS, por_periodo: bool = False) -> np.ndarray:
     """m_{d,l} (D, N, N): media de cargas esperada en cada lane-día, según el Paso 4b de la
     metodología — media móvil de orden 2·`vecinos`+1 (`vecinos` días antes y después, sin el propio
     día), ajustada por día de la semana, con los vecinos disponibles en los bordes de la ventana
     (primeros/últimos días de `count_loads`, que puede ser la ventana completa jun-oct o solo los
     días de ajuste).
+
+    por_periodo : True (con la ventana completa jun-oct) ⇒ la media móvil se calcula dentro de cada período
+    (entrenamiento, validación, prueba; `config.periodos`): los días del borde usan solo los vecinos de su propio
+    período, así que, p. ej., la m del 31 de agosto no ve las cargas de septiembre.
     """
     D = count_loads.shape[0]
+    if por_periodo:
+        partes = [estimar_m(count_loads[ini:fin], dow[ini:fin], f_w, vecinos)
+                  for ini, fin in periodos(D).values() if fin > ini]
+        return np.concatenate(partes, axis=0)
     ajustado = count_loads / f_w[dow][:, None, None]
     suma = np.zeros_like(ajustado)
     cuenta_full = np.zeros_like(ajustado)
@@ -300,6 +308,7 @@ def ajustar(dias_excluidos=None, n_grupos: int = MARKET_N_GRUPOS, r_max: float =
         "fechas_ajuste": fechas.astype("datetime64[D]").astype(str),
         "fecha_inicio": np.array(fecha_inicio),
         "num_dias_total": np.int64(len(fechas_todas)),
+        "train_days": np.int64(train_days),    # con cuántos días se ajustó: MarketProcess exige que sea TRAIN_DAYS
     }
 
 

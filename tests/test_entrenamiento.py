@@ -4,7 +4,8 @@ test_entrenamiento.py
 PPO en el dispositivo (am_training.py) y su validación:
 
   · asignación balanceada de K; número de mundos de validación por tamaño
-  · validación (ValidacionSimulada): mundos fijos distintos de los de evaluación, reproducible, métricas en rango
+  · validación (ValidacionSimulada): mundos fijos del período de validación (septiembre), distintos de los de
+    evaluación (octubre), reproducible, métricas en rango
   · smoke de entrenamiento: reward y pérdidas finitas, aceptación en (0, 1), todos los niveles de K con conformidad
     100 %, sin métricas de Ṽ, guarda el mejor update {"agent", "critic"}
   · checkpoint por media móvil (el update central de la ventana), modo "max", LR coseno y LR constante
@@ -41,16 +42,22 @@ def test_numero_de_mundos_de_validacion_por_tamano():
 
 def test_validacion_fija_reproducible_y_distinta_de_la_evaluacion(d10):
     env = d10.env()
-    val = am_training.ValidacionSimulada(d10.market, env, d10.entradas(env), TRAIN_DAYS, N)
+    val = am_training.ValidacionSimulada(d10.market, env, d10.entradas(env), N)
+    # la validación sale en septiembre y nunca toca entrenamiento ni prueba
+    ini, fin = d10.market.periodo("val")
+    assert TRAIN_DAYS == ini
+    dia0 = val.mundos.dia0.cpu().numpy()
+    assert (dia0 >= ini).all() and (dia0 <= fin - 1).all() and val.mundos.dia_max == fin - 1
     dis = disenar_mundos(N, 100, d10.market, semilla=MARKET_SEED_EVAL)
-    ev_mundos = mundos_eval(d10.market, dis["start_day"], TRAIN_DAYS - 1, MARKET_SEED_EVAL)
+    ev_mundos = mundos_eval(d10.market, dis["start_day"], dis["dia_max"], MARKET_SEED_EVAL)
+    assert dis["start_day"].min() >= fin                                   # la evaluación, en prueba (octubre)
     assert not torch.equal(val.mundos.u[:100], ev_mundos.u)
     agent = agente_chico(N)
     a, b = val.evaluar(agent), val.evaluar(agent)
     assert a == b
     assert set(a["por_k"]) == {"free" if K is None else str(K) for K in K_TRAINING_LEVELS}
     for d in a["por_k"].values():
-        assert set(d) == {"margen", "valid_rate", "tasa_aceptacion", "nivel_medio"}      # sin B3 ni UB-DP
+        assert set(d) == {"margen", "valid_rate", "tasa_aceptacion", "nivel_medio"}      # sin B3
         assert 0 < d["valid_rate"] <= 1 and 0 < d["tasa_aceptacion"] <= 1 and 0 <= d["nivel_medio"] <= N_NIVELES - 1
     assert a["score"] == a["margen"]
 
@@ -66,7 +73,7 @@ def test_rollout_combinado_greedy_igual_y_transiciones_consistentes(d10):
     B = 60
     agent = agente_chico(N)
     torch.manual_seed(0)
-    critic = CriticHead(32).to(DEVICE).eval()
+    critic = CriticHead(32, 4, 1, 64).to(DEVICE).eval()
     nodos = np.arange(B) % N
     k = [None if i % 3 else K_MAX for i in range(B)]
     env = d10.env()
@@ -89,11 +96,58 @@ def test_rollout_combinado_greedy_igual_y_transiciones_consistentes(d10):
             a = torch.zeros(B, dtype=torch.long, device=DEVICE)
             o = torch.full((B,), am_training.OPCION_VACIO, dtype=torch.long, device=DEVICE)
             a[ep], o[ep] = tr["action"][sel], tr["opcion"][sel]
-            _, _, lp, _, _, v = am_training._forward(agent, critic, f, masks, actions_t=a, opcion_t=o)
+            _, _, lp, _, _, v, _ = am_training._forward(agent, critic, f, masks, actions_t=a, opcion_t=o)
             assert torch.allclose(lp[ep], tr["log_prob"][sel], atol=1e-5)
             assert torch.allclose(v[ep], tr["value"][sel], atol=1e-5)
             rew, term, masks = env2.step(a, o)
             assert torch.equal(rew[ep], tr["reward"][sel]) and torch.equal(term[ep], tr["done"][sel])
+
+
+def test_gae_da_el_retorno_del_estado_siguiente():
+    """Dos episodios (3 y 1 pasos), γ = λ = 1: el λ-retorno es la suma de las recompensas que faltan y el retorno
+    siguiente es el de la transición t + 1 del mismo episodio (0 en la última)."""
+    tr = {"ep": torch.tensor([0, 1, 0, 0], device=DEVICE), "t": torch.tensor([0, 0, 1, 2], device=DEVICE),
+          "reward": torch.tensor([1.0, 5.0, 2.0, 3.0], device=DEVICE),
+          "value": torch.tensor([0.5, 0.1, -1.0, 2.0], device=DEVICE)}
+    _, ret, sig = am_training._gae(tr, 2, 1.0, 1.0)
+    torch.testing.assert_close(ret, torch.tensor([6.0, 5.0, 5.0, 3.0], device=DEVICE))
+    torch.testing.assert_close(sig, torch.tensor([5.0, 0.0, 3.0, 0.0], device=DEVICE))
+
+
+def test_cada_perdida_mueve_solo_sus_parametros(d10):
+    """La pérdida de política no llega al crítico ni a la cabeza de continuación (W, L); la de valor solo al crítico;
+    la auxiliar de Δ solo a la cabeza de continuación."""
+    from conftest import mundos_sim
+    from model.critic_head import CriticHead
+    B = 24
+    agent = agente_chico(N)
+    torch.manual_seed(0)
+    critic = CriticHead(32, 4, 1, 64).to(DEVICE)
+    env = d10.env()
+    ent = d10.entradas(env)
+    with torch.no_grad():
+        tr, _ = am_training._rollout(agent, critic, env, mundos_sim(d10.market, B, semilla=3), np.arange(B) % N,
+                                     [None] * B, ent, con_greedy=False)
+    assert bool(tr["cotizo"].any())
+    f = {k: tr[k] for k in am_training._FEATS + ("opciones", "current_node")}
+    delta = {id(p) for p in agent.decoder.precio.delta.parameters()}
+
+    def tocados(perdida):
+        agent.zero_grad(set_to_none=True)
+        critic.zero_grad(set_to_none=True)
+        _, _, lp, _, _, v, wl = am_training._forward(agent, critic, f, tr["mask"], actions_t=tr["action"],
+                                                     opcion_t=tr["opcion"])
+        perdida(lp, v, wl).backward()
+        a = {id(p) for p in agent.parameters() if p.grad is not None and p.grad.abs().sum() > 0}
+        c = any(p.grad is not None and p.grad.abs().sum() > 0 for p in critic.parameters())
+        return a, c
+
+    a, c = tocados(lambda lp, v, wl: lp.sum())
+    assert a and not (a & delta) and not c
+    a, c = tocados(lambda lp, v, wl: v.sum())
+    assert not a and c
+    a, c = tocados(lambda lp, v, wl: (wl * tr["cotizo"][:, None].float()).sum() + 1e-3 * wl.sum())
+    assert a and a <= delta and not c
 
 
 def _entrenar(d, monkeypatch, tmp_path, n_updates, episodios=24, **cfg):
@@ -116,6 +170,7 @@ def test_smoke_de_entrenamiento(d10, monkeypatch, tmp_path):
         assert np.isfinite(e["reward"]) and np.isfinite(e["total_loss"]) and e["entropy_precio"] > 0
         assert 0 < e["tasa_aceptacion"] < 1 and 0 <= e["nivel_medio"] <= N_NIVELES - 1
         assert "post_mse" not in e and "post_ev" not in e
+        assert np.isfinite(e["delta_loss"]) and np.isfinite(e["delta_medio_usd"]) and e["delta_loss"] > 0
         for k, diag in e["k_diagnostics"].items():
             vistos.add(k)
             if diag is not None and "conformity_rate" in diag:

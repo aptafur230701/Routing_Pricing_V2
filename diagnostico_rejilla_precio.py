@@ -18,7 +18,7 @@ bajo, y la pérdida de una rejilla gruesa cambia.
 Las cargas del mundo simulado se sortean desde estos mismos lane-días, así que las pérdidas por lane-día son las que
 vería el modelo en la simulación. Se ponderan por min(cargas, COTIZACIONES_MAX_POR_NODO) (las cotizaciones posibles en la
 lane). Se separan los días de entrenamiento (desde el día DIA_MIN_ENTRENAMIENTO, para dejar fuera los días 0-13 con
-conteos atípicos) y los de evaluación (TRAIN_DAYS en adelante).
+conteos atípicos), los de validación (septiembre) y los de evaluación (octubre, desde TEST_START).
 
 Uso:   python diagnostico_rejilla_precio.py --num-nodes 20 [--num-nodes 35 ...]
 Salida: results/<N>nodes/pricing_val/tables/rejilla_precio.csv   (y una tabla en consola)
@@ -31,7 +31,7 @@ import torch  # noqa: F401  (antes que pandas: en algunos Windows importar panda
 import numpy as np
 import pandas as pd
 
-from config import TRAIN_DAYS, COMPETENCIA_KAPPA, COMPETENCIA_M_MAX, COTIZACIONES_MAX_POR_NODO, MPG, \
+from config import TRAIN_DAYS, TEST_START, COMPETENCIA_KAPPA, COMPETENCIA_M_MAX, COTIZACIONES_MAX_POR_NODO, MPG, \
     MARGINAL_COST_SIN_DIESEL
 from market_process import MarketProcess, asegurar_parametros
 from pricing import competidores_efectivos, interp_cuantiles, U_NIVELES_ARR
@@ -72,7 +72,8 @@ def diagnosticar(n: int) -> pd.DataFrame:
     dist = np.asarray(dist_nn, dtype=np.float64)[i_idx, j_idx]
     diesel = np.asarray(diesel_nn, dtype=np.float64)[i_idx, j_idx]
     peso = np.minimum(cargas[d_idx, i_idx, j_idx], COTIZACIONES_MAX_POR_NODO).astype(np.float64)
-    periodo = np.where(d_idx >= TRAIN_DAYS, "evaluación", np.where(d_idx >= DIA_MIN_ENTRENAMIENTO, "entrenamiento", "excluido"))
+    periodo = np.where(d_idx >= TEST_START, "evaluación", np.where(d_idx >= TRAIN_DAYS, "validación",
+                       np.where(d_idx >= DIA_MIN_ENTRENAMIENTO, "entrenamiento", "excluido")))
 
     u9 = np.asarray(U_NIVELES_ARR, dtype=np.float64)
     u_res = np.arange(u9.min(), u9.max() + 1e-9, PASO_FINO)                 # fino dentro de [p10, p90]

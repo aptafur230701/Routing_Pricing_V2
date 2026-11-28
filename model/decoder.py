@@ -157,9 +157,17 @@ class PriceHead(nn.Module):
 
         logit_k = τ · (v_k + P_k · Δ) + MLP_k          (los niveles; VACÍO: solo MLP)
 
-    Δ (aprendido, en unidades de p95) es lo que vale ganar la carga más allá del tramo: V(j) − V(perder). El
-    nivel óptimo es argmax_k P_k·(p_k·d − c + V(j) − V(perder)), así que la cabeza solo tiene que aprender Δ; con
-    Δ = 0 arranca en la cotización miope. El MLP corrige lo que falte.
+    Δ = W − L (en unidades de p95) es lo que vale ganar la carga más allá del tramo: W es el valor de seguir después
+    de ganar (en j) y L el de seguir después de perder (en i, con un intento menos y 0,25 h más). El valor de cotizar
+    el nivel k es L + P_k·(p_k·d − c + W − L), así que el nivel óptimo es argmax_k P_k·(p_k·d − c + Δ); con Δ = 0
+    arranca en la cotización miope. El MLP corrige lo que falte.
+
+    W y L salen de la cabeza `delta` (2 salidas) y se aprenden por REGRESIÓN, como un crítico, no por gradiente de
+    política (am_training: pérdida auxiliar sobre el valor realizado de la rama que ocurrió, ganar o perder). Como el
+    competidor de cada carga es independiente del futuro, el valor de seguir dado que se ganó no depende del nivel
+    cotizado: las muestras de cada rama son insesgadas aunque la política elija el nivel. Por eso la cabeza `delta`
+    recibe sus entradas y entrega Δ sin gradiente hacia la política (detach): el gradiente de política no la mueve y
+    la pérdida auxiliar no mueve el resto de la red.
 
     El embedding e_j ya trae, por la atención del encoder, el contexto de todo el grafo (cargas, competencia,
     índice de mercado, continuación esperada desde j); h_t trae el momento del ciclo (tiempo, K, rechazos).
@@ -179,15 +187,23 @@ class PriceHead(nn.Module):
                 nn.ReLU(),
                 nn.Linear(d_h, n_opciones),
             )
-            self.delta = nn.Sequential(nn.Linear(n_in, d_h), nn.ReLU(), nn.Linear(d_h, 1))
+            self.delta = nn.Sequential(nn.Linear(n_in, d_h), nn.ReLU(), nn.Linear(d_h, 2))   # (W, L)
             nn.init.zeros_(self.delta[-1].weight)
             nn.init.zeros_(self.delta[-1].bias)
             self.log_tau = nn.Parameter(torch.tensor(float(np.log(10.0))))
 
+    def continuacion(self, context: torch.Tensor, glimpse: torch.Tensor, e_j: torch.Tensor,
+                     cot_j: torch.Tensor) -> torch.Tensor:
+        """(batch, 2): W (seguir después de ganar) y L (después de perder), en unidades de p95. Con gradiente solo
+        hacia la cabeza `delta` (la entrada va sin gradiente): es lo que entrena la pérdida auxiliar."""
+        return self.delta(torch.cat([context, glimpse, e_j, cot_j], dim=-1).detach())
+
     def forward(self, context: torch.Tensor, glimpse: torch.Tensor, e_j: torch.Tensor,
                 cot_j: torch.Tensor) -> torch.Tensor:
         x = torch.cat([context, glimpse, e_j, cot_j], dim=-1)
-        valor = cot_j[:, COT_V] + cot_j[:, COT_P] * self.delta(x)                # (batch, K)
+        wl = self.delta(x.detach()).detach()
+        delta = wl[:, :1] - wl[:, 1:]                                             # (batch, 1) Δ = W − L
+        valor = cot_j[:, COT_V] + cot_j[:, COT_P] * delta                         # (batch, K)
         logits = self.net(x)
         K = valor.shape[1]
         return torch.cat([logits[:, :K] + self.log_tau.exp() * valor, logits[:, K:]], dim=-1)
@@ -217,7 +233,8 @@ class AttentionDecoder(nn.Module):
 
     Recálculo para actualización PPO
     ---------------------------------
-    log_prob, H_destino, H_precio = decoder.evaluate_cotizacion(context, embeddings, mask, opciones, cot, destino, opcion)
+    log_prob, H_destino, H_precio, (W, L) = decoder.evaluate_cotizacion(context, embeddings, mask, opciones, cot,
+                                                                        destino, opcion)
     """
 
     def __init__(
@@ -337,7 +354,10 @@ class AttentionDecoder(nn.Module):
         return self._dist_precio(context, glimpse, embeddings, destino, opciones, cot).probs
 
     def evaluate_cotizacion(self, context, embeddings, action_mask, opciones, cot, destino, opcion) -> tuple:
-        """Recalcula log π(j, o) y las dos entropías para un batch almacenado (actualización PPO)."""
+        """Recalcula log π(j, o) y las dos entropías para un batch almacenado (actualización PPO), y la continuación
+        (W, L) de la cabeza de precio para el destino almacenado (batch, 2), para la pérdida auxiliar de Δ."""
         dist_j, glimpse = self._dist_destino(context, embeddings, action_mask, "decoder softmax probs (eval)")
         dist_o = self._dist_precio(context, glimpse, embeddings, destino, opciones, cot)
-        return dist_j.log_prob(destino) + dist_o.log_prob(opcion), dist_j.entropy(), dist_o.entropy()
+        filas = torch.arange(embeddings.shape[0], device=embeddings.device)
+        wl = self.precio.continuacion(context, glimpse, embeddings[filas, destino], cot[filas, destino])
+        return dist_j.log_prob(destino) + dist_o.log_prob(opcion), dist_j.entropy(), dist_o.entropy(), wl

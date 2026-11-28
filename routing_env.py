@@ -33,6 +33,10 @@ episodio, día, nodo y lane; `MarketProcess.sortear_mundos` para mundos simulado
 reales). Al llegar a i el día absoluto dia = min(dia0 + ⌊t / 14⌋, dia_max) se lee la fila [b, dia − dia0, i] y se
 completa con las tablas por día de `MarketProcess.tensores` (precios por nivel · e^δ, cuantiles, m). Como el mundo
 no depende de las decisiones, dos políticas sobre el mismo `Mundos` enfrentan exactamente lo mismo.
+El día de la VISITA (el de su tablero) manda durante toda la visita: aunque las cotizaciones perdidas (15 min cada
+una) lleven el reloj al día siguiente, el tablero no cambia hasta esperar o viajar, y todo lo que describe "hoy"
+(`current_day`, `current_dow`, `market_index`, `ltr_actual`, `cargas_hoy`, `margen_hoy`) es de ese mismo día. El
+reloj (`time_elapsed`) sí sigue corriendo para el tiempo restante y la factibilidad.
 El agente observa los precios por nivel (`precios_row`), las cargas y m (`competencia`), nunca el
 competidor (`u_comp_row` existe solo para la cota con información perfecta y los tests).
 `reward_rows` y `rate_row_obs` son el margen y el precio en la mediana de cada lane: lo observable.
@@ -196,6 +200,8 @@ class VectorRoutingEnv:
         self._u_comp = z(B, N, C, dtype=torch.float64)
         self._precio_comp = z(B, N, C, dtype=torch.float64)
         self._m = torch.ones(B, dtype=torch.float64, device=dev)
+        self._avance_visita = z(B, dtype=torch.long)     # días desde la salida al revelar el tablero de la visita
+        self._dia_visita = mundos.dia0.to(device=dev, dtype=torch.long).clone()   # su día absoluto (recortado)
         self._perdidas = z(B, N, dtype=torch.long)
         self._n_rechazos = z(B, dtype=torch.long)
         self._last_cotizo = z(B, dtype=torch.bool)
@@ -302,14 +308,17 @@ class VectorRoutingEnv:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _dia(self) -> torch.Tensor:
-        """(B,) día absoluto en que está cada episodio, recortado al último día con datos del mundo."""
-        avance = torch.div(self._time_elapsed, HORAS_DIA_MERCADO, rounding_mode="floor").long()
-        return (self._mundos.dia0 + avance).clamp(max=self._mundos.dia_max)
+        """(B,) día absoluto de la visita actual (el de su tablero), recortado al último día con datos del mundo."""
+        return self._dia_visita
 
     def _revelar_tablero(self, filas: torch.Tensor) -> None:
-        """Tablero del nodo actual en las filas `filas` (B,) bool: la fila del mundo de ese día y nodo."""
+        """Tablero del nodo actual en las filas `filas` (B,) bool: la fila del mundo del día del reloj y ese nodo. Ese
+        día queda como el de la visita (`_dia_visita`) hasta el próximo tablero."""
         tab, mun, b, i = self._tab, self._mundos, self._filas, self._current_node
-        dia = self._dia()
+        avance = torch.div(self._time_elapsed, HORAS_DIA_MERCADO, rounding_mode="floor").long()
+        self._avance_visita = torch.where(filas, avance, self._avance_visita)
+        self._dia_visita = torch.where(filas, (mun.dia0 + avance).clamp(max=mun.dia_max), self._dia_visita)
+        dia = self._dia_visita
         slot = dia - mun.dia0
         loads = mun.loads[b, slot, i]                                            # (B, N)
         u = mun.u[b, slot, i].double()                                           # (B, N, C)
@@ -402,14 +411,18 @@ class VectorRoutingEnv:
 
     @property
     def current_day(self) -> torch.Tensor:
-        """(B,) día absoluto en que está cada episodio (recortado al último día con datos del mundo)."""
+        """(B,) día absoluto de la visita actual (el de su tablero; recortado al último día con datos del mundo)."""
         return self._dia()
 
     @property
+    def dias_desde_salida(self) -> torch.Tensor:
+        """(B,) días de mercado entre la salida y la visita actual (sin recortar)."""
+        return self._avance_visita
+
+    @property
     def current_dow(self) -> torch.Tensor:
-        """(B,) día de la semana (lunes = 0) del día en que está cada episodio, sin recortar."""
-        avance = torch.div(self._time_elapsed, HORAS_DIA_MERCADO, rounding_mode="floor").long()
-        return (self._tab["dow"][self._mundos.dia0] + avance) % 7
+        """(B,) día de la semana (lunes = 0) de la visita actual, sin recortar."""
+        return (self._tab["dow"][self._mundos.dia0] + self._avance_visita) % 7
 
     @property
     def start_dow(self) -> torch.Tensor:
@@ -425,6 +438,18 @@ class VectorRoutingEnv:
     @property
     def mundos(self):
         return self._mundos
+
+    @property
+    def cargas_hoy(self) -> torch.Tensor:
+        """(B, N, N) cargas publicadas HOY (el día de la visita actual) en todas las lanes de la red: el load
+        board público. La fila del nodo actual es su tablero; al llegar a j el mismo día, el de j es su fila."""
+        return self._mundos.loads[self._filas, self._dia() - self._mundos.dia0]
+
+    @property
+    def margen_hoy(self) -> torch.Tensor:
+        """(B, N, N) USD: margen de cada lane de la red si se cobrara la mediana de HOY (p50 · e^δ · dist − costo)."""
+        mediana = self._tab["precios"][self._dia(), :, :, _NIVEL_MEDIANA] * self._escala[:, None, None]
+        return mediana * self.dist[None] - self.costo[None]
 
     @property
     def current_loads_row(self) -> torch.Tensor:
@@ -443,12 +468,12 @@ class VectorRoutingEnv:
 
     @property
     def market_index(self) -> torch.Tensor:
-        """(B, N) índice de mercado observado de todos los nodos el día en que está cada episodio."""
+        """(B, N) índice de mercado observado de todos los nodos el día de la visita actual."""
         return self._tab["indice"][self._dia()]
 
     @property
     def ltr_actual(self) -> torch.Tensor:
-        """(B,) load-to-truck ratio del hub actual el día en que está cada episodio."""
+        """(B,) load-to-truck ratio del hub actual el día de la visita actual."""
         return self._tab["ltr"][self._dia(), self._current_node]
 
     @property

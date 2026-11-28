@@ -3,7 +3,8 @@ test_modelo.py
 ==============
 Entradas y salidas del agente (model/, greedy_rollout.py, transfer_learning.py), en tensores:
 
-  · features por nodo (B, N, N_NODE_FEATURES) finitas y en rango; las de continuación (6–13) coinciden con una
+  · features por nodo (B, N, N_NODE_FEATURES) finitas y en rango; las de continuación (6–13) y las del tablero de hoy
+    (14–17) coinciden con una
     referencia con loops; el conjunto factible excluye lanes sin vuelta; casos especiales (espera, casa)
   · índice de mercado normalizado (simulado y replay), features de cotización recalculadas a mano, día de la semana
   · decoder: la cabeza de precio respeta las opciones; log π(j, o) = log π(j) + log π(o | j); una sola opción no
@@ -21,7 +22,8 @@ import torch
 
 import model.encoder as encoder_mod
 from config import (MAX_DURATION, LOADS_EXPECTED_CLIP, COMPETENCIA_M_MAX, COTIZACIONES_MAX_POR_NODO, K_LEVELS, K_MAX,
-                    REWARD_SCALE_FACTOR, TIME_VIOLATION_PENALTY, DEVICE, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF)
+                    REWARD_SCALE_FACTOR, TIME_VIOLATION_PENALTY, DEVICE, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF,
+                    CRITIC_N_LAYERS)
 from conftest import agente_chico, escenario_sintetico, mundos_sim
 from greedy_rollout import EntradasAgente, construir_features, contexto_agente, greedy_rollout
 from market_process import EstadisticasLane
@@ -35,6 +37,7 @@ from routing_env import OPCION_VACIO, VectorRoutingEnv, fin_espera
 
 N = 10
 CONT = slice(6, 14)
+HOY = slice(14, 18)
 
 
 def np_(x):
@@ -90,7 +93,7 @@ def _referencia(d, env, b):
 # ── Features por nodo ────────────────────────────────────────────────────────
 
 def test_n_features_y_el_encoder_no_importa_de_baselines():
-    assert N_NODE_FEATURES == 6 + 8 + 1 + 3 + 2 * N_NIVELES + 2 and INDEX_COL == 14
+    assert N_NODE_FEATURES == 6 + 12 + 1 + 3 + 2 * N_NIVELES + 2 and INDEX_COL == 18
     assert "baselines" not in inspect.getsource(encoder_mod)
 
 
@@ -115,6 +118,44 @@ def test_columnas_de_continuacion_coinciden_con_referencia_con_loops(d10, pasos)
         np.testing.assert_allclose(np_(f["node_feats"][b, :, CONT]), _referencia(d10, env, b), atol=1e-6)
 
 
+def _referencia_hoy(d, env, b):
+    """Columnas 14–17 (tablero de hoy) de la fila b con loops, leyendo el mundo y las tablas por día directamente."""
+    T, p95, clip = d.T, d.p95, LOADS_EXPECTED_CLIP
+    i, h, t = int(env.current_node[b]), int(env.start_node[b]), float(env.time_elapsed[b])
+    dia = int(env.current_day[b])
+    cargas = np_(env.mundos.loads[b, dia - int(env.mundos.dia0[b])])
+    tab = d.market.tensores(DEVICE)
+    p50 = np_(tab["precios"][dia, :, :, N_NIVELES // 2]) * np.exp(float(env.mundos.delta[b]))
+    G = p50 * d.dist - np_(env.costo)
+    out = np.zeros((N, 4))
+    for j in range(N):
+        espera = j == i
+        if j != h:
+            out[j, 2] = min(cargas[j, h], clip) / clip
+            out[j, 3] = np.clip(G[j, h] / p95, -1, 1)
+        if j == h and not espera:
+            continue
+        tj = float(fin_espera(t)) if espera else t + T[i, j]
+        F = [l for l in range(N) if l not in (i, j, h) and tj + T[j, l] + T[l, h] <= MAX_DURATION]
+        if F:
+            out[j, 0] = np.mean([min(cargas[j, l], clip) / clip for l in F])
+            con = [G[j, l] for l in F if cargas[j, l] > 0]
+            out[j, 1] = np.clip(max(con) / p95, -1, 1) if con else 0.0
+    return out
+
+
+@pytest.mark.parametrize("pasos,replay", [(0, False), (2, False), (1, True)])
+def test_columnas_del_tablero_de_hoy_coinciden_con_referencia_con_loops(d10, pasos, replay):
+    env, activas, f = _estados(d10, pasos=pasos, semilla=10 + pasos, replay=replay)
+    assert len(activas) > 0
+    hoy = np_(f["node_feats"][:, :, HOY])
+    assert hoy[..., [0, 2]].min() >= 0 and hoy[..., [0, 2]].max() <= 1
+    assert hoy[..., [1, 3]].min() >= -1 and hoy[..., [1, 3]].max() <= 1
+    assert (hoy[..., 0] > 0).any() and (hoy[..., 1] != 0).any()
+    for b in activas[:15]:
+        np.testing.assert_allclose(hoy[b], _referencia_hoy(d10, env, b), atol=1e-5)
+
+
 def test_conjunto_factible_excluye_lanes_desde_las_que_no_se_alcanza_a_volver():
     """Con N = 4: ir de j a l = 2 y volver a casa pasa del tiempo máximo, así que su valor (enorme) no cuenta."""
     T = np.full((4, 4), 10.0)
@@ -124,11 +165,19 @@ def test_conjunto_factible_excluye_lanes_desde_las_que_no_se_alcanza_a_volver():
     G[:, 1, 2], G[:, 1, 3] = 100.0, 20.0
     est = EstadisticasLane(L=np.full((7, 4, 4), 5.0), P1=np.ones((7, 4, 4)), G=G, M=np.full((7, 4), 2.0)).a(DEVICE)
     z = torch.zeros(1, dtype=torch.long, device=DEVICE)
+    cargas = torch.zeros(1, 4, 4, dtype=torch.int32, device=DEVICE)
+    cargas[0, 1, 2], cargas[0, 1, 3], cargas[0, 1, 0] = 9, 3, 7                 # hoy: 1→2 (sin vuelta), 1→3, 1→casa
+    margen = torch.zeros(1, 4, 4, dtype=torch.float64, device=DEVICE)
+    margen[0, 1, 2], margen[0, 1, 3], margen[0, 1, 0] = 500.0, 30.0, -40.0
     f = np_(build_continuation_features_batch(z, z, torch.zeros(1, device=DEVICE), z,
-                                              torch.as_tensor(T, device=DEVICE), est, MAX_DURATION, 100.0)[0])
+                                              torch.as_tensor(T, device=DEVICE), est, MAX_DURATION, 100.0,
+                                              cargas, margen)[0])
     assert f[1, 4] == pytest.approx(0.2) and f[1, 6] == pytest.approx(1 / 4)
     assert f[1, 5] == pytest.approx(5.0 / LOADS_EXPECTED_CLIP)
     assert f[1, 7] == pytest.approx(np.log(2.0) / np.log(COMPETENCIA_M_MAX))
+    assert f[1, 8] == pytest.approx(3.0 / LOADS_EXPECTED_CLIP) and f[1, 9] == pytest.approx(0.3)   # solo F_1 = {3}
+    assert f[1, 10] == pytest.approx(7.0 / LOADS_EXPECTED_CLIP) and f[1, 11] == pytest.approx(-0.4)
+    assert (f[0, 10:12] == 0).all()                                               # casa: sin lane de regreso
 
 
 def test_casos_especiales_espera_y_casa(d10):
@@ -139,7 +188,7 @@ def test_casos_especiales_espera_y_casa(d10):
     for b in fuera:
         i, h, t = int(env.current_node[b]), int(env.start_node[b]), float(env.time_elapsed[b])
         assert nf[b, i, 1] * MAX_DURATION == pytest.approx(float(fin_espera(t) - t), abs=1e-4)
-        assert nf[b, h, 6] == 0 and (nf[b, h, 8:14] == 0).all()              # volver a casa termina el ciclo
+        assert nf[b, h, 6] == 0 and (nf[b, h, 8:18] == 0).all()              # volver a casa termina el ciclo
         assert nf[b, h, 7] == pytest.approx(float(np.clip((MAX_DURATION - t - d10.T[i, h]) / MAX_DURATION, 0, 1)),
                                             abs=1e-6)
     env0, _, f0 = _estados(d10, pasos=0, semilla=9)
@@ -188,10 +237,11 @@ def test_dia_de_la_semana(d10):
     uno = torch.zeros(4, 7, device=DEVICE)
     uno[:, 5] = 1
     assert not torch.allclose(sin, ctx(g, c, t, m, b, uno))
-    # el entorno avanza el día de la semana con los días de mercado
+    # el entorno avanza el día de la semana con los días de mercado (el de la visita: un rechazo no lo cambia)
     env, _, _ = _estados(d10, pasos=2, semilla=6)
-    dow = (np_(env.start_dow) + np_(env.time_elapsed).astype(np.float64) // 14).astype(int) % 7
-    np.testing.assert_array_equal(np_(env.current_dow), dow)
+    avance = np_(env.dias_desde_salida)
+    assert (avance <= np_(env.time_elapsed).astype(np.float64) // 14).all()
+    np.testing.assert_array_equal(np_(env.current_dow), (np_(env.start_dow) + avance) % 7)
 
 
 # ── Decoder ──────────────────────────────────────────────────────────────────
@@ -212,7 +262,8 @@ def test_act_respeta_opciones_y_logprob_es_la_suma(d10):
     with torch.no_grad():
         j, o, lp, h_j, h_o = agent.decoder.act_cotizacion(h, emb, mask, op, cot)
         assert op[filas, j, o].all()
-        lp2, _, _ = agent.decoder.evaluate_cotizacion(h, emb, mask, op, cot, j, o)
+        lp2, _, _, wl = agent.decoder.evaluate_cotizacion(h, emb, mask, op, cot, j, o)
+        assert wl.shape == (B, 2)
         torch.testing.assert_close(lp, lp2)
         logits, glimpse = agent.decoder._logits_y_glimpse(h, emb, ~mask)
         lp_j = torch.log_softmax(logits, -1)[filas, j]
@@ -270,7 +321,7 @@ def test_cabeza_de_precio_no_consume_rng_y_arranca_en_la_miope():
     z = torch.zeros(1, 8)
     with torch.no_grad():
         k0 = int(cab(z, z, z, cot)[0, :N_NIVELES].argmax())
-        cab.delta[-1].bias.fill_(1.0)                       # Δ > 0: ganar la carga vale más ⇒ cotiza más bajo
+        cab.delta[-1].bias.copy_(torch.tensor([1.0, 0.0]))  # Δ = W − L > 0: ganar vale más ⇒ cotiza más bajo
         k1 = int(cab(z, z, z, cot)[0, :N_NIVELES].argmax())
     assert k0 == int(np.argmax(v)) and k1 == int(np.argmax(v + P)) and k1 < k0
 
@@ -380,15 +431,18 @@ def test_transfer_de_columnas_de_entrada():
         _reconcile_state_dict({"b": torch.zeros(32)}, {"b": torch.zeros(16)})
     sd, _, omitidos = _reconcile_state_dict({"a": torch.zeros(2)}, {"a": torch.ones(2), "extra": torch.ones(3)})
     assert omitidos == ["extra"] and torch.equal(sd["a"], torch.ones(2))
-    assert _tiene_entradas_actuales({"agent": {clave: torch.zeros(32, N_NODE_FEATURES)}})
-    assert not _tiene_entradas_actuales({"agent": {clave: torch.zeros(32, 34)}})
+    actual = torch.zeros(32, N_NODE_FEATURES)
+    assert _tiene_entradas_actuales({"agent": {clave: actual}, "critic": {clave: actual}})
+    assert not _tiene_entradas_actuales({"agent": {clave: torch.zeros(32, 38)}, "critic": {clave: actual}})
+    assert not _tiene_entradas_actuales({"agent": {clave: actual}, "critic": {"net.0.weight": torch.zeros(32, 32)}})
 
 
 def test_checkpoints_viejos(tmp_path):
     from model.agent import AMRoutingAgent
     from transfer_learning import load_checkpoint_compatible
     torch.manual_seed(0)
-    agent, critic = AMRoutingAgent(N, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, device=DEVICE), CriticHead(AM_D_H)
+    agent = AMRoutingAgent(N, AM_D_H, AM_N_HEADS, AM_N_LAYERS, AM_D_FF, device=DEVICE)
+    critic = CriticHead(AM_D_H, AM_N_HEADS, CRITIC_N_LAYERS, AM_D_FF)
     assert not any(k.startswith("post_value") for k in agent.state_dict())
     sd = dict(agent.state_dict())
     sd["post_value_a.net.0.weight"] = torch.zeros(AM_D_H, 2 * AM_D_H)          # cabezas Ṽ de los *_pricing.pt viejos

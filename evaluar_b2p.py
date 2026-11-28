@@ -1,18 +1,15 @@
 """
 evaluar_b2p.py
 ==============
-Compara B2 y B2P (B2 con pronósticos del índice de mercado, baselines.PoliticaB2P) sin entrenar nada:
-
-  · mundos simulados: los mismos M mundos de evaluación de main.py (disenar_mundos con MARKET_SEED_EVAL)
-    para cada N, K libre;
-  · replay de los días reales de evaluación (solo con --replay), con los mismos casos de evaluar_replay.
+Compara B2 y B2P (B2 con pronósticos del índice de mercado, baselines.PoliticaB2P) sin entrenar nada, en los
+mismos M mundos de prueba de main.py (salidas en octubre; disenar_mundos con MARKET_SEED_EVAL) para cada N, K libre.
 
 Reporta el margen medio de cada política, la diferencia pareada B2P − B2 con IC95 por bootstrap sobre
 mundos, los ms por decisión y la factibilidad. Escribe results/b2p/.
 
 Uso
 ---
-    python evaluar_b2p.py --nodos 10 35 --replay 10
+    python evaluar_b2p.py --nodos 10 35
 """
 
 import argparse
@@ -22,8 +19,8 @@ import time
 import torch  # noqa: F401  (antes que pandas: en Windows, pandas primero rompe la carga de las DLL de torch)
 import pandas as pd
 
-from config import MARKET_SEED_EVAL, MARKET_M_EVAL_WORLDS, TRAIN_DAYS, REPLAY_MAX_CASOS
-from evaluation import ContextoEval, _Casos, casos_replay, disenar_mundos, ejecutar_lote, mundos_eval
+from config import MARKET_SEED_EVAL, MARKET_M_EVAL_WORLDS
+from evaluation import ContextoEval, _Casos, disenar_mundos, ejecutar_lote, mundos_eval
 from market_process import MarketProcess, asegurar_parametros
 from problem_data import load_matrices
 from stats_analysis import ic_bootstrap_media
@@ -52,19 +49,10 @@ def _contexto(N):
 
 def evaluar_simulado(N: int, M: int) -> pd.DataFrame:
     ctx, market = _contexto(N)
-    dis = disenar_mundos(N, M, market, num_dias=TRAIN_DAYS, semilla=MARKET_SEED_EVAL)
-    mundos = mundos_eval(market, dis["start_day"], TRAIN_DAYS - 1, MARKET_SEED_EVAL)
-    casos = _Casos(dis["nodo"], dis["start_day"], dis["dow"], dis["start_day"], mundos, (None,))
-    return _correr(ctx, casos, f"N={N} simulado")
-
-
-def evaluar_replay(N: int) -> pd.DataFrame:
-    ctx, market = _contexto(N)
-    nodos, dias = casos_replay(N, market.num_dias_total - TRAIN_DAYS, REPLAY_MAX_CASOS)
-    dia0 = TRAIN_DAYS + dias
-    mundos = mundos_eval(market, dia0, market.num_dias_total - 1, MARKET_SEED_EVAL + 1, replay=True)
-    casos = _Casos(nodos, dia0, market.dia_semana(dia0), dia0, mundos, (None,))
-    return _correr(ctx, casos, f"N={N} replay")
+    dis = disenar_mundos(N, M, market, periodo="test", semilla=MARKET_SEED_EVAL)
+    mundos = mundos_eval(market, dis["start_day"], dis["dia_max"], MARKET_SEED_EVAL)
+    casos = _Casos(dis["nodo"], dis["start_day"], dis["dow"], mundos, (None,))
+    return _correr(ctx, casos, f"N={N} prueba")
 
 
 def resumir(df: pd.DataFrame, modo: str, N: int) -> dict:
@@ -87,8 +75,7 @@ def resumir(df: pd.DataFrame, modo: str, N: int) -> dict:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--nodos", type=int, nargs="+", default=[10, 35], help="tamaños para los mundos simulados")
-    ap.add_argument("--replay", type=int, nargs="*", default=[10], help="tamaños para el replay")
+    ap.add_argument("--nodos", type=int, nargs="+", default=[10, 35], help="tamaños a evaluar")
     ap.add_argument("--mundos", type=int, default=MARKET_M_EVAL_WORLDS)
     ap.add_argument("--salida", default=os.path.join(_CWD, "results", "b2p"))
     args = ap.parse_args()
@@ -97,12 +84,8 @@ def main():
     filas = []
     for N in args.nodos:
         df = evaluar_simulado(N, args.mundos)
-        df.to_csv(os.path.join(args.salida, f"b2p_simulado_{N}nodos.csv"), index=False)
-        filas.append(resumir(df, "simulado", N))
-    for N in args.replay:
-        df = evaluar_replay(N)
-        df.to_csv(os.path.join(args.salida, f"b2p_replay_{N}nodos.csv"), index=False)
-        filas.append(resumir(df, "replay", N))
+        df.to_csv(os.path.join(args.salida, f"b2p_prueba_{N}nodos.csv"), index=False)
+        filas.append(resumir(df, "prueba", N))
     res = pd.DataFrame(filas)
     res.to_csv(os.path.join(args.salida, "b2p_resumen.csv"), index=False)
     with pd.option_context("display.width", 250, "display.max_columns", None, "display.float_format", "{:.3f}".format):

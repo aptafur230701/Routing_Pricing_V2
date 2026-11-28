@@ -10,6 +10,8 @@ Proceso exógeno de cargas y tarifas (market_process.py, metodologia_realizacion
   · tablas por día: precios con δ = 0 dentro de los cuantiles del día usado, niveles monótonos, m en [1, M_MAX]
   · estadísticas por lane del agente: solo días de entrenamiento, κ de entrenamiento
   · firma, índice histórico, día de la semana, ajuste (días excluidos) y la fórmula de lane_reward
+  · split temporal: la media m y el día más cercano con cargas no cruzan entre entrenamiento, validación y prueba;
+    el ajuste guardado es de los TRAIN_DAYS actuales
 """
 
 import copy
@@ -19,10 +21,10 @@ import torch  # noqa: F401
 import numpy as np
 import pytest
 
-from config import (DIAS_EXCLUIDOS, FECHA_INICIO, TRAIN_DAYS, MARKET_DIAS_EPISODIO, COTIZACIONES_MAX_POR_NODO,
-                    COMPETENCIA_M_MAX, DEVICE)
+from config import (DIAS_EXCLUIDOS, FECHA_INICIO, TRAIN_DAYS, TEST_START, MARKET_DIAS_EPISODIO,
+                    COTIZACIONES_MAX_POR_NODO, COMPETENCIA_M_MAX, DEVICE, periodos)
 from conftest import generador, mundos_sim
-from fit_market_process import ajustar, dia_de_semana, params_path
+from fit_market_process import ajustar, dia_de_semana, estimar_m, params_path
 from market_process import MarketProcess, asegurar_parametros, _CLAVES_AJUSTE
 from pricing import N_NIVELES, indice_nivel, lane_cost_row, precios_niveles
 from problem_data import cargar_dias_mercado, lane_reward
@@ -100,7 +102,7 @@ def test_p1_del_agente_es_la_frecuencia_del_generador(d10):
 def test_replay_usa_las_cargas_reales_y_recorta_al_ultimo_dia(d10):
     mp = d10.market
     ultimo = mp.num_dias_total - 1
-    dia0 = np.array([TRAIN_DAYS, TRAIN_DAYS + 5, ultimo - 1])
+    dia0 = np.array([TEST_START, TEST_START + 5, ultimo - 1])
     m = mp.mundos_replay(dia0, MARKET_DIAS_EPISODIO, ultimo, generador(0))
     assert (m.delta == 0).all() and m.dia_max == ultimo
     for b, d0 in enumerate(dia0):
@@ -236,3 +238,39 @@ def test_parametros_guardados_usan_solo_dias_de_entrenamiento():
     with np.load(params_path()) as z:
         assert z["indice"].shape[0] == len(z["dias_usados"]) == TRAIN_DAYS
         assert np.array_equal(z["dias_usados"], np.arange(TRAIN_DAYS))
+        assert int(z["train_days"]) == TRAIN_DAYS
+
+
+# ── Split temporal ───────────────────────────────────────────────────────────
+
+def test_periodos_cubren_el_historico_sin_huecos(d10):
+    mp = d10.market
+    per = periodos(mp.num_dias_total)
+    assert per["train"] == (0, TRAIN_DAYS) and per["val"][0] == TRAIN_DAYS and per["test"] == (TEST_START, mp.num_dias_total)
+    assert per["val"][1] == TEST_START
+    assert str(mp.fechas[TRAIN_DAYS - 1]) == "2026-08-31" and str(mp.fechas[TEST_START]) == "2026-10-01"
+    assert mp.periodo("test") == per["test"]
+
+
+def test_media_m_se_calcula_dentro_de_cada_periodo(d10):
+    """La ventana de ±3 días de m no cruza de un período a otro: la m de cada período es la que se obtiene con
+    solo los días de ese período (p. ej. la del 31 de agosto no ve las cargas de septiembre)."""
+    mp = d10.market
+    dow = mp.dia_semana(np.arange(mp.num_dias_total))
+    for ini, fin in periodos(mp.num_dias_total).values():
+        solo = estimar_m(mp.count_loads[ini:fin], dow[ini:fin], mp.f_w)
+        np.testing.assert_allclose(mp._m_stack[ini:fin], solo)
+    # cambiar las cargas de validación y prueba no mueve la m de entrenamiento
+    otras = mp.count_loads.copy()
+    otras[TRAIN_DAYS:] = otras[TRAIN_DAYS:] * 3 + 1
+    m_otra = estimar_m(otras, dow, mp.f_w, por_periodo=True)
+    np.testing.assert_allclose(m_otra[:TRAIN_DAYS], mp._m_stack[:TRAIN_DAYS])
+
+
+def test_dia_cercano_con_cargas_no_sale_de_su_periodo(d10):
+    mp = d10.market
+    D = mp.num_dias_total
+    per = np.searchsorted([TRAIN_DAYS, TEST_START], np.arange(D), side="right")      # 0 train, 1 val, 2 test
+    dc = mp._dia_cercano
+    valido = dc >= 0
+    assert (per[np.where(valido, dc, 0)] == per[:, None, None])[valido].all()

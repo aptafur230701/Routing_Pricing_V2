@@ -6,7 +6,7 @@ con los 194 hubs y las 37,442 lanes. Produce las tablas y figuras de validacion_
 
   A. Disponibilidad de cargas (binomial negativa / Poisson) — prueba de Kolmogorov-Smirnov de dos muestras,
      lane por lane: las cargas reales por día de la lane contra las cargas que sortea el generador
-     (m del Paso 4b, r del grupo de volumen). Dentro de la muestra (jun-sep) y fuera de ella (oct).
+     (m del Paso 4b, r del grupo de volumen). Dentro de la muestra (jun-ago) y fuera de ella (oct).
   B. Rate ($/milla) — la media del precio sorteado (calculada exacta, sin Monte Carlo) contra la media
      real del día, que NO se usa para construir los sorteos. Mejores y peores lanes.
   C. Corrimiento δ — normalidad del cambio diario del factor nacional (KS con parámetros estimados,
@@ -26,7 +26,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from config import TRAIN_DAYS
+from config import TRAIN_DAYS, TEST_START
 from fit_market_process import estimar_m, factor_nacional, params_path
 from problem_data import cargar_dias_mercado
 
@@ -124,7 +124,7 @@ def figura_media_desv(t, path):
         ax.plot(lim, lim, color="black", ls="--", lw=1, label="real = generado")
         ax.set(xlabel=f"{nombre}: real", ylabel=f"{nombre}: generador", title=nombre)
         ax.legend(fontsize=8, loc="upper left")
-    fig.suptitle("Una lane por punto (jun–sep). Colores más oscuros = más lanes", fontsize=10)
+    fig.suptitle("Una lane por punto (jun–ago). Colores más oscuros = más lanes", fontsize=10)
     fig.tight_layout()
     fig.savefig(path, dpi=130)
     plt.close(fig)
@@ -148,7 +148,7 @@ def figura_ecdf_grupos(y, m, r_lane, grupo, r_grupo, path, rng):
     axes[0, 0].legend(fontsize=8)
     axes[0, 0].set_ylabel("proporción acumulada")
     axes[1, 0].set_ylabel("proporción acumulada")
-    fig.suptitle("Distribución acumulada de las cargas por día: real contra generador, por grupo de volumen (jun–sep)",
+    fig.suptitle("Distribución acumulada de las cargas por día: real contra generador, por grupo de volumen (jun–ago)",
                  fontsize=10)
     fig.tight_layout()
     fig.savefig(path, dpi=130)
@@ -299,8 +299,9 @@ def main():
 
     # ── A ──
     print("== A. Disponibilidad de cargas (KS de dos muestras: real vs. generador) ==")
-    # m como en el ajuste: entrenamiento con los vecinos de jun-sep; prueba con los vecinos de oct (r y f_w de entrenamiento)
-    periodos = {"entrenamiento": slice(0, TRAIN_DAYS), "prueba": slice(TRAIN_DAYS, None)}
+    # m como en el ajuste: entrenamiento con los vecinos de jun-ago; prueba con los vecinos de oct (r y f_w de
+    # entrenamiento). Septiembre (validación) no entra en ninguno de los dos.
+    periodos = {"entrenamiento": slice(0, TRAIN_DAYS), "prueba": slice(TEST_START, None)}
     datos = {}
     for nombre, sl in periodos.items():
         y = cl[sl].astype(np.float64)
@@ -353,7 +354,7 @@ def main():
                                     lanes_en_nivel=len(tg)))
     por_nivel = pd.DataFrame(filas_nivel)
     por_nivel.to_csv(os.path.join(TAB, "A_casos_por_volumen.csv"), index=False)
-    print("\nMejor / mediana / peor lane en cada nivel de volumen (D del KS, jun–sep):")
+    print("\nMejor / mediana / peor lane en cada nivel de volumen (D del KS, jun–ago):")
     print(por_nivel.drop(columns=["i", "j"]).to_string(index=False))
     niveles = {"alto": (9, "Alto volumen (decil 9, ≥ 53 cargas/día en promedio)"),
                "medio": (5, "Volumen medio (decil 5, 7–11 cargas/día)"),
@@ -362,7 +363,7 @@ def main():
         sub = por_nivel[por_nivel["grupo"] == g]
         casos = [(f"{r.caso.capitalize()}", int(r.i), int(r.j), r.D, r.p_valor) for r in sub.itertuples()]
         figura_lanes_cargas(y_tr, m_tr, r_lane, casos, hubs_txt, os.path.join(FIG, f"A_lanes_{clave}_volumen.png"),
-                            f"Cargas por día, {texto}: mejor, mediana y peor lane según D de KS (jun–sep)")
+                            f"Cargas por día, {texto}: mejor, mediana y peor lane según D de KS (jun–ago)")
 
     met = {}
     for periodo, (y, m) in datos.items():

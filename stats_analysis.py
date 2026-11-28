@@ -12,53 +12,24 @@ Unidad de análisis: la diferencia de margen (USD) DRL − método en un mismo m
     (BOOTSTRAP_B remuestreos, semilla fija; Agarwal et al., 2021).
   · Wilcoxon de rangos con signo, pareado y de una cola (H1: DRL > método), con
     corrección de Holm por las comparaciones de cada (modo, K, familia) (Accorsi, Lodi y Vigo).
-  · Si UB-DP es "no tratable" a ese tamaño, B3 no está en los datos y simplemente no se compara.
+  · Si la DP es "no tratable" a ese tamaño, B3 no está en los datos y simplemente no se compara.
   · B2 se compara en todos los niveles de K, incluido el libre.
-  · gap_pct: (ref − método) / |ref| · 100 sobre los promedios de los mismos mundos (lo usa el Resumen).
+  · gap_pct: (UB-PI − método) / |UB-PI| · 100 sobre los promedios de los mismos mundos (lo usa el Resumen).
 
-El replay (días reales desde TRAIN_DAYS, que ni el entrenamiento ni el ajuste del proceso vieron) se
-calcula igual pero va etiquetado con la fecha real de inicio (NOTA_REPLAY), calculada a partir de
-FECHA_INICIO y TRAIN_DAYS en vez de quemar un rango de días a mano.
+Los mundos comparados son los de prueba (salidas en octubre, evaluation.evaluar_mundos_simulados).
 """
-
-import datetime
 
 import numpy as np
 import torch  # noqa: F401  (antes que pandas: en Windows, pandas primero rompe la carga de las DLL de torch)
 import pandas as pd
 from scipy.stats import wilcoxon
 
-from config import BOOTSTRAP_B, BOOTSTRAP_SEED, FECHA_INICIO, TRAIN_DAYS
+from config import BOOTSTRAP_B, BOOTSTRAP_SEED
 
 REFERENCIA = "DRL"
 BASELINES = ("B1", "B2", "B2P", "B3")
 REGLAS_PRECIO = ("DRL-dest+mediana", "DRL-dest+be_margen", "DRL-dest+miope")
 FAMILIAS = {"ruteo": BASELINES, "precio": REGLAS_PRECIO}
-_FECHA_INICIO_REPLAY = (
-    datetime.date.fromisoformat(FECHA_INICIO) + datetime.timedelta(days=TRAIN_DAYS)
-).isoformat()
-NOTA_REPLAY = f"replay, fuera de muestra (días reales desde {_FECHA_INICIO_REPLAY})"
-
-
-def etiqueta_modo(modo: str) -> str:
-    return NOTA_REPLAY if modo == "replay" else modo
-
-
-NOTA_UB_DP = ("«Óptimo con mercado promedio» es lo que lograría la mejor política si el mercado de cada día fuera "
-              "el promedio, sin memoria de los días anteriores. No es un tope: un método que observa el mercado del día "
-              "puede superarlo. El «Máximo teórico (información perfecta)» sí es un tope: ningún método puede superarlo.")
-NOTA_UB_DP_FLOJA = "supera al máximo teórico (ver nota)"
-NOTA_UB_DP_FLOJA_LARGA = (
-    "Aquí el «Óptimo con mercado promedio» supera al «Máximo teórico», lo que no debería pasar: es un error de "
-    "aproximación de su cálculo (muestreo y discretización del tiempo). No usarlo como referencia en esta tabla."
-)
-
-
-def ub_dp_floja(ub_dp, ub_pi) -> bool:
-    """True si la media de UB-DP supera a la de UB-PI (sobre los mundos con ambas cotas)."""
-    ub_dp, ub_pi = np.asarray(ub_dp, dtype=float), np.asarray(ub_pi, dtype=float)
-    ok = ~np.isnan(ub_dp) & ~np.isnan(ub_pi)
-    return bool(ok.any() and ub_dp[ok].mean() > ub_pi[ok].mean())
 
 
 def gap_pct(ub, x) -> float:
@@ -145,7 +116,7 @@ def _bloque_pareado(ancho, modo, K, familia, metodos, referencia, B, rng, alpha)
         medias = dif[_indices_bootstrap(n, B, rng)].mean(axis=1)
         stat, p = _wilcoxon_mayor(dif)
         bloque.append({
-            "modo": etiqueta_modo(modo), "K": K, "familia": familia,
+            "modo": modo, "K": K, "familia": familia,
             "comparacion": f"{referencia} − {b}", "n_mundos": n,
             "dif_media_usd": float(dif.mean()),
             "ic95_inf": float(np.percentile(medias, 2.5)),
@@ -160,11 +131,10 @@ def _bloque_pareado(ancho, modo, K, familia, metodos, referencia, B, rng, alpha)
     return bloque
 
 
-def append_comparacion_to_excel(excel_path: str, sim_df: pd.DataFrame, replay_df: pd.DataFrame = None) -> None:
+def append_comparacion_to_excel(excel_path: str, sim_df: pd.DataFrame) -> None:
     """Agrega al Excel la hoja 'Comparación': DRL − cada método, una fila por (modo, K, comparación).
     familia "ruteo" = B1, B2, B2P, B3; familia "precio" = mismas rutas del DRL con reglas de precio fijas (lo que aporta la cabeza de precio)."""
-    df = sim_df if replay_df is None or replay_df.empty else pd.concat([sim_df, replay_df], ignore_index=True)
-    pareada = comparar_con_baselines(df).drop(columns=["wilcoxon_stat", "p_una_cola"], errors="ignore")
+    pareada = comparar_con_baselines(sim_df).drop(columns=["wilcoxon_stat", "p_una_cola"], errors="ignore")
     from excel_report import escribir_comparacion
     escribir_comparacion(excel_path, pareada)
     print(f"Hoja 'Comparación' agregada → {excel_path}")

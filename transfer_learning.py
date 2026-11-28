@@ -12,12 +12,12 @@ que dependan de num_nodes. El Transformer opera sobre conjuntos de
 embeddings de tamaño variable — lo que cambia entre tamaños es el
 número de nodos en runtime, no los pesos del modelo.
 
-  encoder.input_proj   : N_NODE_FEATURES (8, o 12 con USE_CONTINUATION_FEATURES) → d_h  (independiente de N)
+  encoder.input_proj   : N_NODE_FEATURES → d_h  (independiente de N; igual en el encoder del crítico)
   encoder.layers[i]    : d_h → d_h        (independiente de N)
   context_net.proj     : 2·d_h+3+n_market+n_budget → d_h  (independiente de N)
   decoder.glimpse      : d_h → d_h        (independiente de N)
   decoder.pointer      : d_h → logit      (independiente de N)
-  critic.net           : d_h → 1          (independiente de N)
+  critic.*             : encoder + context propios, d_h → 1  (independiente de N)
 
 Uso desde main.py
 -----------------
@@ -37,7 +37,7 @@ import os
 import torch
 from model.agent import AMRoutingAgent
 from model.critic_head import CriticHead
-from config import DEVICE
+from config import DEVICE, CRITIC_N_LAYERS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -124,12 +124,15 @@ def _tiene_cabeza_de_precio(checkpoint: dict) -> bool:
 
 
 def _tiene_entradas_actuales(checkpoint: dict) -> bool:
-    """El encoder del checkpoint tiene las columnas de nodo actuales (model.encoder.N_NODE_FEATURES). Un checkpoint con
-    menos columnas (p. ej. el de antes del 2026-11-27, con 34) NO se expande: sus columnas de continuación significan
-    otra cosa y `_reconcile_state_dict` las copiaría desalineadas en silencio."""
+    """Los encoders del agente y del crítico tienen las columnas de nodo actuales (model.encoder.N_NODE_FEATURES). Un
+    checkpoint con menos columnas (34 antes del 2026-11-27, 38 antes del 2026-11-28, sin el tablero de hoy) NO se
+    expande: sus columnas de continuación e índice significan otra cosa y `_reconcile_state_dict` las copiaría
+    desalineadas en silencio. Tampoco sirve uno cuyo crítico no tiene encoder propio (antes del 2026-11-28)."""
     from model.encoder import N_NODE_FEATURES
     pesos = checkpoint["agent"].get("encoder.input_proj.proj.weight")
-    return pesos is not None and pesos.shape[1] == N_NODE_FEATURES
+    pesos_c = checkpoint.get("critic", {}).get("encoder.input_proj.proj.weight")   # crítico con encoder propio
+    return (pesos is not None and pesos.shape[1] == N_NODE_FEATURES
+            and pesos_c is not None and pesos_c.shape[1] == N_NODE_FEATURES)
 
 
 def es_checkpoint_con_cotizacion(checkpoint_path: str) -> bool:
@@ -170,15 +173,15 @@ def _instanciar_y_transferir(
         )
     if not _tiene_entradas_actuales(checkpoint):
         raise ValueError(
-            f"{checkpoint_path} tiene otras columnas de nodo que el modelo actual (antes del 2026-11-27: otras features "
-            f"de continuación). Bórralo o vuelve a entrenar ese tamaño."
+            f"{checkpoint_path} tiene otras columnas de nodo que el modelo actual, o un crítico sin encoder propio "
+            f"(checkpoints de antes del 2026-11-28). Bórralo o vuelve a entrenar ese tamaño."
         )
 
     agent  = AMRoutingAgent(
         num_nodes=num_nodes, d_h=d_h, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff,
         device=DEVICE,
     )
-    critic = CriticHead(d_h).to(DEVICE)
+    critic = CriticHead(d_h, n_heads, CRITIC_N_LAYERS, d_ff).to(DEVICE)
 
     agent_sd,  transferred_a, skipped_a = _reconcile_state_dict(agent.state_dict(),  checkpoint["agent"])
     critic_sd, transferred_c, skipped_c = _reconcile_state_dict(critic.state_dict(), checkpoint["critic"])
@@ -335,7 +338,7 @@ def build_agent_for_training(
     if verbose:
         print(f"\n  [Transfer] {num_nodes} nodos — pesos aleatorios (sin fuente).")
     agent  = AMRoutingAgent(num_nodes, d_h, n_heads, n_layers, d_ff, device=DEVICE)
-    critic = CriticHead(d_h).to(DEVICE)
+    critic = CriticHead(d_h, n_heads, CRITIC_N_LAYERS, d_ff).to(DEVICE)
     return agent, critic
 
 

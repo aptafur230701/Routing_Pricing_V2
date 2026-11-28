@@ -98,7 +98,7 @@ def construir_features(env, entradas: EntradasAgente) -> dict:
     node_feats = build_node_features_batch(
         cur, env.start_node, env.T, env.dist, entradas.max_duration, entradas.p95, entradas.avail,
         env.reward_rows, entradas.est, env.time_elapsed, env.start_dow, env.market_index, env.index_std,
-        cotizacion_feats=cot_nodo,
+        cotizacion_feats=cot_nodo, cargas_hoy=env.cargas_hoy, margen_hoy=env.margen_hoy,
     )
     return dict(
         node_feats=node_feats,

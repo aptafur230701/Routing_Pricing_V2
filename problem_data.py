@@ -29,7 +29,7 @@ import pandas as pd
 from config import (
     MPG,
     BIG_M_PENALTY, MARGINAL_COST_SIN_DIESEL,
-    TRAIN_DAYS,
+    TRAIN_DAYS, periodos,
 )
 
 # ── Rutas de los datos nuevos (jun-oct 2026) ──────────────────────────────
@@ -54,13 +54,23 @@ def orden_hubs(data_dir: str = None) -> np.ndarray:
     return header.columns.astype(np.int64).to_numpy()
 
 
-def _nearest_valid_index(valid: np.ndarray) -> np.ndarray:
+def _nearest_valid_index(valid: np.ndarray, por_periodo: bool = False) -> np.ndarray:
     """Para cada posición a lo largo del eje 0 (días), el índice del día más cercano con `valid=True`
     en esa misma posición de los ejes restantes (empate → el día anterior). `valid` : (D, ...) bool.
     Devuelve (D, ...) int64; una posición sin ningún día válido devuelve -1 (el llamador debe manejarlo:
     en ese caso la lane nunca tuvo cargas en toda la ventana).
+
+    por_periodo : True ⇒ el día más cercano se busca solo dentro del mismo período (entrenamiento, validación o
+    prueba, `config.periodos`), para que ningún período use datos de otro.
     """
     D = valid.shape[0]
+    if por_periodo:
+        out = np.full(valid.shape, -1, dtype=np.int64)
+        for ini, fin in periodos(D).values():
+            if fin > ini:
+                sub = _nearest_valid_index(valid[ini:fin])
+                out[ini:fin] = np.where(sub >= 0, sub + ini, -1)
+        return out
     forma_dia = (D,) + (1,) * (valid.ndim - 1)
     dia_idx = np.arange(D).reshape(forma_dia)
 
@@ -138,7 +148,7 @@ def cargar_dias_mercado(data_dir: str = None) -> dict:
     ltr_valido = ~((ltr_hub == 0) & (loads_por_hub > 0))
     n_faltantes = int((~ltr_valido).sum())
     if n_faltantes:
-        idx_cercano = _nearest_valid_index(ltr_valido)             # (D, N)
+        idx_cercano = _nearest_valid_index(ltr_valido, por_periodo=True)   # (D, N), dentro del período
         malos = np.flatnonzero(~ltr_valido.ravel())
         d_malo, hub_malo = np.unravel_index(malos, ltr_valido.shape)
         d_cercano = idx_cercano[d_malo, hub_malo]
@@ -151,7 +161,7 @@ def cargar_dias_mercado(data_dir: str = None) -> dict:
     # Regla 1: lane-día con count_loads == 0 → cuantiles no usables; día más cercano con cargas de esa
     # misma lane (para sortear precios cuando la realización sí ofrezca cargas en esa lane ese día).
     con_cargas = count_loads > 0
-    dia_con_cargas_cercano = _nearest_valid_index(con_cargas)      # (D, N, N)
+    dia_con_cargas_cercano = _nearest_valid_index(con_cargas, por_periodo=True)   # (D, N, N), dentro del período
 
     return {
         **stacks,
@@ -260,8 +270,9 @@ def load_matrices(num_nodes: int) -> tuple:
     dias = cargar_dias_mercado(data_dir)
     num_days = dias["count_loads"].shape[0]
     train_days = min(TRAIN_DAYS, num_days)
-    print(f"Multi-day data  : {num_days} días totales (jun-oct 2026) | train={train_days} "
-          f"| eval={num_days - train_days}")
+    per = periodos(num_days)
+    print(f"Multi-day data  : {num_days} días totales (jun-oct 2026) | "
+          + " | ".join(f"{k}={fin - ini}" for k, (ini, fin) in per.items()))
 
     rate_stack_raw  = dias["mean"]
     loads_stack_raw = dias["count_loads"]

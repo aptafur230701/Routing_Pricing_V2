@@ -63,9 +63,11 @@ class ObsLote:
     m (B,) f64           : competidores efectivos del nodo.
     opciones (B, N, K+1) : opciones válidas por destino (niveles y VACÍO).
     dow0 (B,)            : día de la semana (lunes = 0) del día de salida.
-    indice (B, N) f64    : índice de mercado de hoy (solo B2P).
+    indice (B, N) f64    : índice de mercado de hoy, el día de la visita (solo B2P).
     n_rech (B,)          : cotizaciones ya perdidas en esta visita al nodo.
     intentos (B, N)      : cargas de cada lane que se pueden cotizar todavía en esta visita.
+    dia_visita (B,)      : días de mercado entre la salida y la visita (el día del tablero y del índice; solo B2P).
+                           None ⇒ se toma del reloj (filas sintéticas de los tests, donde coinciden).
     """
     nodo: torch.Tensor
     casa: torch.Tensor
@@ -80,6 +82,7 @@ class ObsLote:
     indice: torch.Tensor
     n_rech: torch.Tensor
     intentos: torch.Tensor
+    dia_visita: torch.Tensor = None
 
     @staticmethod
     def del_entorno(env, masks) -> "ObsLote":
@@ -87,7 +90,7 @@ class ObsLote:
             nodo=env.current_node, casa=env.start_node, tiempo=env.time_elapsed.double(),
             k_rest=env.k_remaining, k_restr=env.k_restricted, mascara=masks.bool(), precios=env.precios_row,
             m=env.competencia, opciones=env.opciones_validas, dow0=env.start_dow, indice=env.market_index.double(),
-            n_rech=env.n_rechazos, intentos=env.intentos.clamp_min(0),
+            n_rech=env.n_rechazos, intentos=env.intentos.clamp_min(0), dia_visita=env.dias_desde_salida,
         )
 
     @property
@@ -555,7 +558,9 @@ class PoliticaB2P(_ConEstatico):
         s_a = torch.floor((t[:, None] + est.T[i]) / est.dt + 1e-9).long().clamp(max=smax)          # (n, N)
         s_w = est.franja(fin_espera(t))
         s_a[bb, i] = s_w
-        dia_hoy = torch.floor(torch.floor(t / est.dt + 1e-9) * est.dt / _DIA_HORAS + 1e-9).long()
+        # "Hoy" es el día del índice observado: el de la visita (aunque los rechazos hayan pasado el reloj al siguiente).
+        dia_hoy = (obs.dia_visita[filas] if obs.dia_visita is not None
+                   else torch.floor(torch.floor(t / est.dt + 1e-9) * est.dt / _DIA_HORAS + 1e-9).long())
         s_lo = int(torch.floor(t / est.dt + 1e-9).long().clamp(max=smax).min())
         tabla = self._valores(est, h, d0, dia_hoy, indice, s_lo, None if libre else int(k.max()))
         if libre:

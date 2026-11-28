@@ -15,5 +15,5 @@ slurm_job.sh
 *.sbatch
 
 # Estado completo para reanudar el entrenamiento (am_training.py): pesado y temporal, se copia a mano entre sesiones
-checkpoints/am_resume_*.pt
-checkpoints/am_resume_*.pt.tmp
+checkpoints/**/am_resume_*.pt
+checkpoints/**/am_resume_*.pt.tmp
