@@ -59,9 +59,6 @@ USE_REWARD_SHAPING     = False   # True: el retorno exitoso suma RETURN_SUCCESS_
                                  # retorno exitoso, así que el reward del episodio es margen / REWARD_SCALE_FACTOR.
                                  # TIME_VIOLATION_PENALTY se aplica en ambos casos. Ablacionable.
 
-# ── Evaluation ────────────────────────────────────────────────
-N_EVAL_EPISODES = 50
-
 # ── AM Model architecture ─────────────────────────────────────
 AM_D_H      = 192  # Dimensión de embeddings del Transformer. Subido de 128: la política greedy
                     # saturaba en una meseta ~update 300-400 con crítico sano, indicando techo
@@ -145,6 +142,13 @@ SELF_CRITICAL_WARMUP_UPDATES = 50      # no aplicar self-critical hasta este upd
 CKPT_SELECTION = "moving_avg"   # "moving_avg" | "max"
 CKPT_WINDOW    = 3
 
+# ── Reanudación del entrenamiento (am_training.py) ────────────
+# Cada tanto se guarda el estado COMPLETO del entrenamiento en checkpoints/am_resume_<N>nodes.pt: pesos, optimizadores,
+# scheduler, update, selección del mejor checkpoint, historial y estados aleatorios. Con RESUME=1 (variable de entorno),
+# main.py sigue desde ahí si el archivo existe; sin RESUME=1 se entrena desde cero y el archivo se sobrescribe.
+RESUME_CADA_UPDATES = 20    # guarda cada tantos updates…
+RESUME_CADA_MIN     = 15.0  # …o cada tantos minutos desde el último guardado, lo que pase primero
+
 # ── Learning rate con decaimiento coseno ──────────────────────
 USE_LR_COSINE  = True   # True: el LR de actor y critic baja con coseno desde su valor inicial hasta
                         # LR_FINAL_FRAC de ese valor al terminar n_updates (un scheduler.step() por update).
@@ -205,8 +209,8 @@ def set_seeds(seed: int) -> None:
         torch.cuda.manual_seed(seed)
 
 # ── Generador de realizaciones diarias (market_process) ──────
-# Ver metodologia_realizaciones_mercado_reefer.md (generador) y proceso_exogeno_cargas_tarifas.md
-# (índice de mercado por nodo, conservado). Ningún índice de día va escrito a mano: el número de
+# Ver metodologia_realizaciones_mercado_reefer.md (generador); el índice de mercado por nodo se
+# documenta en fit_market_process.py. Ningún índice de día va escrito a mano: el número de
 # días sale de los CSV diarios de datos/datos_finales_jun_oct_2026 y las fechas salen de sus nombres
 # de archivo (FECHA_INICIO = la primera fecha de esa carpeta, jun 1 2026).
 FECHA_INICIO         = "2026-06-01"   # primer día de datos/datos_finales_jun_oct_2026 (lunes)

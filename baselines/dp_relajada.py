@@ -79,11 +79,6 @@ def tabla_path(num_nodes: int) -> str:
     return os.path.join(_CWD, UBDP_TABLA_PATH.format(n=num_nodes))
 
 
-def marcador_path(num_nodes: int) -> str:
-    """Ruta del marcador "no tratable" de `num_nodes` nodos."""
-    return tabla_path(num_nodes).replace(".npz", ".no_tratable.json")
-
-
 class UBDPNoTratable(Exception):
     """El cálculo de la tabla superó el tiempo máximo o la memoria disponible."""
 

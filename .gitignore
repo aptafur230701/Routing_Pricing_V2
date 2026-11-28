@@ -4,9 +4,8 @@ __pycache__/
 logs/
 runs/
 .ipynb_checkpoints/
-# Tabla V de UB-DP y marcadores "no tratable": se regeneran con main.py (dp_relajada.cargar_o_calcular_tabla)
-baselines/datos/ubdp_tabla_*.npz
-baselines/datos/ubdp_tabla_*.no_tratable.json
+# La tabla V de UB-DP (baselines/datos/ubdp_tabla_*.npz) y su marcador "no tratable" SÍ se versionan: recalcularlas
+# cuesta horas (tope UBDP_TIEMPO_MAX_HORAS) y en Kaggle cada sesión empieza de cero. Límite de GitHub: 100 MB por archivo.
 
 # Caché de baselines y cotas de la evaluación (se regenera)
 datos/cache_eval/
@@ -14,3 +13,7 @@ datos/cache_eval/
 # Guiones del runner de experimentos
 slurm_job.sh
 *.sbatch
+
+# Estado completo para reanudar el entrenamiento (am_training.py): pesado y temporal, se copia a mano entre sesiones
+checkpoints/am_resume_*.pt
+checkpoints/am_resume_*.pt.tmp

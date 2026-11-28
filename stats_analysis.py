@@ -38,7 +38,6 @@ _FECHA_INICIO_REPLAY = (
     datetime.date.fromisoformat(FECHA_INICIO) + datetime.timedelta(days=TRAIN_DAYS)
 ).isoformat()
 NOTA_REPLAY = f"replay, fuera de muestra (días reales desde {_FECHA_INICIO_REPLAY})"
-ETIQUETA_REPLAY_CORTA = f"replay (desde {_FECHA_INICIO_REPLAY})"
 
 
 def etiqueta_modo(modo: str) -> str:
@@ -87,25 +86,6 @@ def ic_bootstrap_media(valores, B: int = BOOTSTRAP_B, rng=None, semilla: int = B
         return float("nan"), float("nan")
     rng = rng if rng is not None else np.random.Generator(np.random.PCG64(semilla))
     medias = v[_indices_bootstrap(len(v), B, rng)].mean(axis=1)
-    return float(np.percentile(medias, 2.5)), float(np.percentile(medias, 97.5))
-
-
-def ic_bootstrap_cluster(valores, grupos, B: int = BOOTSTRAP_B, semilla: int = BOOTSTRAP_SEED) -> tuple:
-    """IC del 95 % de la media por bootstrap de conglomerados: remuestrea GRUPOS (p. ej. mundos) con reemplazo.
-
-    Los estados de un mismo mundo no son independientes, así que se remuestrean mundos enteros y la media de cada
-    réplica es la de todos los valores de los mundos sorteados (suma / cuenta). Devuelve (bajo, alto); NaN si vacío.
-    """
-    v, g = np.asarray(valores, dtype=float), np.asarray(grupos)
-    ok = ~np.isnan(v)
-    v, g = v[ok], g[ok]
-    if len(v) == 0:
-        return float("nan"), float("nan")
-    _, inv = np.unique(g, return_inverse=True)
-    suma, cuenta = np.bincount(inv, weights=v), np.bincount(inv).astype(float)
-    rng = np.random.Generator(np.random.PCG64(semilla))
-    idx = rng.integers(0, len(suma), size=(B, len(suma)))
-    medias = suma[idx].sum(axis=1) / cuenta[idx].sum(axis=1)
     return float(np.percentile(medias, 2.5)), float(np.percentile(medias, 97.5))
 
 

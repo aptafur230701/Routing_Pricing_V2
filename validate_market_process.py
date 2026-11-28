@@ -2,8 +2,8 @@
 validate_market_process.py
 ==========================
 Validación del generador de realizaciones diarias (Paso 6 de
-metodologia_realizaciones_mercado_reefer.md) y del índice de mercado por nodo (conservado de
-proceso_exogeno_cargas_tarifas.md).
+metodologia_realizaciones_mercado_reefer.md) y del índice de mercado por nodo (ajustado en
+fit_market_process.py).
 
 Se simulan miles de realizaciones con δ = 0 de una muestra de días y lanes de ENTRENAMIENTO (con
 lanes de volumen alto, medio y bajo) y se revisa:
@@ -82,10 +82,6 @@ def _estados_por_hub(data_dir: str = None) -> dict:
 def _nombre_hub(hub_id: int, estados: dict) -> str:
     abrev = estados.get(hub_id)
     return _ESTADOS_US.get(abrev, abrev) if abrev else f"hub {hub_id}"
-
-
-def _dentro(real, lo, hi) -> np.ndarray:
-    return (real >= lo) & (real <= hi)
 
 
 def pendiente(indice: np.ndarray, h: int) -> float:

@@ -18,6 +18,8 @@ tensores y GAE se calcula vectorizado sobre los B episodios. A la CPU solo vuelv
 """
 
 import math
+import os
+import random
 import time
 from collections import defaultdict, deque
 from contextlib import contextmanager
@@ -44,6 +46,7 @@ from config import (
     USE_CONTINUATION_FEATURES,
     CKPT_SELECTION, CKPT_WINDOW, USE_LR_COSINE, LR_FINAL_FRAC, hp,
     PPO_ENTROPY_COEF_PRECIO_START, PPO_ENTROPY_COEF_PRECIO_END,
+    RESUME_CADA_UPDATES, RESUME_CADA_MIN,
 )
 from routing_env import VectorRoutingEnv
 from greedy_rollout import EntradasAgente, greedy_rollout, construir_features
@@ -256,6 +259,34 @@ def _gae(tr: dict, B: int, gamma: float, lam: float) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Reanudación: estado completo del entrenamiento en un archivo
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _guardar_atomico(obj, path: str) -> None:
+    """torch.save a un temporal y después os.replace: un corte a mitad de la escritura no deja el archivo corrupto."""
+    tmp = path + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def _cargar_reanudacion(path: str) -> dict:
+    # Archivo propio (no de terceros): weights_only=False para los estados de numpy y random y el historial.
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def tiempo_previo_reanudacion(path: str) -> float:
+    """Segundos de entrenamiento ya acumulados en el archivo de reanudación (0.0 si no existe)."""
+    if not path or not os.path.exists(path):
+        return 0.0
+    return float(_cargar_reanudacion(path).get("t_acumulado", 0.0))
+
+
+def _diferencias_huella(guardada: dict, actual: dict) -> list:
+    return [f"{k}: archivo={guardada.get(k)!r} ahora={actual.get(k)!r}"
+            for k in sorted(set(guardada) | set(actual)) if guardada.get(k) != actual.get(k)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Función principal de entrenamiento
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -273,6 +304,8 @@ def run_am_training(
     best_checkpoint_path: str = None,  # ruta donde se guarda el update con mejor margen de validación; None = no se guarda
     trial_callback: callable = None,   # HPO opcional: fn(step, n_updates, log_entry) -> bool (True = detener ya)
     est_lane: object = None,           # EstadisticasLane (MarketProcess.estadisticas_dow); None ⇒ se calcula aquí
+    resume_path: str = None,           # archivo con el estado completo para reanudar; None = no se guarda
+    reanudar: bool = False,            # True: si resume_path existe, sigue desde ahí; False: empieza de cero
 ) -> tuple:
     """
     Entrena AMRoutingAgent + CriticHead con PPO, todo en config.DEVICE.
@@ -280,6 +313,13 @@ def run_am_training(
     En cada update se sortean B = PPO_N_EPISODES_PER_UPDATE mundos (hub inicial, día real inicial, δ, cargas y
     competidores) y se recolecta un episodio en cada uno, en paralelo. `best_checkpoint_path` guarda
     {"agent", "critic"} del update con mejor margen en los episodios fijos de validación (ValidacionSimulada).
+
+    Reanudación: con `resume_path`, cada RESUME_CADA_UPDATES updates o RESUME_CADA_MIN minutos (y al terminar) se
+    guarda el estado completo (pesos, optimizadores, schedulers, update, selección del mejor checkpoint, historial y
+    estados aleatorios de random, numpy, torch, CUDA y el generador de mundos). Con `reanudar=True` y el archivo
+    presente, el entrenamiento sigue en el update siguiente al guardado; si ya había terminado, no entrena más. En CPU
+    el resultado es idéntico al de una corrida sin cortes; en GPU, equivalente (algunos kernels de CUDA no son
+    deterministas). Si la configuración del archivo no coincide con la actual, se detiene con un error.
 
     Retorna (agent, critic, episode_rewards (list), episode_losses (list), training_log (list de dicts)).
     """
@@ -297,6 +337,7 @@ def run_am_training(
     entropy_precio_start  = hp("PPO_ENTROPY_COEF_PRECIO_START", PPO_ENTROPY_COEF_PRECIO_START)
     entropy_precio_end    = hp("PPO_ENTROPY_COEF_PRECIO_END",   PPO_ENTROPY_COEF_PRECIO_END)
 
+    t_sesion0 = time.perf_counter()
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
@@ -346,11 +387,80 @@ def run_am_training(
     ventana = deque(maxlen=CKPT_WINDOW)     # selección por media móvil: pesos (CPU) y score de las últimas validaciones
     best_ma = -np.inf
     ckpt_update = ckpt_score = None
+    best_pesos = None                       # {"agent", "critic"} (CPU) del mejor checkpoint: va en la reanudación
     episode_rewards, episode_losses, training_log = [], [], []
     fases_acum, updates_acum = defaultdict(float), 0
 
+    # ── Reanudación ───────────────────────────────────────────────────────────
+    # Huella: lo que tiene que coincidir para que seguir un entrenamiento guardado sea válido.
+    huella = {
+        "num_nodes": int(num_nodes), "n_updates": int(n_updates), "episodios_por_update": int(n_episodes_per_update),
+        "lr": float(lr), "entropy": (float(entropy_start), float(entropy_end)),
+        "entropy_precio": (float(entropy_precio_start), float(entropy_precio_end)),
+        "lr_final_frac": float(lr_final_frac), "lr_coseno": bool(USE_LR_COSINE),
+        "self_critical": bool(USE_SELF_CRITICAL), "ckpt": (CKPT_SELECTION, int(CKPT_WINDOW)),
+        "k_niveles": ["libre" if k is None else int(k) for k in K_TRAINING_LEVELS],
+        "seed": int(SEED), "market_seed_train": int(MARKET_SEED_TRAIN), "num_train_days": int(num_train_days),
+        "device": DEVICE.type, "arquitectura": {k: tuple(v.shape) for k, v in agent.state_dict().items()},
+    }
+    t_previo = 0.0                # segundos de sesiones anteriores
+    start_update = 0
+    if resume_path and reanudar and os.path.exists(resume_path):
+        st = _cargar_reanudacion(resume_path)
+        dif = _diferencias_huella(st["huella"], huella)
+        if dif:
+            raise ValueError(f"{resume_path} es de un entrenamiento con otra configuración; no se puede reanudar.\n  "
+                             + "\n  ".join(dif) + "\nBórralo o corre sin RESUME=1 para empezar de cero.")
+        agent.load_state_dict(st["agent"])
+        critic.load_state_dict(st["critic"])
+        actor_optimizer.load_state_dict(st["actor_optimizer"])
+        critic_optimizer.load_state_dict(st["critic_optimizer"])
+        for sch, s in zip(schedulers, st["schedulers"]):
+            sch.load_state_dict(s)
+        start_update = int(st["update"])
+        best_score, best_ma = st["best_score"], st["best_ma"]
+        ckpt_update, ckpt_score = st["ckpt_update"], st["ckpt_score"]
+        ventana.extend(st["ventana"])
+        best_pesos = st["best_pesos"]
+        episode_rewards = np.asarray(st["episode_rewards"], dtype=np.float64).tolist()
+        episode_losses, training_log = list(st["episode_losses"]), list(st["training_log"])
+        t_previo = float(st["t_acumulado"])
+        random.setstate(st["rng"]["python"])
+        np.random.set_state(st["rng"]["numpy"])
+        torch.set_rng_state(st["rng"]["torch"].cpu())
+        if st["rng"]["cuda"] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state(st["rng"]["cuda"].cpu())
+        gen_mundos.set_state(st["rng"]["gen_mundos"].cpu())
+        if best_pesos is not None and best_checkpoint_path:      # por si el _best.pt no viajó con la reanudación
+            torch.save(best_pesos, best_checkpoint_path)
+        print(f"Reanudando desde {resume_path}: {start_update}/{n_updates} updates hechos "
+              f"({t_previo / 3600:.2f} h de entrenamiento previo).")
+        del st
+    elif resume_path and os.path.exists(resume_path):
+        print(f"Aviso: {resume_path} existe pero no se reanuda (RESUME=1 no está activo): se entrena desde cero "
+              f"y se sobrescribirá.")
+
+    def _guardar_reanudacion(siguiente_update: int) -> None:
+        cpu = lambda sd: {k: t.detach().cpu().clone() for k, t in sd.items()}
+        _guardar_atomico({
+            "huella": huella, "update": siguiente_update, "completo": siguiente_update >= n_updates,
+            "agent": cpu(agent.state_dict()), "critic": cpu(critic.state_dict()),
+            "actor_optimizer": actor_optimizer.state_dict(), "critic_optimizer": critic_optimizer.state_dict(),
+            "schedulers": [s.state_dict() for s in schedulers],
+            "best_score": best_score, "best_ma": best_ma, "ckpt_update": ckpt_update, "ckpt_score": ckpt_score,
+            "ventana": list(ventana), "best_pesos": best_pesos,
+            "episode_rewards": np.asarray(episode_rewards, dtype=np.float32),
+            "episode_losses": episode_losses, "training_log": training_log,
+            "t_acumulado": t_previo + (time.perf_counter() - t_sesion0),
+            "rng": {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
+                    "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                    "gen_mundos": gen_mundos.get_state()},
+        }, resume_path)
+
+    t_ultimo_guardado = time.perf_counter()
+
     # ── Loop principal ────────────────────────────────────────────────────────
-    for update in range(n_updates):
+    for update in range(start_update, n_updates):
         t_update0 = time.perf_counter()
         fases     = _Fases()
         progress  = update / max(1, n_updates - 1)
@@ -530,8 +640,9 @@ def run_am_training(
                         centro = ventana[len(ventana) // 2]         # update CENTRAL de la ventana, no el último
                         ckpt_update, ckpt_score = centro["update"], centro["score"]
                         log_entry["val_best"] = True
+                        best_pesos = {"agent": centro["agent"], "critic": centro["critic"]}
                         if best_checkpoint_path:
-                            torch.save({"agent": centro["agent"], "critic": centro["critic"]}, best_checkpoint_path)
+                            torch.save(best_pesos, best_checkpoint_path)
                     log_entry["val_ma"] = ma
                     log_entry["ckpt_update"] = ckpt_update
                     log_entry["ckpt_score"] = ckpt_score
@@ -539,8 +650,10 @@ def run_am_training(
                     best_score = v["score"]
                     log_entry["val_best"] = True
                     ckpt_update, ckpt_score = update + 1, v["score"]
+                    best_pesos = {"agent":  {k: t.detach().cpu().clone() for k, t in agent.state_dict().items()},
+                                  "critic": {k: t.detach().cpu().clone() for k, t in critic.state_dict().items()}}
                     if best_checkpoint_path:
-                        torch.save({"agent": agent.state_dict(), "critic": critic.state_dict()}, best_checkpoint_path)
+                        torch.save(best_pesos, best_checkpoint_path)
                 if CKPT_SELECTION != "moving_avg":
                     log_entry["ckpt_update"] = ckpt_update
                     log_entry["ckpt_score"] = ckpt_score
@@ -600,6 +713,10 @@ def run_am_training(
             updates_acum = 0
 
         training_log.append(log_entry)
+        if resume_path and ((update + 1) % RESUME_CADA_UPDATES == 0 or update == n_updates - 1 or stop_now
+                            or time.perf_counter() - t_ultimo_guardado >= 60.0 * RESUME_CADA_MIN):
+            _guardar_reanudacion(update + 1)
+            t_ultimo_guardado = time.perf_counter()
         if stop_now:
             break
 

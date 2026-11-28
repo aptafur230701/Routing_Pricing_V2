@@ -106,6 +106,84 @@ def test_media_movil_guarda_el_update_central_y_lr_coseno(d10, monkeypatch, tmp_
     assert lr[-1] == pytest.approx(PPO_LR * (LR_FINAL_FRAC + (1 - LR_FINAL_FRAC) * 0.5 * (1 + math.cos(math.pi * (n - 1) / n))))
 
 
+def _entrenar_reanudable(d, monkeypatch, tmp_path, n_updates, reanudar, cortar_en=None, **cfg):
+    """Como _entrenar pero con archivo de reanudación (guardado en cada update). cortar_en=u simula un corte
+    durante el update u (1-indexado): la validación de ese update lanza una excepción."""
+    monkeypatch.setattr(am_training, "PPO_N_EPISODES_PER_UPDATE", 16)
+    monkeypatch.setattr(am_training, "get_n_updates", lambda n: n_updates)
+    monkeypatch.setattr(am_training, "RESUME_CADA_UPDATES", 1)
+    for k, v in cfg.items():
+        monkeypatch.setattr(am_training, k, v)
+    original = am_training.ValidacionSimulada.evaluar
+    llamadas = {"n": 0}
+
+    def evaluar(self, agent):
+        llamadas["n"] += 1
+        if cortar_en is not None and llamadas["n"] == cortar_en:
+            raise KeyboardInterrupt("corte simulado")
+        return original(self, agent)
+
+    monkeypatch.setattr(am_training.ValidacionSimulada, "evaluar", evaluar)
+    resume = str(tmp_path / "resume.pt")
+    best = str(tmp_path / "best.pt")
+    agent, critic, rewards, losses, log = am_training.run_am_training(
+        d.tm, d.dist, d.diesel, N, d.market, avail_expected_arr=d.avail, reward_global_p95=d.p95,
+        best_checkpoint_path=best, est_lane=d.est, resume_path=resume, reanudar=reanudar)
+    return agent, critic, rewards, losses, log, resume, best
+
+
+def _sin_tiempos(log):
+    return [{k: v for k, v in e.items() if not k.startswith("t_")} for e in log]
+
+
+@pytest.mark.parametrize("cortar_en", [2, 5])     # con la ventana de la media móvil sin llenar y ya llena
+def test_reanudar_tras_un_corte_da_lo_mismo_que_sin_corte(d10, monkeypatch, tmp_path, cortar_en):
+    n = 6
+    ref_dir, cortado_dir = tmp_path / "ref", tmp_path / "cortado"
+    ref_dir.mkdir()
+    cortado_dir.mkdir()
+    a_ref, c_ref, r_ref, l_ref, log_ref, _, best_ref = _entrenar_reanudable(d10, monkeypatch, ref_dir, n, reanudar=False)
+    ref_best = torch.load(best_ref, map_location="cpu")
+
+    with pytest.raises(KeyboardInterrupt):
+        _entrenar_reanudable(d10, monkeypatch, cortado_dir, n, reanudar=False, cortar_en=cortar_en)
+    resume = str(cortado_dir / "resume.pt")
+    st = torch.load(resume, map_location="cpu", weights_only=False)
+    assert st["update"] == cortar_en - 1 and not st["completo"]
+    best_cortado = cortado_dir / "best.pt"
+    if best_cortado.exists():                        # como en Kaggle si solo viajó el archivo de reanudación
+        best_cortado.unlink()
+
+    a, c, r, l, log, _, best = _entrenar_reanudable(d10, monkeypatch, cortado_dir, n, reanudar=True)
+    for x, y in ((a, a_ref), (c, c_ref)):
+        sx, sy = x.state_dict(), y.state_dict()
+        assert all(torch.equal(sx[k], sy[k]) for k in sy)
+    assert r == pytest.approx(r_ref, rel=1e-6) and l == l_ref
+    assert _sin_tiempos(log) == _sin_tiempos(log_ref)
+    assert [e["update"] for e in log] == list(range(1, n + 1))
+    nuevo_best = torch.load(best, map_location="cpu")        # el _best.pt se reescribe aunque se haya perdido
+    for parte in ("agent", "critic"):
+        assert all(torch.equal(nuevo_best[parte][k], ref_best[parte][k]) for k in ref_best[parte])
+    assert torch.load(resume, map_location="cpu", weights_only=False)["completo"]
+
+
+def test_reanudar_un_entrenamiento_terminado_no_entrena_mas(d10, monkeypatch, tmp_path):
+    a0, _, _, _, log0, resume, _ = _entrenar_reanudable(d10, monkeypatch, tmp_path, 3, reanudar=False)
+    a1, _, _, _, log1, _, _ = _entrenar_reanudable(d10, monkeypatch, tmp_path, 3, reanudar=True, cortar_en=1)
+    assert _sin_tiempos(log1) == _sin_tiempos(log0)          # cortar_en=1: cualquier validación nueva fallaría
+    assert all(torch.equal(a1.state_dict()[k], v) for k, v in a0.state_dict().items())
+    assert am_training.tiempo_previo_reanudacion(resume) > 0
+
+
+def test_reanudar_con_otra_configuracion_falla_y_sin_reanudar_empieza_de_cero(d10, monkeypatch, tmp_path):
+    _entrenar_reanudable(d10, monkeypatch, tmp_path, 2, reanudar=False)
+    with pytest.raises(ValueError, match="lr: archivo="):
+        _entrenar_reanudable(d10, monkeypatch, tmp_path, 2, reanudar=True, PPO_LR=PPO_LR * 2)
+    _, _, _, _, log, resume, _ = _entrenar_reanudable(d10, monkeypatch, tmp_path, 3, reanudar=False)
+    assert [e["update"] for e in log] == [1, 2, 3]
+    assert torch.load(resume, map_location="cpu", weights_only=False)["huella"]["n_updates"] == 3
+
+
 def test_ckpt_max_y_lr_constante(d10, monkeypatch, tmp_path):
     _, log, _ = _entrenar(d10, monkeypatch, tmp_path, n_updates=5, episodios=16, CKPT_SELECTION="max",
                           USE_LR_COSINE=False)

@@ -67,15 +67,19 @@ def _run_am(
     NUM_NODES, time_matrix, distance_arr, diesel_arr, cwd, market_process,
     pretrained_agent=None, pretrained_critic=None,
     reward_global_p95=1.0, avail_expected_arr=None,
-    best_checkpoint_path=None, est_lane=None,
+    best_checkpoint_path=None, est_lane=None, resume_path=None, reanudar=False,
 ):
-    """Pipeline AM: entrenamiento PPO (mundos simulados del proceso exógeno, en DEVICE) → checkpoint."""
-    from am_training import run_am_training
+    """Pipeline AM: entrenamiento PPO (mundos simulados del proceso exógeno, en DEVICE) → checkpoint.
+
+    resume_path / reanudar: ver am_training.run_am_training. Con reanudación, el tiempo de entrenamiento reportado
+    suma el de las sesiones anteriores (el trabajo perdido entre el último guardado y el corte no cuenta)."""
+    from am_training import run_am_training, tiempo_previo_reanudacion
 
     print(f"Device           : {DEVICE}")
     print(f"Training episodes: {get_n_updates(NUM_NODES) * PPO_N_EPISODES_PER_UPDATE}")
 
     set_seeds(SEED)
+    t_previo = tiempo_previo_reanudacion(resume_path) if reanudar else 0.0
     t0 = time.time()
     agent_am, critic, ep_rewards, ep_losses, training_log = run_am_training(
         time_matrix, distance_arr, diesel_arr, NUM_NODES, market_process,
@@ -85,8 +89,10 @@ def _run_am(
         pretrained_critic=pretrained_critic,
         best_checkpoint_path=best_checkpoint_path,
         est_lane=est_lane,
+        resume_path=resume_path,
+        reanudar=reanudar,
     )
-    train_time = time.time() - t0
+    train_time = time.time() - t0 + t_previo
     print(f"Training time: {train_time:.1f} s")
 
     torch.save(
@@ -100,6 +106,11 @@ def _checkpoint_path(checkpoint_dir: str, num_nodes: int, best: bool = False) ->
     """Último update (am_checkpoint_<N>nodes.pt) o mejor update de validación (..._best.pt)."""
     sufijo = "_best" if best else ""
     return os.path.join(checkpoint_dir, f"am_checkpoint_{num_nodes}nodes{sufijo}.pt")
+
+
+def _resume_path(checkpoint_dir: str, num_nodes: int) -> str:
+    """Estado completo del entrenamiento para reanudarlo (am_training.run_am_training)."""
+    return os.path.join(checkpoint_dir, f"am_resume_{num_nodes}nodes.pt")
 
 
 def _load_agent(checkpoint_dir: str, num_nodes: int, best: bool = False) -> tuple:
@@ -239,7 +250,7 @@ def _imprimir_comparacion_b(sim_df, replay_df) -> None:
 def _run_one_size(
     NUM_NODES, cwd,
     EVAL_ONLY, USE_TRANSFER, EVAL_BEST_CHECKPOINT,
-    EVAL_SET, K_RESTRINGIDO,
+    EVAL_SET, K_RESTRINGIDO, REANUDAR=False,
 ):
     """Pipeline completo (entrenamiento + evaluación) para un solo tamaño de grafo.
 
@@ -295,6 +306,8 @@ def _run_one_size(
             avail_expected_arr=avail_expected_arr,
             best_checkpoint_path=_checkpoint_path(checkpoint_dir, NUM_NODES, True),
             est_lane=est_lane,
+            resume_path=_resume_path(checkpoint_dir, NUM_NODES),
+            reanudar=REANUDAR,
         )
         best_path = _checkpoint_path(checkpoint_dir, NUM_NODES, True)
         if EVAL_BEST_CHECKPOINT and os.path.exists(best_path):
@@ -339,6 +352,9 @@ def main():
     # NODE_SIZES      = [75]   # solo el que falta (20, 35 y 50 ya tienen checkpoint)
     NODE_SIZES      = [20]   # solo 20 nodos
     EVAL_ONLY       = os.environ.get("EVAL_ONLY", "0") == "1"   # True (EVAL_ONLY=1): carga checkpoint y salta entrenamiento
+    REANUDAR        = os.environ.get("RESUME", "0") == "1"      # True (RESUME=1): sigue el entrenamiento desde
+                                                                 # checkpoints/am_resume_<N>nodes.pt si existe (si ya
+                                                                 # había terminado, pasa directo a la evaluación)
     USE_TRANSFER    = True   # True: inicializa los pesos desde el checkpoint del tamaño anterior. False: entrena desde pesos aleatorios con la
                               # arquitectura de config.py.
     EVAL_BEST_CHECKPOINT = False  # False (por defecto): evalúa el último update, el modelo que dejó el
@@ -364,7 +380,7 @@ def main():
             _run_one_size(
                 NUM_NODES, cwd,
                 EVAL_ONLY, USE_TRANSFER, EVAL_BEST_CHECKPOINT,
-                EVAL_SET, K_RESTRINGIDO,
+                EVAL_SET, K_RESTRINGIDO, REANUDAR,
             )
         except Exception:
             fallidos.append(NUM_NODES)

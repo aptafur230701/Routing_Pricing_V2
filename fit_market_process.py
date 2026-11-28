@@ -3,7 +3,7 @@ fit_market_process.py
 =====================
 Estimación de lo que necesita el generador de realizaciones diarias
 (metodologia_realizaciones_mercado_reefer.md) y del índice de mercado por nodo
-(proceso_exogeno_cargas_tarifas.md, Fase 3 — se conserva, repuntado a los datos nuevos).
+(nivel lento + rápido AR(1), estimado con los datos nuevos).
 
 El generador de cargas/tarifas de la metodología nueva NO tiene un modelo de tarifas que ajustar
 (usa los cuantiles reales del día) ni una tasa global de cargas por lane (usa la media móvil de 6

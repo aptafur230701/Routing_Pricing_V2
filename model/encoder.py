@@ -102,10 +102,6 @@ N_NODE_FEATURES = INDEX_COL + N_INDEX_FEATURES + N_COT_FEATURES
 N_COT_CONTEXT = 2
 _U_20, _U_50, _U_80 = indice_nivel(0.2), indice_nivel(0.5), indice_nivel(0.8)
 
-# Número de features de presupuesto de cardinalidad K — debe coincidir con
-# build_budget_features_batch().
-N_BUDGET_FEATURES = 2
-
 # Día de la semana (one-hot, lunes = 0) del día en que está el camión: el proceso de cargas
 # depende de él (factor s_d de 0,58 a 1,43), así que el agente lo necesita para estimar el
 # valor de los nodos siguientes. Va como ÚLTIMO bloque de la entrada de ContextNetwork para que

@@ -2,8 +2,7 @@
 market_process.py
 =================
 Generador de realizaciones diarias (metodologia_realizaciones_mercado_reefer.md) + índice de
-mercado por nodo (proceso_exogeno_cargas_tarifas.md, Fase 3 — conservado, repuntado a los datos
-nuevos; ver decisión del plan).
+mercado por nodo (nivel lento + rápido AR(1), estimado en fit_market_process.py).
 
 Cuando el agente llega al nodo i el día real `dia`, el proceso sortea para cada lane (i, j) que
 sale del nodo:
